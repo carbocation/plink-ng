@@ -12,6 +12,7 @@ namespace {
 
 using pgen_rans::CodecParams;
 using pgen_rans::DecodeRecord;
+using pgen_rans::DecodeRecordToBuffer;
 using pgen_rans::EncodeRecord;
 using pgen_rans::EstimateRecordBytes;
 using pgen_rans::GetPackedGenotype;
@@ -115,6 +116,23 @@ void RoundTrip(const std::vector<uint8_t>& target,
          "decode failed: " + error);
   Expect(metadata.mode == mode, "decoded mode mismatch");
   ExpectEqual(decoded, target, "round-trip");
+
+  const uint32_t packed_word_ct = PackedWordCt(sample_ct);
+  std::vector<uint64_t> decoded_buffer(packed_word_ct + 1,
+                                       0xdec0dedec0dedULL);
+  Expect(DecodeRecordToBuffer(
+             record.data(), record.size(), anchors, 8, sample_ct, params,
+             decoded_buffer.data(), packed_word_ct, &metadata, &error),
+         "buffer decode failed: " + error);
+  ExpectEqual(decoded_buffer, target, "buffer round-trip");
+  Expect(decoded_buffer.back() == 0xdec0dedec0dedULL,
+         "buffer decoder wrote past its declared output");
+  if (packed_word_ct > 1) {
+    Expect(!DecodeRecordToBuffer(
+               record.data(), record.size(), anchors, 8, sample_ct, params,
+               decoded_buffer.data(), packed_word_ct - 1, nullptr, &error),
+           "undersized decode buffer was accepted");
+  }
 
   if (record.size() > 1) {
     Expect(!DecodeRecord(record.data(), record.size() - 1, anchors, 8,

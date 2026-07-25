@@ -25,6 +25,7 @@
 #include "include/plink2_bits.h"
 #include "pgen_rans_codec.h"
 #include "pgen_rans_container.h"
+#include "pgen_rans_cpu.h"
 
 namespace {
 
@@ -33,9 +34,11 @@ using pgen_rans::CodecParams;
 using pgen_rans::ContainerParams;
 using pgen_rans::ContainerReader;
 using pgen_rans::ContainerWriter;
+using pgen_rans::CpuBlockDecoder;
 using pgen_rans::DecodeRecord;
 using pgen_rans::EncodeRecord;
 using pgen_rans::EncodedBlock;
+using pgen_rans::EncodedBlockView;
 using pgen_rans::EstimateRecordBytes;
 using pgen_rans::ParseRecordMetadata;
 using pgen_rans::RecordMetadata;
@@ -59,6 +62,8 @@ struct Options {
   uint32_t rans_scale_bits = 12;
   uint32_t thread_ct = 0;
   uint32_t variant_limit = UINT32_MAX;
+  uint32_t benchmark_block_ct = 80;
+  uint32_t benchmark_iteration_ct = 1;
 };
 
 struct VariantMeta {
@@ -96,6 +101,7 @@ void PrintUsage(FILE* out) {
       "Usage:\n"
       "  pgen_rans encode <input.pgen> <output.pgr> [options]\n"
       "  pgen_rans verify <input.pgen> <input.pgr> [options]\n"
+      "  pgen_rans benchmark <input.pgen> <input.pgr> [options]\n"
       "  pgen_rans inspect <input.pgr>\n"
       "\n"
       "Encode options:\n"
@@ -111,7 +117,12 @@ void PrintUsage(FILE* out) {
       "  --variant-limit <n>        Encode only the first n variants.\n"
       "\n"
       "Verify options:\n"
-      "  --variant-limit <n>        Verify only the first n variants.\n",
+      "  --variant-limit <n>        Verify only the first n variants.\n"
+      "\n"
+      "Benchmark options:\n"
+      "  --threads <n>              Persistent CPU decoder workers.\n"
+      "  --blocks <n>               Deterministic block strata (default 80).\n"
+      "  --iterations <n>           Decode passes per fetched block (default 1).\n",
       out);
 }
 
@@ -161,7 +172,8 @@ bool ParseOptions(int argc, char** argv, Options* opts) {
     opts->input_fname = argv[2];
     return true;
   }
-  if ((opts->command != "encode") && (opts->command != "verify")) {
+  if ((opts->command != "encode") && (opts->command != "verify") &&
+      (opts->command != "benchmark")) {
     fprintf(stderr, "Error: Unknown command '%s'.\n", argv[1]);
     return false;
   }
@@ -236,6 +248,20 @@ bool ParseOptions(int argc, char** argv, Options* opts) {
                 value);
         return false;
       }
+    } else if (!strcmp(arg, "--blocks")) {
+      if ((opts->command != "benchmark") ||
+          (!ParseU32(value, 1, UINT32_MAX,
+                     &(opts->benchmark_block_ct)))) {
+        fprintf(stderr, "Error: Invalid --blocks value '%s'.\n", value);
+        return false;
+      }
+    } else if (!strcmp(arg, "--iterations")) {
+      if ((opts->command != "benchmark") ||
+          (!ParseU32(value, 1, 1000,
+                     &(opts->benchmark_iteration_ct)))) {
+        fprintf(stderr, "Error: Invalid --iterations value '%s'.\n", value);
+        return false;
+      }
     } else {
       fprintf(stderr, "Error: Unknown option '%s'.\n", arg);
       return false;
@@ -250,6 +276,20 @@ bool ParseOptions(int argc, char** argv, Options* opts) {
         (opts->rans_state_ct != 32) || (opts->rans_scale_bits != 12) ||
         opts->thread_ct) {
       fputs("Error: verify accepts only --variant-limit.\n", stderr);
+      return false;
+    }
+  } else if (opts->command == "benchmark") {
+    if (!opts->pvar_fname.empty() ||
+        (opts->block_variant_ct != 128) || (opts->anchor_ct != 32) ||
+        (opts->two_ref_shortlist != 4) ||
+        (opts->max_anchor_bp != 1000000) ||
+        (opts->restart_variant_ct != 64) ||
+        (opts->rans_state_ct != 32) || (opts->rans_scale_bits != 12) ||
+        (opts->variant_limit != UINT32_MAX)) {
+      fputs(
+          "Error: benchmark accepts only --threads, --blocks, and "
+          "--iterations.\n",
+          stderr);
       return false;
     }
   }
@@ -1079,6 +1119,194 @@ cleanup:
   return return_code;
 }
 
+std::vector<uint32_t> SelectBenchmarkBlocks(uint32_t block_ct,
+                                            uint32_t requested_block_ct) {
+  const uint32_t selected_ct = std::min(block_ct, requested_block_ct);
+  std::vector<uint32_t> result;
+  result.reserve(selected_ct);
+  for (uint32_t stratum_idx = 0; stratum_idx != selected_ct;
+       ++stratum_idx) {
+    const uint64_t numerator =
+        static_cast<uint64_t>(2 * stratum_idx + 1) * block_ct;
+    result.push_back(
+        static_cast<uint32_t>(numerator / (2 * selected_ct)));
+  }
+  return result;
+}
+
+int Benchmark(const Options& opts) {
+  PgenInput pgen;
+  std::string error;
+  if (!pgen.Open(opts.input_fname, &error)) {
+    fprintf(stderr, "Error: %s\n", error.c_str());
+    return 1;
+  }
+  ContainerReader reader;
+  if (!reader.Open(opts.output_fname, &error)) {
+    fprintf(stderr, "Error: %s\n", error.c_str());
+    return 1;
+  }
+  const ContainerParams& params = reader.params();
+  if ((params.sample_ct != pgen.sample_ct()) ||
+      (params.variant_ct > pgen.variant_ct())) {
+    fputs("Error: PGEN/container dimension mismatch.\n", stderr);
+    return 1;
+  }
+  const std::vector<uint32_t> selected_blocks =
+      SelectBenchmarkBlocks(params.block_ct, opts.benchmark_block_ct);
+  const CodecParams codec_params = {
+      params.state_ct, params.scale_bits};
+  CpuBlockDecoder cpu_decoder(opts.thread_ct);
+  if (!cpu_decoder.thread_ct()) {
+    fputs("Error: Could not start CPU decoder workers.\n", stderr);
+    return 1;
+  }
+  const uint32_t packed_word_ct = pgen_rans::PackedWordCt(params.sample_ct);
+  const uint32_t pgen_word_stride =
+      NypCtToVecCt(params.sample_ct) * kWordsPerVec;
+  uintptr_t* pgen_block_genovecs = nullptr;
+  if (cachealigned_malloc(
+          static_cast<uintptr_t>(params.block_variant_ct) *
+              pgen_word_stride * sizeof(uintptr_t),
+          &pgen_block_genovecs)) {
+    fputs("Error: Out of memory allocating PGEN benchmark output.\n",
+          stderr);
+    return 1;
+  }
+
+  uint64_t pgen_payload_bytes = 0;
+  uint64_t pgr_block_bytes = 0;
+  uint64_t benchmark_variant_ct = 0;
+  uint64_t checksum = 0;
+  double pgen_seconds = 0.0;
+  double pgr_read_seconds = 0.0;
+  double pgr_decode_seconds = 0.0;
+  std::vector<uint8_t> block_storage;
+  std::vector<uint64_t> decoded;
+  uint32_t completed_block_ct = 0;
+  int return_code = 1;
+  for (const uint32_t block_idx : selected_blocks) {
+    EncodedBlockView block;
+    const auto read_start = std::chrono::steady_clock::now();
+    if (!reader.ReadBlockView(block_idx, &block_storage, &block, &error)) {
+      fprintf(stderr, "\nError: %s\n", error.c_str());
+      goto cleanup;
+    }
+    pgr_read_seconds +=
+        std::chrono::duration<double>(
+            std::chrono::steady_clock::now() - read_start)
+            .count();
+    const size_t decoded_word_ct =
+        static_cast<size_t>(block.variant_ct()) * packed_word_ct;
+    decoded.resize(decoded_word_ct);
+    for (uint32_t iteration_idx = 0;
+         iteration_idx != opts.benchmark_iteration_ct; ++iteration_idx) {
+      const auto decode_start = std::chrono::steady_clock::now();
+      if (!cpu_decoder.Decode(block, params.sample_ct, codec_params,
+                              decoded.data(), decoded.size(), &error)) {
+        fprintf(stderr, "\nError: %s\n", error.c_str());
+        goto cleanup;
+      }
+      pgr_decode_seconds +=
+          std::chrono::duration<double>(
+              std::chrono::steady_clock::now() - decode_start)
+              .count();
+      checksum ^=
+          decoded[(static_cast<size_t>(iteration_idx) +
+                   block.first_variant()) %
+                  decoded.size()];
+    }
+    const auto pgen_start = std::chrono::steady_clock::now();
+    for (uint32_t variant_offset = 0;
+         variant_offset != block.variant_ct(); ++variant_offset) {
+      const uint32_t variant_idx =
+          block.first_variant() + variant_offset;
+      uintptr_t* expected =
+          pgen_block_genovecs +
+          static_cast<size_t>(variant_offset) * pgen_word_stride;
+      if (!pgen.Read(variant_idx, expected, &error)) {
+        fprintf(stderr, "\nError: %s\n", error.c_str());
+        goto cleanup;
+      }
+    }
+    pgen_seconds +=
+        std::chrono::duration<double>(
+            std::chrono::steady_clock::now() - pgen_start)
+            .count();
+    for (uint32_t variant_offset = 0;
+         variant_offset != block.variant_ct(); ++variant_offset) {
+      const uint32_t variant_idx =
+          block.first_variant() + variant_offset;
+      const uintptr_t* expected =
+          pgen_block_genovecs +
+          static_cast<size_t>(variant_offset) * pgen_word_stride;
+      const uint64_t* observed =
+          decoded.data() +
+          static_cast<size_t>(variant_offset) * packed_word_ct;
+      if (memcmp(expected, observed,
+                 static_cast<size_t>(packed_word_ct) * sizeof(uint64_t))) {
+        fprintf(stderr,
+                "\nError: CPU benchmark genotype mismatch at variant %u.\n",
+                variant_idx);
+        goto cleanup;
+      }
+      pgen_payload_bytes += pgen.record_byte_ct(variant_idx);
+    }
+    pgr_block_bytes += reader.block_index()[block_idx].byte_ct;
+    benchmark_variant_ct += block.variant_ct();
+    ++completed_block_ct;
+    fprintf(stderr, "\rBenchmarked %u/%zu blocks.", completed_block_ct,
+            selected_blocks.size());
+    fflush(stderr);
+  }
+  {
+    const long double calls =
+        static_cast<long double>(benchmark_variant_ct) * params.sample_ct;
+    const double average_decode_seconds =
+        pgr_decode_seconds / opts.benchmark_iteration_ct;
+    const double pgr_serial_seconds =
+        pgr_read_seconds + average_decode_seconds;
+    printf("\nConditional-rANS CPU benchmark\n");
+    printf("  samples:                 %u\n", params.sample_ct);
+    printf("  variants:                %llu\n",
+           static_cast<unsigned long long>(benchmark_variant_ct));
+    printf("  blocks:                  %zu / %u\n", selected_blocks.size(),
+           params.block_ct);
+    printf("  decoder threads:         %u\n", cpu_decoder.thread_ct());
+    printf("  decode iterations:       %u\n",
+           opts.benchmark_iteration_ct);
+    printf("  checksum:                %016llx\n",
+           static_cast<unsigned long long>(checksum));
+    printf("\nCurrent PGEN\n");
+    printf("  payload bytes:           %llu\n",
+           static_cast<unsigned long long>(pgen_payload_bytes));
+    printf("  read + decode seconds:   %.6f\n", pgen_seconds);
+    printf("  billion calls/second:    %.3Lf\n",
+           (pgen_seconds > 0.0)
+               ? calls / pgen_seconds / 1.0e9L
+               : 0.0L);
+    printf("\nConditional rANS\n");
+    printf("  block bytes read:        %llu\n",
+           static_cast<unsigned long long>(pgr_block_bytes));
+    printf("  block read seconds:      %.6f\n", pgr_read_seconds);
+    printf("  decode seconds/pass:     %.6f\n", average_decode_seconds);
+    printf("  billion calls/second:    %.3Lf\n",
+           (average_decode_seconds > 0.0)
+               ? calls / average_decode_seconds / 1.0e9L
+               : 0.0L);
+    printf("  serial read + decode:    %.6f\n", pgr_serial_seconds);
+    printf("  PGEN/PGR serial speedup: %.3f\n",
+           (pgr_serial_seconds > 0.0)
+               ? pgen_seconds / pgr_serial_seconds
+               : 0.0);
+  }
+  return_code = 0;
+
+cleanup:
+  aligned_free(pgen_block_genovecs);
+  return return_code;
+}
+
 int Inspect(const Options& opts) {
   ContainerReader reader;
   std::string error;
@@ -1151,6 +1379,9 @@ int main(int argc, char** argv) {
   }
   if (opts.command == "verify") {
     return Verify(opts);
+  }
+  if (opts.command == "benchmark") {
+    return Benchmark(opts);
   }
   return Inspect(opts);
 }

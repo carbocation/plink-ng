@@ -114,6 +114,12 @@ exactly one bounded read matching its table entry. A validated block view
 points directly into that caller-owned byte buffer, so CPU and GPU adapters do
 not need to copy every record into a separate allocation.
 
+The CPU block decoder emits the standard variant-major packed two-bit
+hardcall layout. It first decodes the scheduled anchor slab and then dispatches
+all remaining records independently across a persistent worker pool. The
+32-state record path advances the independent states in sample order and emits
+one complete 64-bit packed genotype word per round.
+
 ## Reference CLI
 
 Build from `2.0/`:
@@ -145,3 +151,18 @@ decoding genotypes:
 ```sh
 bin/pgen_rans inspect cohort.pgr
 ```
+
+`benchmark` deterministically samples block strata, decodes each block with a
+persistent CPU worker pool, and compares every packed output word with
+`PgrGet()` from the source PGEN:
+
+```sh
+bin/pgen_rans benchmark cohort.pgen cohort.pgr \
+  --threads 16 \
+  --blocks 80 \
+  --iterations 3
+```
+
+The report separates bounded block-read time from warm decode time. The
+reported serial total is intentionally conservative; a production caller can
+double-buffer block reads and decoding.

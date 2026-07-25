@@ -46,6 +46,13 @@ bool EstimateRecordBytes(const uint32_t* context_symbol_counts,
 bool ParseRecordMetadata(const uint8_t* record, size_t record_size,
                          RecordMetadata* metadata, std::string* error);
 
+bool DecodeRecordToBuffer(const uint8_t* record, size_t record_size,
+                          const uint64_t* const* anchors,
+                          uint32_t anchor_ct, uint32_t sample_ct,
+                          const CodecParams& params, uint64_t* target,
+                          size_t target_word_ct, RecordMetadata* metadata,
+                          std::string* error);
+
 bool DecodeRecord(const uint8_t* record, size_t record_size,
                   const uint64_t* const* anchors, uint32_t anchor_ct,
                   uint32_t sample_ct, const CodecParams& params,

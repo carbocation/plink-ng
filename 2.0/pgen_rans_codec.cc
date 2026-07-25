@@ -5,6 +5,7 @@
 #include <algorithm>
 #include <array>
 #include <cmath>
+#include <cstring>
 #include <limits>
 
 namespace pgen_rans {
@@ -573,15 +574,17 @@ bool ParseRecordMetadata(const uint8_t* record, size_t record_size,
   return ParsePrefix(record, record_size, metadata, &offset, error);
 }
 
-bool DecodeRecord(const uint8_t* record, size_t record_size,
-                  const uint64_t* const* anchors, uint32_t anchor_ct,
-                  uint32_t sample_ct, const CodecParams& params,
-                  std::vector<uint64_t>* target, RecordMetadata* metadata,
-                  std::string* error) {
-  target->clear();
+bool DecodeRecordToBuffer(const uint8_t* record, size_t record_size,
+                          const uint64_t* const* anchors,
+                          uint32_t anchor_ct, uint32_t sample_ct,
+                          const CodecParams& params, uint64_t* target,
+                          size_t target_word_ct, RecordMetadata* metadata,
+                          std::string* error) {
+  const uint32_t packed_word_ct = PackedWordCt(sample_ct);
   if ((!record) || (!sample_ct) || (!params.state_ct) ||
       (params.state_ct > 256) || (params.scale_bits < 8) ||
-      (params.scale_bits > 16)) {
+      (params.scale_bits > 16) || (!target) ||
+      (target_word_ct < packed_word_ct)) {
     SetError("Invalid decoder arguments.", error);
     return false;
   }
@@ -626,24 +629,32 @@ bool DecodeRecord(const uint8_t* record, size_t record_size,
     SetError("Entropy-payload flag does not match the decoded model.", error);
     return false;
   }
-  target->assign(PackedWordCt(sample_ct), 0);
+  memset(target, 0, static_cast<size_t>(packed_word_ct) * sizeof(uint64_t));
   if (!model.has_entropy) {
     if (offset != record_size) {
       SetError("Deterministic record has trailing payload.", error);
-      target->clear();
       return false;
     }
-    for (uint32_t sample_idx = 0; sample_idx != sample_ct; ++sample_idx) {
-      const uint32_t context = ContextIndex(
-          parsed_metadata.mode, reference1, reference2, sample_idx);
-      const ModelRow& row = model.rows[context];
-      if (row.active_symbol_ct != 1) {
-        SetError("Reference selects an absent deterministic context.", error);
-        target->clear();
-        return false;
+    for (uint32_t word_idx = 0; word_idx != packed_word_ct; ++word_idx) {
+      const uint32_t first_sample = 32 * word_idx;
+      const uint32_t word_sample_ct =
+          std::min(32U, sample_ct - first_sample);
+      uint64_t packed_word = 0;
+      for (uint32_t word_offset = 0; word_offset != word_sample_ct;
+           ++word_offset) {
+        const uint32_t sample_idx = first_sample + word_offset;
+        const uint32_t context = ContextIndex(
+            parsed_metadata.mode, reference1, reference2, sample_idx);
+        const ModelRow& row = model.rows[context];
+        if (row.active_symbol_ct != 1) {
+          SetError("Reference selects an absent deterministic context.",
+                   error);
+          return false;
+        }
+        packed_word |= static_cast<uint64_t>(row.deterministic_symbol)
+                       << (2 * word_offset);
       }
-      SetPackedGenotype(target->data(), sample_idx,
-                        row.deterministic_symbol);
+      target[word_idx] = packed_word;
     }
     if (metadata) {
       *metadata = parsed_metadata;
@@ -652,70 +663,123 @@ bool DecodeRecord(const uint8_t* record, size_t record_size,
   }
 
   const uint32_t state_ct = std::min(params.state_ct, sample_ct);
-  std::vector<uint32_t> states(state_ct);
+  std::array<uint32_t, 256> states = {};
   for (uint32_t lane = 0; lane != state_ct; ++lane) {
     if (!ReadU32(record, record_size, &offset, &(states[lane])) ||
         (states[lane] < kRansLowerBound)) {
       SetError("Invalid or truncated rANS initial state.", error);
-      target->clear();
       return false;
     }
   }
-  std::vector<uint32_t> lane_boundaries(state_ct + 1);
+  std::array<uint32_t, 257> lane_boundaries = {};
   for (uint32_t lane = 0; lane + 1 != state_ct; ++lane) {
     if (!ReadU32(record, record_size, &offset,
                  &(lane_boundaries[lane + 1]))) {
       SetError("Truncated rANS lane boundary table.", error);
-      target->clear();
       return false;
     }
   }
   const size_t payload_size = record_size - offset;
   if (payload_size > UINT32_MAX) {
     SetError("rANS payload exceeds the v1 record limit.", error);
-    target->clear();
     return false;
   }
   lane_boundaries[state_ct] = static_cast<uint32_t>(payload_size);
+  std::array<const uint8_t*, 256> lane_starts = {};
+  std::array<const uint8_t*, 256> lane_iters = {};
   for (uint32_t lane = 0; lane != state_ct; ++lane) {
     if ((lane_boundaries[lane] > lane_boundaries[lane + 1]) ||
         (lane_boundaries[lane + 1] > payload_size)) {
       SetError("Invalid rANS lane boundary.", error);
-      target->clear();
       return false;
     }
-    const uint8_t* lane_start = record + offset + lane_boundaries[lane];
-    const uint8_t* lane_iter =
+    lane_starts[lane] = record + offset + lane_boundaries[lane];
+    lane_iters[lane] =
         record + offset + lane_boundaries[lane + 1];
-    uint32_t state = states[lane];
-    for (uint32_t sample_idx = lane; sample_idx < sample_ct;
-         sample_idx += state_ct) {
-      const uint32_t context = ContextIndex(
-          parsed_metadata.mode, reference1, reference2, sample_idx);
-      const ModelRow& row = model.rows[context];
-      if (!row.active_symbol_ct) {
-        SetError("Reference selects an absent model context.", error);
-        target->clear();
-        return false;
+  }
+  if (state_ct == 32) {
+    for (uint32_t word_idx = 0; word_idx != packed_word_ct; ++word_idx) {
+      const uint32_t first_sample = 32 * word_idx;
+      const uint32_t word_sample_ct =
+          std::min(32U, sample_ct - first_sample);
+      uint64_t packed_word = 0;
+      for (uint32_t lane = 0; lane != word_sample_ct; ++lane) {
+        const uint32_t sample_idx = first_sample + lane;
+        const uint32_t context = ContextIndex(
+            parsed_metadata.mode, reference1, reference2, sample_idx);
+        const ModelRow& row = model.rows[context];
+        if (!row.active_symbol_ct) {
+          SetError("Reference selects an absent model context.", error);
+          return false;
+        }
+        uint8_t symbol;
+        if (row.active_symbol_ct == 1) {
+          symbol = row.deterministic_symbol;
+        } else if (!RansDecodeSymbol(
+                       row, params.scale_bits, lane_starts[lane],
+                       &(lane_iters[lane]), &(states[lane]), &symbol,
+                       error)) {
+          return false;
+        }
+        packed_word |= static_cast<uint64_t>(symbol) << (2 * lane);
       }
-      uint8_t symbol;
-      if (row.active_symbol_ct == 1) {
-        symbol = row.deterministic_symbol;
-      } else if (!RansDecodeSymbol(row, params.scale_bits, lane_start,
-                                   &lane_iter, &state, &symbol, error)) {
-        target->clear();
-        return false;
-      }
-      SetPackedGenotype(target->data(), sample_idx, symbol);
+      target[word_idx] = packed_word;
     }
-    if ((lane_iter != lane_start) || (state != kRansLowerBound)) {
+  } else {
+    for (uint32_t first_sample = 0; first_sample < sample_ct;
+         first_sample += state_ct) {
+      const uint32_t round_sample_ct =
+          std::min(state_ct, sample_ct - first_sample);
+      for (uint32_t lane = 0; lane != round_sample_ct; ++lane) {
+        const uint32_t sample_idx = first_sample + lane;
+        const uint32_t context = ContextIndex(
+            parsed_metadata.mode, reference1, reference2, sample_idx);
+        const ModelRow& row = model.rows[context];
+        if (!row.active_symbol_ct) {
+          SetError("Reference selects an absent model context.", error);
+          return false;
+        }
+        uint8_t symbol;
+        if (row.active_symbol_ct == 1) {
+          symbol = row.deterministic_symbol;
+        } else if (!RansDecodeSymbol(
+                       row, params.scale_bits, lane_starts[lane],
+                       &(lane_iters[lane]), &(states[lane]), &symbol,
+                       error)) {
+          return false;
+        }
+        SetPackedGenotype(target, sample_idx, symbol);
+      }
+    }
+  }
+  for (uint32_t lane = 0; lane != state_ct; ++lane) {
+    if ((lane_iters[lane] != lane_starts[lane]) ||
+        (states[lane] != kRansLowerBound)) {
       SetError("rANS lane did not terminate at its canonical state.", error);
-      target->clear();
       return false;
     }
   }
   if (metadata) {
     *metadata = parsed_metadata;
+  }
+  return true;
+}
+
+bool DecodeRecord(const uint8_t* record, size_t record_size,
+                  const uint64_t* const* anchors, uint32_t anchor_ct,
+                  uint32_t sample_ct, const CodecParams& params,
+                  std::vector<uint64_t>* target, RecordMetadata* metadata,
+                  std::string* error) {
+  if (!target) {
+    SetError("Invalid decoder output.", error);
+    return false;
+  }
+  target->assign(PackedWordCt(sample_ct), 0);
+  if (!DecodeRecordToBuffer(
+          record, record_size, anchors, anchor_ct, sample_ct, params,
+          target->data(), target->size(), metadata, error)) {
+    target->clear();
+    return false;
   }
   return true;
 }

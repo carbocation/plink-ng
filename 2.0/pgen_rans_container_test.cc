@@ -2,6 +2,7 @@
 
 #include "pgen_rans_codec.h"
 #include "pgen_rans_container.h"
+#include "pgen_rans_cpu.h"
 
 #include <algorithm>
 #include <cerrno>
@@ -18,6 +19,7 @@ using pgen_rans::CodecParams;
 using pgen_rans::ContainerParams;
 using pgen_rans::ContainerReader;
 using pgen_rans::ContainerWriter;
+using pgen_rans::CpuBlockDecoder;
 using pgen_rans::EncodedBlockView;
 using pgen_rans::DecodeRecord;
 using pgen_rans::EncodeRecord;
@@ -262,6 +264,30 @@ int main() {
   }
   Expect(!block_view.record(block_view.variant_ct()).data,
          "block view accepted an out-of-range record");
+  const uint32_t decoded_word_stride = PackedWordCt(kSampleCt);
+  std::vector<uint64_t> decoded_block(
+      static_cast<size_t>(block_view.variant_ct()) * decoded_word_stride);
+  CpuBlockDecoder cpu_decoder(4);
+  Expect(cpu_decoder.thread_ct() == 4,
+         "CPU decoder did not start the requested worker count");
+  Expect(cpu_decoder.Decode(
+             block_view, kSampleCt, codec_params, decoded_block.data(),
+             decoded_block.size(), &error),
+         "CPU block decode failed: " + error);
+  for (uint32_t offset = 0; offset != block_view.variant_ct(); ++offset) {
+    std::vector<uint64_t> observed(
+        decoded_block.begin() +
+            static_cast<std::ptrdiff_t>(offset * decoded_word_stride),
+        decoded_block.begin() +
+            static_cast<std::ptrdiff_t>((offset + 1) *
+                                        decoded_word_stride));
+    ExpectEqual(observed, source[block_view.first_variant() + offset],
+                kSampleCt);
+  }
+  Expect(!cpu_decoder.Decode(
+             block_view, kSampleCt, codec_params, decoded_block.data(),
+             decoded_block.size() - 1, &error),
+         "CPU block decoder accepted an undersized output");
   reader.Close();
 
   FILE* corrupt_file = fopen(path.c_str(), "r+b");
