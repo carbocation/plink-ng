@@ -287,6 +287,42 @@ int main() {
     ExpectEqual(observed, source[block_view.first_variant() + offset],
                 kSampleCt);
   }
+  const uint32_t projected_samples[] = {0, 2, 33, 999, 1002};
+  const size_t projected_stride = 4;
+  std::vector<uint8_t> projected_block(
+      block_view.variant_ct() * projected_stride, 0xa5);
+  Expect(cpu_decoder.ProjectSampleSubset(
+             decoded_block.data(), block_view.variant_ct(), kSampleCt,
+             projected_samples, 5, projected_block.data(),
+             projected_stride, &error),
+         "CPU sample projection failed: " + error);
+  for (uint32_t offset = 0; offset != block_view.variant_ct(); ++offset) {
+    for (uint32_t subset_idx = 0; subset_idx != 5; ++subset_idx) {
+      const uint8_t observed =
+          (projected_block[offset * projected_stride +
+                           subset_idx / 4] >>
+           (2 * (subset_idx % 4))) &
+          3U;
+      const uint8_t expected = GetPackedGenotype(
+          source[block_view.first_variant() + offset].data(),
+          projected_samples[subset_idx]);
+      Expect(observed == expected,
+             "CPU sample projection genotype mismatch");
+    }
+    Expect(
+        !(projected_block[offset * projected_stride + 1] & 0xfcU),
+        "CPU sample projection did not clear packed tail bits");
+    Expect(projected_block[offset * projected_stride + 2] == 0xa5,
+           "CPU sample projection overwrote output stride padding");
+    Expect(projected_block[offset * projected_stride + 3] == 0xa5,
+           "CPU sample projection overwrote output stride padding");
+  }
+  const uint32_t invalid_projected_samples[] = {2, 2};
+  Expect(!cpu_decoder.ProjectSampleSubset(
+             decoded_block.data(), block_view.variant_ct(), kSampleCt,
+             invalid_projected_samples, 2, projected_block.data(),
+             projected_stride, &error),
+         "CPU sample projection accepted duplicate indices");
   Expect(!cpu_decoder.Decode(
              block_view, kSampleCt, codec_params, decoded_block.data(),
              decoded_block.size() - 1, &error),

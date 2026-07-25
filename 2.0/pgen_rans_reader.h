@@ -17,6 +17,7 @@ struct PackedReadStats {
   uint64_t returned_variant_ct = 0;
   double block_read_seconds = 0.0;
   double decode_seconds = 0.0;
+  double projection_seconds = 0.0;
 };
 
 class PackedVariantReader {

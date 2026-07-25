@@ -109,6 +109,8 @@ struct PackedVariantReader::Impl {
         sample_subset.clear();
       }
     }
+    cached_block_idx = UINT32_MAX;
+    projected_block.clear();
     return true;
   }
 
@@ -144,6 +146,25 @@ struct PackedVariantReader::Impl {
         std::chrono::duration<double>(
             std::chrono::steady_clock::now() - decode_start)
             .count();
+    double projection_seconds = 0.0;
+    if (!sample_subset.empty()) {
+      projected_block.resize(
+          static_cast<size_t>(block_view.variant_ct()) * packed_byte_ct);
+      const auto projection_start = std::chrono::steady_clock::now();
+      if (!decoder->ProjectSampleSubset(
+              decoded_block.data(), block_view.variant_ct(),
+              reader.params().sample_ct, sample_subset.data(),
+              output_sample_ct, projected_block.data(), packed_byte_ct,
+              error)) {
+        return false;
+      }
+      projection_seconds =
+          std::chrono::duration<double>(
+              std::chrono::steady_clock::now() - projection_start)
+              .count();
+    } else {
+      projected_block.clear();
+    }
     cached_block_idx = block_idx;
     if (stats) {
       ++stats->block_read_ct;
@@ -151,6 +172,7 @@ struct PackedVariantReader::Impl {
       stats->decoded_variant_ct += block_view.variant_ct();
       stats->block_read_seconds += read_seconds;
       stats->decode_seconds += decode_seconds;
+      stats->projection_seconds += projection_seconds;
     }
     return true;
   }
@@ -198,26 +220,14 @@ struct PackedVariantReader::Impl {
       const uint8_t* source = reinterpret_cast<const uint8_t*>(
           decoded_block.data() +
           static_cast<size_t>(variant_offset) * word_stride);
+      if (!sample_subset.empty()) {
+        source = projected_block.data() +
+                 static_cast<size_t>(variant_offset) * packed_byte_ct;
+      }
       uint8_t* destination =
           output +
           static_cast<size_t>(request.second) * output_variant_stride;
-      if (sample_subset.empty()) {
-        memcpy(destination, source, packed_byte_ct);
-      } else {
-        memset(destination, 0, packed_byte_ct);
-        for (uint32_t subset_idx = 0; subset_idx != output_sample_ct;
-             ++subset_idx) {
-          const uint32_t source_idx = sample_subset[subset_idx];
-          const uint8_t genotype =
-              static_cast<uint8_t>(
-                  (source[source_idx / 4] >>
-                   (2 * (source_idx % 4))) &
-                  3U);
-          destination[subset_idx / 4] |=
-              static_cast<uint8_t>(genotype <<
-                                   (2 * (subset_idx % 4)));
-        }
-      }
+      memcpy(destination, source, packed_byte_ct);
     }
     if (stats) {
       stats->returned_variant_ct += variant_ct;
@@ -236,6 +246,7 @@ struct PackedVariantReader::Impl {
   std::vector<uint8_t> block_storage;
   EncodedBlockView block_view;
   std::vector<uint64_t> decoded_block;
+  std::vector<uint8_t> projected_block;
 };
 
 PackedVariantReader::PackedVariantReader() : impl_(new Impl()) {}

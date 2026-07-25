@@ -5,6 +5,7 @@
 #include <algorithm>
 #include <atomic>
 #include <condition_variable>
+#include <cstring>
 #include <limits>
 #include <mutex>
 #include <thread>
@@ -73,6 +74,27 @@ struct CpuBlockDecoder::Impl {
         break;
       }
       const uint32_t variant_offset = (*task_offsets)[task_idx];
+      if (project_phase) {
+        uint8_t* destination =
+            project_output +
+            static_cast<size_t>(variant_offset) * project_output_stride;
+        memset(destination, 0, project_output_byte_ct);
+        const uint64_t* source =
+            project_input +
+            static_cast<size_t>(variant_offset) * project_input_word_stride;
+        for (uint32_t subset_idx = 0;
+             subset_idx != project_subset_sample_ct; ++subset_idx) {
+          const uint32_t source_idx = project_sample_indices[subset_idx];
+          const uint8_t genotype = static_cast<uint8_t>(
+              (source[source_idx / 32] >>
+               (2 * (source_idx % 32))) &
+              3U);
+          destination[subset_idx / 4] |=
+              static_cast<uint8_t>(
+                  genotype << (2 * (subset_idx % 4)));
+        }
+        continue;
+      }
       const ByteSpan record = block->record(variant_offset);
       if ((!record.data) || (!record.size)) {
         SetFailure("Block decoder received an invalid record view.");
@@ -124,7 +146,8 @@ struct CpuBlockDecoder::Impl {
   }
 
   bool RunPhase(const std::vector<uint32_t>& offsets,
-                bool is_anchor_phase, std::string* error) {
+                bool is_anchor_phase, bool is_project_phase,
+                std::string* error) {
     if (offsets.empty()) {
       return true;
     }
@@ -132,6 +155,7 @@ struct CpuBlockDecoder::Impl {
       std::lock_guard<std::mutex> lock(work_mutex);
       task_offsets = &offsets;
       anchor_phase = is_anchor_phase;
+      project_phase = is_project_phase;
       next_task.store(0, std::memory_order_relaxed);
       failed.store(false, std::memory_order_relaxed);
       {
@@ -202,7 +226,7 @@ struct CpuBlockDecoder::Impl {
     params = params_arg;
     output = output_arg;
     word_stride = stride;
-    if (!RunPhase(anchor_offsets, true, error)) {
+    if (!RunPhase(anchor_offsets, true, false, error)) {
       return false;
     }
     std::vector<const uint64_t*> anchor_ptrs(anchor_offsets.size());
@@ -212,7 +236,68 @@ struct CpuBlockDecoder::Impl {
           output + static_cast<size_t>(anchor_offsets[anchor_idx]) * stride;
     }
     anchors = &anchor_ptrs;
-    return RunPhase(target_offsets, false, error);
+    return RunPhase(target_offsets, false, false, error);
+  }
+
+  bool ProjectSampleSubset(const uint64_t* input_arg,
+                           uint32_t variant_ct,
+                           uint32_t raw_sample_ct,
+                           const uint32_t* sample_indices,
+                           uint32_t subset_sample_ct,
+                           uint8_t* output_arg,
+                           size_t output_variant_stride,
+                           std::string* error) {
+    if (workers.empty()) {
+      SetError("Could not start conditional-rANS CPU decoder threads.",
+               error);
+      return false;
+    }
+    if ((!input_arg) || (!variant_ct) || (!raw_sample_ct) ||
+        (!sample_indices) || (!subset_sample_ct) ||
+        (subset_sample_ct > raw_sample_ct) || (!output_arg)) {
+      SetError("Invalid conditional-rANS sample projection arguments.",
+               error);
+      return false;
+    }
+    const size_t output_byte_ct =
+        (static_cast<size_t>(subset_sample_ct) + 3) / 4;
+    if (output_variant_stride < output_byte_ct) {
+      SetError("Conditional-rANS sample projection stride is too small.",
+               error);
+      return false;
+    }
+    for (uint32_t subset_idx = 0; subset_idx != subset_sample_ct;
+         ++subset_idx) {
+      if ((sample_indices[subset_idx] >= raw_sample_ct) ||
+          (subset_idx &&
+           (sample_indices[subset_idx - 1] >=
+            sample_indices[subset_idx]))) {
+        SetError(
+            "Conditional-rANS sample projection indices must be sorted "
+            "and unique.",
+            error);
+        return false;
+      }
+    }
+    if (variant_ct >
+        std::numeric_limits<size_t>::max() / output_variant_stride) {
+      SetError("Conditional-rANS projected output exceeds platform limits.",
+               error);
+      return false;
+    }
+    std::vector<uint32_t> variant_offsets(variant_ct);
+    for (uint32_t variant_idx = 0; variant_idx != variant_ct;
+         ++variant_idx) {
+      variant_offsets[variant_idx] = variant_idx;
+    }
+    project_input = input_arg;
+    project_input_word_stride = PackedWordCt(raw_sample_ct);
+    project_sample_indices = sample_indices;
+    project_subset_sample_ct = subset_sample_ct;
+    project_output = output_arg;
+    project_output_stride = output_variant_stride;
+    project_output_byte_ct = output_byte_ct;
+    return RunPhase(variant_offsets, false, true, error);
   }
 
   uint32_t thread_ct = 0;
@@ -232,6 +317,14 @@ struct CpuBlockDecoder::Impl {
   uint64_t* output = nullptr;
   size_t word_stride = 0;
   bool anchor_phase = false;
+  bool project_phase = false;
+  const uint64_t* project_input = nullptr;
+  size_t project_input_word_stride = 0;
+  const uint32_t* project_sample_indices = nullptr;
+  uint32_t project_subset_sample_ct = 0;
+  uint8_t* project_output = nullptr;
+  size_t project_output_stride = 0;
+  size_t project_output_byte_ct = 0;
   std::atomic<uint32_t> next_task = {0};
   std::atomic<bool> failed = {false};
   std::mutex error_mutex;
@@ -249,6 +342,15 @@ bool CpuBlockDecoder::Decode(const EncodedBlockView& block,
                              size_t output_word_ct, std::string* error) {
   return impl_->Decode(block, sample_ct, params, output, output_word_ct,
                        error);
+}
+
+bool CpuBlockDecoder::ProjectSampleSubset(
+    const uint64_t* input, uint32_t variant_ct, uint32_t raw_sample_ct,
+    const uint32_t* sample_indices, uint32_t subset_sample_ct,
+    uint8_t* output, size_t output_variant_stride, std::string* error) {
+  return impl_->ProjectSampleSubset(
+      input, variant_ct, raw_sample_ct, sample_indices,
+      subset_sample_ct, output, output_variant_stride, error);
 }
 
 uint32_t CpuBlockDecoder::thread_ct() const {

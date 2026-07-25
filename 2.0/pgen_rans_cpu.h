@@ -24,6 +24,13 @@ class CpuBlockDecoder {
               const CodecParams& params, uint64_t* output,
               size_t output_word_ct, std::string* error);
 
+  bool ProjectSampleSubset(const uint64_t* input, uint32_t variant_ct,
+                           uint32_t raw_sample_ct,
+                           const uint32_t* sample_indices,
+                           uint32_t subset_sample_ct, uint8_t* output,
+                           size_t output_variant_stride,
+                           std::string* error);
+
   uint32_t thread_ct() const;
 
  private:
