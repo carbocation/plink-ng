@@ -12,14 +12,29 @@
 namespace pgen_rans {
 
 struct ContainerParams {
-  uint32_t sample_ct = 0;
-  uint32_t variant_ct = 0;
-  uint32_t block_variant_ct = 128;
-  uint32_t anchor_ct = 32;
-  uint32_t state_ct = 32;
-  uint32_t scale_bits = 12;
-  uint32_t restart_variant_ct = 64;
-  uint32_t block_ct = 0;
+  ContainerParams(uint32_t samples = 0, uint32_t variants = 0,
+                  uint32_t block_variants = 128,
+                  uint32_t anchors = 32, uint32_t states = 32,
+                  uint32_t scale_bit_count = 12,
+                  uint32_t restart_variants = 64,
+                  uint32_t blocks = 0)
+      : sample_ct(samples),
+        variant_ct(variants),
+        block_variant_ct(block_variants),
+        anchor_ct(anchors),
+        state_ct(states),
+        scale_bits(scale_bit_count),
+        restart_variant_ct(restart_variants),
+        block_ct(blocks) {}
+
+  uint32_t sample_ct;
+  uint32_t variant_ct;
+  uint32_t block_variant_ct;
+  uint32_t anchor_ct;
+  uint32_t state_ct;
+  uint32_t scale_bits;
+  uint32_t restart_variant_ct;
+  uint32_t block_ct;
 };
 
 struct EncodedBlock {
@@ -28,16 +43,28 @@ struct EncodedBlock {
 };
 
 struct BlockIndexEntry {
-  uint32_t first_variant = 0;
-  uint32_t variant_ct = 0;
-  uint64_t file_offset = 0;
-  uint64_t byte_ct = 0;
-  uint32_t checksum = 0;
+  BlockIndexEntry(uint32_t first = 0, uint32_t variants = 0,
+                  uint64_t offset = 0, uint64_t bytes = 0,
+                  uint32_t crc = 0)
+      : first_variant(first),
+        variant_ct(variants),
+        file_offset(offset),
+        byte_ct(bytes),
+        checksum(crc) {}
+
+  uint32_t first_variant;
+  uint32_t variant_ct;
+  uint64_t file_offset;
+  uint64_t byte_ct;
+  uint32_t checksum;
 };
 
 struct ByteSpan {
-  const uint8_t* data = nullptr;
-  size_t size = 0;
+  ByteSpan(const uint8_t* bytes = nullptr, size_t byte_ct = 0)
+      : data(bytes), size(byte_ct) {}
+
+  const uint8_t* data;
+  size_t size;
 };
 
 class EncodedBlockView {

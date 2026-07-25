@@ -17,8 +17,12 @@ enum class RecordMode : uint8_t {
 };
 
 struct CodecParams {
-  uint32_t state_ct = 32;
-  uint32_t scale_bits = 12;
+  CodecParams(uint32_t state_count = 32,
+              uint32_t scale_bit_count = 12)
+      : state_ct(state_count), scale_bits(scale_bit_count) {}
+
+  uint32_t state_ct;
+  uint32_t scale_bits;
 };
 
 struct RecordMetadata {
