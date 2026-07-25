@@ -110,6 +110,27 @@ bool EnsureDeviceCapacity(T** pointer, size_t* capacity, size_t requested,
   return true;
 }
 
+template <typename T>
+bool EnsurePinnedCapacity(T** pointer, size_t* capacity, size_t requested,
+                          std::string* error) {
+  if (requested <= *capacity) {
+    return true;
+  }
+  T* replacement = nullptr;
+  if (!CheckCuda(
+          cudaHostAlloc(reinterpret_cast<void**>(&replacement),
+                        requested * sizeof(T), cudaHostAllocPortable),
+          "cudaHostAlloc", error)) {
+    return false;
+  }
+  if (*pointer) {
+    cudaFreeHost(*pointer);
+  }
+  *pointer = replacement;
+  *capacity = requested;
+  return true;
+}
+
 __device__ uint16_t ReadDeviceU16(const uint8_t* input) {
   return static_cast<uint16_t>(
       static_cast<uint16_t>(input[0]) |
@@ -407,29 +428,19 @@ __global__ void DecodeRecordsKernel(
         symbol = row.deterministic_symbol;
       } else {
         const uint32_t slot = state & slot_mask;
-        uint32_t selected_symbol = 4;
-        for (uint32_t candidate = 0; candidate != 4; ++candidate) {
-          const uint32_t frequency = row.frequencies[candidate];
-          if (frequency && (slot >= row.cumulative[candidate]) &&
-              (slot < row.cumulative[candidate] + frequency)) {
-            selected_symbol = candidate;
+        symbol =
+            static_cast<uint32_t>(slot >= row.cumulative[1]) +
+            static_cast<uint32_t>(slot >= row.cumulative[2]) +
+            static_cast<uint32_t>(slot >= row.cumulative[3]);
+        const uint32_t frequency = row.frequencies[symbol];
+        state = frequency * (state >> scale_bits) + slot -
+                row.cumulative[symbol];
+        while (state < kRansLowerBound) {
+          if (lane_iter == lane_start) {
+            lane_error = true;
             break;
           }
-        }
-        if (selected_symbol == 4) {
-          lane_error = true;
-        } else {
-          symbol = selected_symbol;
-          const uint32_t frequency = row.frequencies[symbol];
-          state = frequency * (state >> scale_bits) + slot -
-                  row.cumulative[symbol];
-          while (state < kRansLowerBound) {
-            if (lane_iter == lane_start) {
-              lane_error = true;
-              break;
-            }
-            state = (state << 8) | *--lane_iter;
-          }
+          state = (state << 8) | *--lane_iter;
         }
       }
     }
@@ -472,6 +483,33 @@ struct CudaBlockDecoder::Impl {
     cudaFree(device_anchor_descriptors);
     cudaFree(device_target_descriptors);
     cudaFree(device_error);
+    cudaFreeHost(host_record_bytes);
+    cudaFreeHost(host_anchor_descriptors);
+    cudaFreeHost(host_target_descriptors);
+    cudaFreeHost(host_error);
+    for (cudaEvent_t event : timing_events) {
+      if (event) {
+        cudaEventDestroy(event);
+      }
+    }
+  }
+
+  bool EnsureTimingEvents(std::string* error) {
+    if (timing_events[0]) {
+      return true;
+    }
+    for (uint32_t event_idx = 0; event_idx != 4; ++event_idx) {
+      if (!CheckCuda(cudaEventCreate(&(timing_events[event_idx])),
+                     "cudaEventCreate", error)) {
+        for (uint32_t cleanup_idx = 0; cleanup_idx != event_idx;
+             ++cleanup_idx) {
+          cudaEventDestroy(timing_events[cleanup_idx]);
+          timing_events[cleanup_idx] = nullptr;
+        }
+        return false;
+      }
+    }
+    return true;
   }
 
   bool Decode(const std::vector<const EncodedBlockView*>& blocks,
@@ -488,9 +526,9 @@ struct CudaBlockDecoder::Impl {
       SetError("Invalid conditional-rANS CUDA decoder arguments.", error);
       return false;
     }
-    host_record_bytes.clear();
-    host_anchor_descriptors.clear();
-    host_target_descriptors.clear();
+    size_t host_record_byte_ct = 0;
+    size_t host_anchor_descriptor_ct = 0;
+    size_t host_target_descriptor_ct = 0;
     uint64_t output_variant_ct = 0;
     for (const EncodedBlockView* block : blocks) {
       if ((!block) || (!block->variant_ct()) || (!block->anchor_ct())) {
@@ -501,6 +539,62 @@ struct CudaBlockDecoder::Impl {
         SetError("CUDA batch contains too many variants.", error);
         return false;
       }
+      for (uint32_t variant_offset = 0;
+           variant_offset != block->variant_ct(); ++variant_offset) {
+        const ByteSpan record = block->record(variant_offset);
+        if ((!record.data) || (!record.size) ||
+            (record.size > UINT32_MAX) ||
+            (host_record_byte_ct >
+             UINT32_MAX - record.size)) {
+          SetError("CUDA batch record bytes exceed format limits.",
+                   error);
+          return false;
+        }
+        host_record_byte_ct += record.size;
+      }
+      host_anchor_descriptor_ct += block->anchor_ct();
+      host_target_descriptor_ct +=
+          block->variant_ct() - block->anchor_ct();
+      output_variant_ct += block->variant_ct();
+    }
+    const uint32_t word_stride = (sample_ct + 31) / 32;
+    if ((output_variant_ct >
+         std::numeric_limits<size_t>::max() / word_stride) ||
+        (output_word_ct <
+         static_cast<size_t>(output_variant_ct) * word_stride)) {
+      SetError("CUDA decoder output buffer is too small.", error);
+      return false;
+    }
+    if ((timings && (!EnsureTimingEvents(error))) ||
+        (!EnsurePinnedCapacity(
+             &host_record_bytes, &host_record_byte_capacity,
+             host_record_byte_ct, error)) ||
+        (!EnsurePinnedCapacity(
+             &host_anchor_descriptors, &host_anchor_descriptor_capacity,
+             host_anchor_descriptor_ct, error)) ||
+        (!EnsurePinnedCapacity(
+             &host_target_descriptors, &host_target_descriptor_capacity,
+             host_target_descriptor_ct, error)) ||
+        (!EnsurePinnedCapacity(
+             &host_error, &host_error_capacity, 1, error)) ||
+        (!EnsureDeviceCapacity(
+             &device_record_bytes, &record_byte_capacity,
+             host_record_byte_ct, error)) ||
+        (!EnsureDeviceCapacity(
+             &device_anchor_descriptors, &anchor_descriptor_capacity,
+             host_anchor_descriptor_ct, error)) ||
+        (!EnsureDeviceCapacity(
+             &device_target_descriptors, &target_descriptor_capacity,
+             host_target_descriptor_ct, error)) ||
+        (!EnsureDeviceCapacity(&device_error, &error_capacity, 1, error))) {
+      return false;
+    }
+
+    size_t record_byte_offset = 0;
+    size_t anchor_descriptor_idx = 0;
+    size_t target_descriptor_idx = 0;
+    output_variant_ct = 0;
+    for (const EncodedBlockView* block : blocks) {
       const uint32_t block_output_variant =
           static_cast<uint32_t>(output_variant_ct);
       const std::vector<uint32_t> anchor_offsets =
@@ -514,8 +608,8 @@ struct CudaBlockDecoder::Impl {
         const ByteSpan record = block->record(variant_offset);
         if ((!record.data) || (!record.size) ||
             (record.size > UINT32_MAX) ||
-            (host_record_bytes.size() >
-             UINT32_MAX - record.size)) {
+            (record_byte_offset >
+             host_record_byte_ct - record.size)) {
           SetError("CUDA batch record bytes exceed format limits.", error);
           return false;
         }
@@ -532,133 +626,105 @@ struct CudaBlockDecoder::Impl {
           return false;
         }
         const DeviceRecordDescriptor descriptor = {
-            static_cast<uint32_t>(host_record_bytes.size()),
+            static_cast<uint32_t>(record_byte_offset),
             static_cast<uint32_t>(record.size),
             block_output_variant + variant_offset,
             block_output_variant,
             block->variant_ct(),
             block->anchor_ct()};
-        host_record_bytes.insert(host_record_bytes.end(), record.data,
-                                 record.data + record.size);
+        memcpy(host_record_bytes + record_byte_offset, record.data,
+               record.size);
+        record_byte_offset += record.size;
         if (is_anchor[variant_offset]) {
-          host_anchor_descriptors.push_back(descriptor);
+          host_anchor_descriptors[anchor_descriptor_idx++] = descriptor;
         } else {
-          host_target_descriptors.push_back(descriptor);
+          host_target_descriptors[target_descriptor_idx++] = descriptor;
         }
       }
       output_variant_ct += block->variant_ct();
     }
-    const uint32_t word_stride = (sample_ct + 31) / 32;
-    if ((output_variant_ct >
-         std::numeric_limits<size_t>::max() / word_stride) ||
-        (output_word_ct <
-         static_cast<size_t>(output_variant_ct) * word_stride)) {
-      SetError("CUDA decoder output buffer is too small.", error);
-      return false;
-    }
-    if ((!EnsureDeviceCapacity(
-             &device_record_bytes, &record_byte_capacity,
-             host_record_bytes.size(), error)) ||
-        (!EnsureDeviceCapacity(
-             &device_anchor_descriptors, &anchor_descriptor_capacity,
-             host_anchor_descriptors.size(), error)) ||
-        (!EnsureDeviceCapacity(
-             &device_target_descriptors, &target_descriptor_capacity,
-             host_target_descriptors.size(), error)) ||
-        (!EnsureDeviceCapacity(&device_error, &error_capacity, 1, error))) {
-      return false;
-    }
 
     cudaStream_t stream = reinterpret_cast<cudaStream_t>(stream_void);
-    cudaEvent_t events[4] = {};
-    for (uint32_t event_idx = 0; event_idx != 4; ++event_idx) {
-      if (!CheckCuda(cudaEventCreate(&(events[event_idx])),
-                     "cudaEventCreate", error)) {
-        for (uint32_t cleanup_idx = 0; cleanup_idx != event_idx;
-             ++cleanup_idx) {
-          cudaEventDestroy(events[cleanup_idx]);
-        }
-        return false;
-      }
-    }
-    const cudaEvent_t start_event = events[0];
-    const cudaEvent_t upload_event = events[1];
-    const cudaEvent_t anchor_event = events[2];
-    const cudaEvent_t target_event = events[3];
+    const cudaEvent_t start_event = timing_events[0];
+    const cudaEvent_t upload_event = timing_events[1];
+    const cudaEvent_t anchor_event = timing_events[2];
+    const cudaEvent_t target_event = timing_events[3];
     bool success =
-        CheckCuda(cudaEventRecord(start_event, stream), "cudaEventRecord",
-                  error) &&
+        ((!timings) ||
+         CheckCuda(cudaEventRecord(start_event, stream),
+                   "cudaEventRecord", error)) &&
         CheckCuda(cudaMemcpyAsync(
-                      device_record_bytes, host_record_bytes.data(),
-                      host_record_bytes.size(), cudaMemcpyHostToDevice,
+                      device_record_bytes, host_record_bytes,
+                      host_record_byte_ct, cudaMemcpyHostToDevice,
                       stream),
                   "cudaMemcpyAsync(record bytes)", error) &&
         CheckCuda(cudaMemcpyAsync(
                       device_anchor_descriptors,
-                      host_anchor_descriptors.data(),
-                      host_anchor_descriptors.size() *
+                      host_anchor_descriptors,
+                      host_anchor_descriptor_ct *
                           sizeof(DeviceRecordDescriptor),
                       cudaMemcpyHostToDevice, stream),
                   "cudaMemcpyAsync(anchor descriptors)", error) &&
         CheckCuda(cudaMemsetAsync(device_error, 0, sizeof(uint32_t),
                                   stream),
                   "cudaMemsetAsync", error);
-    if (success && (!host_target_descriptors.empty())) {
+    if (success && host_target_descriptor_ct) {
       success = CheckCuda(
           cudaMemcpyAsync(device_target_descriptors,
-                          host_target_descriptors.data(),
-                          host_target_descriptors.size() *
+                          host_target_descriptors,
+                          host_target_descriptor_ct *
                               sizeof(DeviceRecordDescriptor),
                           cudaMemcpyHostToDevice, stream),
           "cudaMemcpyAsync(target descriptors)", error);
     }
-    if (success) {
+    if (success && timings) {
       success = CheckCuda(cudaEventRecord(upload_event, stream),
                           "cudaEventRecord", error);
     }
     uint64_t* device_output =
         reinterpret_cast<uint64_t*>(device_output_void);
-    if (success && (!host_anchor_descriptors.empty())) {
+    if (success && host_anchor_descriptor_ct) {
       const uint32_t grid_size = static_cast<uint32_t>(
-          (host_anchor_descriptors.size() * kWarpSize +
+          (host_anchor_descriptor_ct * kWarpSize +
            kThreadsPerBlock - 1) /
           kThreadsPerBlock);
       DecodeRecordsKernel<<<grid_size, kThreadsPerBlock, 0, stream>>>(
           device_record_bytes, device_anchor_descriptors,
-          static_cast<uint32_t>(host_anchor_descriptors.size()), sample_ct,
+          static_cast<uint32_t>(host_anchor_descriptor_ct), sample_ct,
           params.scale_bits, device_output, word_stride, device_error);
       success = CheckCuda(cudaGetLastError(), "anchor kernel launch", error);
     }
     success =
         success &&
-        CheckCuda(cudaEventRecord(anchor_event, stream), "cudaEventRecord",
-                  error);
-    if (success && (!host_target_descriptors.empty())) {
+        ((!timings) ||
+         CheckCuda(cudaEventRecord(anchor_event, stream),
+                   "cudaEventRecord", error));
+    if (success && host_target_descriptor_ct) {
       const uint32_t grid_size = static_cast<uint32_t>(
-          (host_target_descriptors.size() * kWarpSize +
+          (host_target_descriptor_ct * kWarpSize +
            kThreadsPerBlock - 1) /
           kThreadsPerBlock);
       DecodeRecordsKernel<<<grid_size, kThreadsPerBlock, 0, stream>>>(
           device_record_bytes, device_target_descriptors,
-          static_cast<uint32_t>(host_target_descriptors.size()), sample_ct,
+          static_cast<uint32_t>(host_target_descriptor_ct), sample_ct,
           params.scale_bits, device_output, word_stride, device_error);
       success = CheckCuda(cudaGetLastError(), "target kernel launch", error);
     }
     success =
         success &&
-        CheckCuda(cudaEventRecord(target_event, stream), "cudaEventRecord",
-                  error);
-    uint32_t host_error = 0;
+        ((!timings) ||
+         CheckCuda(cudaEventRecord(target_event, stream),
+                   "cudaEventRecord", error));
     success =
         success &&
-        CheckCuda(cudaMemcpyAsync(&host_error, device_error,
-                                  sizeof(host_error),
+        CheckCuda(cudaMemcpyAsync(host_error, device_error,
+                                  sizeof(*host_error),
                                   cudaMemcpyDeviceToHost, stream),
                   "cudaMemcpyAsync(error)", error) &&
         CheckCuda(cudaStreamSynchronize(stream), "cudaStreamSynchronize",
-                  error);
-    if (success && host_error) {
-      SetError(DeviceErrorMessage(host_error), error);
+                                  error);
+    if (success && *host_error) {
+      SetError(DeviceErrorMessage(*host_error), error);
       success = false;
     }
     if (success && timings) {
@@ -679,9 +745,6 @@ struct CudaBlockDecoder::Impl {
         timings->genotype_call_ct = output_variant_ct * sample_ct;
       }
     }
-    for (cudaEvent_t event : events) {
-      cudaEventDestroy(event);
-    }
     return success;
   }
 
@@ -694,9 +757,15 @@ struct CudaBlockDecoder::Impl {
   size_t anchor_descriptor_capacity = 0;
   size_t target_descriptor_capacity = 0;
   size_t error_capacity = 0;
-  std::vector<uint8_t> host_record_bytes;
-  std::vector<DeviceRecordDescriptor> host_anchor_descriptors;
-  std::vector<DeviceRecordDescriptor> host_target_descriptors;
+  uint8_t* host_record_bytes = nullptr;
+  DeviceRecordDescriptor* host_anchor_descriptors = nullptr;
+  DeviceRecordDescriptor* host_target_descriptors = nullptr;
+  uint32_t* host_error = nullptr;
+  size_t host_record_byte_capacity = 0;
+  size_t host_anchor_descriptor_capacity = 0;
+  size_t host_target_descriptor_capacity = 0;
+  size_t host_error_capacity = 0;
+  cudaEvent_t timing_events[4] = {};
 };
 
 CudaBlockDecoder::CudaBlockDecoder() : impl_(new Impl()) {}
