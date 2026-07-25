@@ -553,7 +553,7 @@ RansEstimate EstimateRans(const uint32_t* counts, uint32_t row_ct,
                           const Options& opts, uint32_t sample_ct) {
   RansEstimate result;
   const bool conditional = (reference_ct != 0);
-  result.model_bytes = 1;
+  result.model_bytes = (reference_ct == 2) ? 2 : 1;
   for (uint32_t row_idx = 0; row_idx != row_ct; ++row_idx) {
     const uint32_t* row = &(counts[row_idx * 4]);
     uint32_t row_total = 0;
