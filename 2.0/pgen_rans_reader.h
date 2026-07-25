@@ -1,0 +1,51 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+
+#ifndef PGEN_RANS_READER_H_
+#define PGEN_RANS_READER_H_
+
+#include <cstddef>
+#include <cstdint>
+#include <memory>
+#include <string>
+
+namespace pgen_rans {
+
+struct PackedReadStats {
+  uint64_t block_read_ct = 0;
+  uint64_t block_byte_ct = 0;
+  uint64_t decoded_variant_ct = 0;
+  uint64_t returned_variant_ct = 0;
+  double block_read_seconds = 0.0;
+  double decode_seconds = 0.0;
+};
+
+class PackedVariantReader {
+ public:
+  PackedVariantReader();
+  ~PackedVariantReader();
+  PackedVariantReader(const PackedVariantReader&) = delete;
+  PackedVariantReader& operator=(const PackedVariantReader&) = delete;
+
+  bool Open(const std::string& path, uint32_t thread_ct,
+            std::string* error);
+  void Close();
+
+  uint32_t sample_ct() const;
+  uint32_t variant_ct() const;
+  size_t packed_variant_byte_ct() const;
+
+  bool ReadRange(uint32_t first_variant, uint32_t variant_ct,
+                 uint8_t* output, size_t output_variant_stride,
+                 PackedReadStats* stats, std::string* error);
+  bool ReadList(const uint32_t* variants, uint32_t variant_ct,
+                uint8_t* output, size_t output_variant_stride,
+                PackedReadStats* stats, std::string* error);
+
+ private:
+  struct Impl;
+  std::unique_ptr<Impl> impl_;
+};
+
+}  // namespace pgen_rans
+
+#endif  // PGEN_RANS_READER_H_

@@ -120,12 +120,26 @@ all remaining records independently across a persistent worker pool. The
 32-state record path advances the independent states in sample order and emits
 one complete 64-bit packed genotype word per round.
 
+`PackedVariantReader` is the CPU-facing compatibility layer. It accepts
+contiguous ranges or arbitrary variant-index lists, groups requests by block,
+decodes each required block once, and copies exact `(sample_count + 3) / 4`
+byte packed hardcalls into the caller's existing per-variant stride. The most
+recent decoded block is retained for adjacent or repeated requests. It does
+not yet support a sample subset; callers must use the complete sample order
+stored in the container.
+
 ## Reference CLI
 
 Build from `2.0/`:
 
 ```sh
 make -f Makefile.pgen_rans pgen_rans
+```
+
+CPU consumers can instead build `bin/libpgen_rans.a`:
+
+```sh
+make -f Makefile.pgen_rans libpgen_rans
 ```
 
 Encode an unphased, biallelic hardcall PGEN:

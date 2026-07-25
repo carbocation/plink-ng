@@ -5,13 +5,21 @@ include Makefile
 PGENRANSCODECOBJ = pgen_rans_codec.o
 PGENRANSTESTOBJ = $(PGENRANSCODECOBJ) pgen_rans_codec_test.o
 PGENRANSCONTAINEROBJ = pgen_rans_container.o pgen_rans_cpu.o
+PGENRANSLIBOBJ = $(PGENRANSCODECOBJ) $(PGENRANSCONTAINEROBJ) \
+	pgen_rans_reader.o
 PGENRANSCONTAINERTESTOBJ = $(PGENRANSCODECOBJ) \
-	$(PGENRANSCONTAINEROBJ) pgen_rans_container_test.o
+	$(PGENRANSCONTAINEROBJ) pgen_rans_reader.o \
+	pgen_rans_container_test.o
 PGENRANSTOOLSRC = $(PGENLIB_CCSRC) pgen_rans_codec.cc \
 	pgen_rans_container.cc pgen_rans_cpu.cc pgen_rans_tool.cc
 PGENRANSTOOLOBJ = $(PGENRANSTOOLSRC:.cc=.o)
 
-.PHONY: pgen_rans pgen_rans_codec_test pgen_rans_container_test test
+.PHONY: libpgen_rans pgen_rans pgen_rans_codec_test \
+	pgen_rans_container_test test
+
+libpgen_rans: $(PGENRANSLIBOBJ)
+	$(MKDIR) -p bin
+	$(AR) rcs bin/libpgen_rans.a $(PGENRANSLIBOBJ)
 
 pgen_rans: $(PGENRANSTOOLOBJ)
 	$(MKDIR) -p bin
@@ -32,5 +40,5 @@ test: pgen_rans_codec_test pgen_rans_container_test
 	bin/pgen_rans_codec_test
 	bin/pgen_rans_container_test
 
-CLEAN += bin/pgen_rans bin/pgen_rans_codec_test \
+CLEAN += bin/libpgen_rans.a bin/pgen_rans bin/pgen_rans_codec_test \
 	bin/pgen_rans_container_test

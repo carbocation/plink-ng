@@ -3,6 +3,7 @@
 #include "pgen_rans_codec.h"
 #include "pgen_rans_container.h"
 #include "pgen_rans_cpu.h"
+#include "pgen_rans_reader.h"
 
 #include <algorithm>
 #include <cerrno>
@@ -21,6 +22,8 @@ using pgen_rans::ContainerReader;
 using pgen_rans::ContainerWriter;
 using pgen_rans::CpuBlockDecoder;
 using pgen_rans::EncodedBlockView;
+using pgen_rans::PackedReadStats;
+using pgen_rans::PackedVariantReader;
 using pgen_rans::DecodeRecord;
 using pgen_rans::EncodeRecord;
 using pgen_rans::EncodedBlock;
@@ -289,6 +292,59 @@ int main() {
              decoded_block.size() - 1, &error),
          "CPU block decoder accepted an undersized output");
   reader.Close();
+
+  PackedVariantReader packed_reader;
+  Expect(packed_reader.Open(path, 4, &error),
+         "packed reader open failed: " + error);
+  Expect(packed_reader.sample_ct() == kSampleCt,
+         "packed reader sample count mismatch");
+  Expect(packed_reader.variant_ct() == kVariantCt,
+         "packed reader variant count mismatch");
+  const size_t packed_byte_ct = (kSampleCt + 3) / 4;
+  const size_t output_stride = packed_byte_ct + 5;
+  std::vector<uint8_t> packed_output(7 * output_stride, 0xa5);
+  PackedReadStats packed_stats;
+  Expect(packed_reader.ReadRange(
+             7, 7, packed_output.data(), output_stride, &packed_stats,
+             &error),
+         "packed range read failed: " + error);
+  for (uint32_t output_idx = 0; output_idx != 7; ++output_idx) {
+    Expect(!memcmp(packed_output.data() + output_idx * output_stride,
+                   source[7 + output_idx].data(), packed_byte_ct),
+           "packed range genotype mismatch");
+    for (size_t padding_idx = packed_byte_ct;
+         padding_idx != output_stride; ++padding_idx) {
+      Expect(packed_output[output_idx * output_stride + padding_idx] == 0xa5,
+             "packed range read overwrote output padding");
+    }
+  }
+  const uint32_t requested_variants[] = {18, 1, 11, 10, 1};
+  packed_output.assign(5 * output_stride, 0xa5);
+  Expect(packed_reader.ReadList(
+             requested_variants, 5, packed_output.data(), output_stride,
+             &packed_stats, &error),
+         "packed list read failed: " + error);
+  for (uint32_t output_idx = 0; output_idx != 5; ++output_idx) {
+    Expect(!memcmp(packed_output.data() + output_idx * output_stride,
+                   source[requested_variants[output_idx]].data(),
+                   packed_byte_ct),
+           "packed list genotype mismatch");
+  }
+  const uint64_t cached_read_ct = packed_stats.block_read_ct;
+  packed_output.assign(2 * output_stride, 0xa5);
+  Expect(packed_reader.ReadRange(
+             10, 2, packed_output.data(), output_stride, &packed_stats,
+             &error),
+         "cached packed range read failed: " + error);
+  Expect(packed_stats.block_read_ct == cached_read_ct,
+         "packed reader did not reuse its decoded block cache");
+  Expect(packed_stats.returned_variant_ct == 14,
+         "packed reader returned-variant accounting mismatch");
+  Expect(!packed_reader.ReadRange(
+             kVariantCt, 1, packed_output.data(), output_stride,
+             &packed_stats, &error),
+         "packed reader accepted an out-of-range request");
+  packed_reader.Close();
 
   FILE* corrupt_file = fopen(path.c_str(), "r+b");
   Expect(corrupt_file != nullptr, "could not reopen temporary container");
