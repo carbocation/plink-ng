@@ -344,6 +344,48 @@ int main() {
              kVariantCt, 1, packed_output.data(), output_stride,
              &packed_stats, &error),
          "packed reader accepted an out-of-range request");
+  const uint32_t sample_subset[] = {0, 2, 33, 999, 1002};
+  Expect(packed_reader.SetSampleSubset(
+             sample_subset, 5, &error),
+         "packed reader sample subset failed: " + error);
+  Expect(packed_reader.raw_sample_ct() == kSampleCt,
+         "packed reader raw sample count changed");
+  Expect(packed_reader.sample_ct() == 5,
+         "packed reader subset sample count mismatch");
+  Expect(packed_reader.packed_variant_byte_ct() == 2,
+         "packed reader subset byte count mismatch");
+  std::vector<uint8_t> subset_output(5 * 4, 0xa5);
+  Expect(packed_reader.ReadList(
+             requested_variants, 5, subset_output.data(), 4,
+             &packed_stats, &error),
+         "packed subset read failed: " + error);
+  for (uint32_t output_idx = 0; output_idx != 5; ++output_idx) {
+    for (uint32_t subset_idx = 0; subset_idx != 5; ++subset_idx) {
+      const uint8_t observed =
+          static_cast<uint8_t>(
+              (subset_output[4 * output_idx + subset_idx / 4] >>
+               (2 * (subset_idx % 4))) &
+              3U);
+      const uint8_t expected = GetPackedGenotype(
+          source[requested_variants[output_idx]].data(),
+          sample_subset[subset_idx]);
+      Expect(observed == expected, "packed subset genotype mismatch");
+    }
+    Expect((subset_output[4 * output_idx + 1] & 0xfcU) == 0,
+           "packed subset trailing bits are nonzero");
+    Expect((subset_output[4 * output_idx + 2] == 0xa5) &&
+               (subset_output[4 * output_idx + 3] == 0xa5),
+           "packed subset read overwrote output padding");
+  }
+  const uint32_t invalid_subset[] = {2, 1};
+  Expect(!packed_reader.SetSampleSubset(
+             invalid_subset, 2, &error),
+         "packed reader accepted an unsorted sample subset");
+  Expect(packed_reader.sample_ct() == 5,
+         "invalid sample subset changed reader state");
+  packed_reader.ClearSampleSubset();
+  Expect(packed_reader.sample_ct() == kSampleCt,
+         "packed reader did not clear its sample subset");
   packed_reader.Close();
 
   FILE* corrupt_file = fopen(path.c_str(), "r+b");

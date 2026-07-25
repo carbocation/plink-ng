@@ -47,8 +47,7 @@ struct PackedVariantReader::Impl {
     }
     params = {reader.params().state_ct, reader.params().scale_bits};
     word_stride = PackedWordCt(reader.params().sample_ct);
-    packed_byte_ct =
-        (static_cast<size_t>(reader.params().sample_ct) + 3) / 4;
+    ClearSampleSubset();
     return true;
   }
 
@@ -57,11 +56,60 @@ struct PackedVariantReader::Impl {
     reader.Close();
     params = {};
     word_stride = 0;
+    output_sample_ct = 0;
     packed_byte_ct = 0;
+    sample_subset.clear();
     cached_block_idx = UINT32_MAX;
     block_storage.clear();
     decoded_block.clear();
     block_view = {};
+  }
+
+  void ClearSampleSubset() {
+    sample_subset.clear();
+    output_sample_ct = reader.params().sample_ct;
+    packed_byte_ct =
+        (static_cast<size_t>(output_sample_ct) + 3) / 4;
+  }
+
+  bool SetSampleSubset(const uint32_t* sample_indices,
+                       uint32_t subset_sample_ct, std::string* error) {
+    if ((!decoder) || (!sample_indices) || (!subset_sample_ct) ||
+        (subset_sample_ct > reader.params().sample_ct)) {
+      SetError("Invalid conditional-rANS sample subset.", error);
+      return false;
+    }
+    std::vector<uint32_t> candidate(
+        sample_indices, sample_indices + subset_sample_ct);
+    for (uint32_t subset_idx = 0; subset_idx != subset_sample_ct;
+         ++subset_idx) {
+      if ((candidate[subset_idx] >= reader.params().sample_ct) ||
+          (subset_idx &&
+           (candidate[subset_idx - 1] >= candidate[subset_idx]))) {
+        SetError(
+            "Conditional-rANS sample subset must be sorted and unique.",
+            error);
+        return false;
+      }
+    }
+    sample_subset.swap(candidate);
+    output_sample_ct = subset_sample_ct;
+    packed_byte_ct =
+        (static_cast<size_t>(output_sample_ct) + 3) / 4;
+    if (subset_sample_ct == reader.params().sample_ct) {
+      bool identity = true;
+      for (uint32_t sample_idx = 0; sample_idx != subset_sample_ct;
+           ++sample_idx) {
+        if (sample_subset[sample_idx] != sample_idx) {
+          identity = false;
+          break;
+        }
+      }
+      if (identity) {
+        sample_subset.clear();
+      }
+    }
+    return true;
   }
 
   bool DecodeBlock(uint32_t block_idx, PackedReadStats* stats,
@@ -153,7 +201,23 @@ struct PackedVariantReader::Impl {
       uint8_t* destination =
           output +
           static_cast<size_t>(request.second) * output_variant_stride;
-      memcpy(destination, source, packed_byte_ct);
+      if (sample_subset.empty()) {
+        memcpy(destination, source, packed_byte_ct);
+      } else {
+        memset(destination, 0, packed_byte_ct);
+        for (uint32_t subset_idx = 0; subset_idx != output_sample_ct;
+             ++subset_idx) {
+          const uint32_t source_idx = sample_subset[subset_idx];
+          const uint8_t genotype =
+              static_cast<uint8_t>(
+                  (source[source_idx / 4] >>
+                   (2 * (source_idx % 4))) &
+                  3U);
+          destination[subset_idx / 4] |=
+              static_cast<uint8_t>(genotype <<
+                                   (2 * (subset_idx % 4)));
+        }
+      }
     }
     if (stats) {
       stats->returned_variant_ct += variant_ct;
@@ -165,7 +229,9 @@ struct PackedVariantReader::Impl {
   std::unique_ptr<CpuBlockDecoder> decoder;
   CodecParams params;
   uint32_t word_stride = 0;
+  uint32_t output_sample_ct = 0;
   size_t packed_byte_ct = 0;
+  std::vector<uint32_t> sample_subset;
   uint32_t cached_block_idx = UINT32_MAX;
   std::vector<uint8_t> block_storage;
   EncodedBlockView block_view;
@@ -187,6 +253,10 @@ void PackedVariantReader::Close() {
 }
 
 uint32_t PackedVariantReader::sample_ct() const {
+  return impl_->output_sample_ct;
+}
+
+uint32_t PackedVariantReader::raw_sample_ct() const {
   return impl_->reader.params().sample_ct;
 }
 
@@ -196,6 +266,16 @@ uint32_t PackedVariantReader::variant_ct() const {
 
 size_t PackedVariantReader::packed_variant_byte_ct() const {
   return impl_->packed_byte_ct;
+}
+
+bool PackedVariantReader::SetSampleSubset(
+    const uint32_t* sample_indices, uint32_t subset_sample_ct,
+    std::string* error) {
+  return impl_->SetSampleSubset(sample_indices, subset_sample_ct, error);
+}
+
+void PackedVariantReader::ClearSampleSubset() {
+  impl_->ClearSampleSubset();
 }
 
 bool PackedVariantReader::ReadRange(

@@ -124,9 +124,11 @@ one complete 64-bit packed genotype word per round.
 contiguous ranges or arbitrary variant-index lists, groups requests by block,
 decodes each required block once, and copies exact `(sample_count + 3) / 4`
 byte packed hardcalls into the caller's existing per-variant stride. The most
-recent decoded block is retained for adjacent or repeated requests. It does
-not yet support a sample subset; callers must use the complete sample order
-stored in the container.
+recent decoded block is retained for adjacent or repeated requests. An
+optional sorted sample index projects the fully decoded record into a smaller
+packed output. Since rANS states cannot jump over arbitrary samples, this
+projection reduces downstream work and buffer size but not entropy-decode
+work.
 
 ## Reference CLI
 
