@@ -5,13 +5,16 @@ include Makefile
 CUDAROOT ?= /usr/local/cuda
 NVCC ?= $(CUDAROOT)/bin/nvcc
 CUDA_ARCH ?= 80
+CUDA_ARCHS ?= $(CUDA_ARCH)
+CUDA_GENCODE ?= $(foreach arch,$(CUDA_ARCHS),\
+	-gencode arch=compute_$(arch),code=sm_$(arch))
 PGENRANSCUDAOBJ = pgen_rans_codec.o pgen_rans_container.o \
 	pgen_rans_cpu.o pgen_rans_cuda.o pgen_rans_cuda_benchmark.o
 
 .PHONY: pgen_rans_cuda_benchmark
 
 pgen_rans_cuda.o: pgen_rans_cuda.cu pgen_rans_cuda.h
-	$(NVCC) -O3 -std=c++17 -lineinfo -arch=sm_$(CUDA_ARCH) \
+	$(NVCC) -O3 -std=c++17 -lineinfo $(CUDA_GENCODE) \
 		-Xcompiler -Wall,-Wextra,-Wshadow \
 		-I. -c $< -o $@
 
@@ -21,7 +24,7 @@ pgen_rans_cuda_benchmark.o: pgen_rans_cuda_benchmark.cc
 
 pgen_rans_cuda_benchmark: $(PGENRANSCUDAOBJ)
 	$(MKDIR) -p bin
-	$(NVCC) -std=c++17 -arch=sm_$(CUDA_ARCH) $(PGENRANSCUDAOBJ) \
+	$(NVCC) -std=c++17 $(CUDA_GENCODE) $(PGENRANSCUDAOBJ) \
 		-o bin/pgen_rans_cuda_benchmark -lpthread
 
 CLEAN += bin/pgen_rans_cuda_benchmark

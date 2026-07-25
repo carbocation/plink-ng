@@ -205,3 +205,12 @@ The benchmark reports block-read, host-to-device, anchor-kernel,
 target-kernel, and complete decoder wall times separately. GPU output is
 copied back once per batch and compared byte-for-byte with the persistent
 CPU block decoder.
+
+To build one fat binary for both T4 (`sm_75`) and A100 (`sm_80`), use:
+
+```sh
+make -f Makefile.pgen_rans_cuda CUDA_ARCHS="75 80"
+```
+
+`compression_builds.md` documents the Linux MKL, macOS Accelerate, and
+multi-architecture CUDA artifact workflow.

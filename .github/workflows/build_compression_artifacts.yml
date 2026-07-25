@@ -1,0 +1,303 @@
+name: Build compression artifacts
+
+on:
+  workflow_dispatch:
+  push:
+    tags:
+      - "compression-v*"
+
+permissions:
+  contents: read
+
+jobs:
+  linux-cpu:
+    name: Linux x86-64-v3 with static oneMKL
+    runs-on: ubuntu-22.04
+    timeout-minutes: 90
+
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v5
+
+      - name: Install build dependencies and oneMKL
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            build-essential \
+            gpg \
+            wget \
+            zlib1g-dev
+          wget -qO- \
+            https://apt.repos.intel.com/intel-gpg-keys/GPG-PUB-KEY-INTEL-SW-PRODUCTS.PUB \
+            | gpg --dearmor \
+            | sudo tee /usr/share/keyrings/oneapi-archive-keyring.gpg \
+              >/dev/null
+          echo \
+            "deb [signed-by=/usr/share/keyrings/oneapi-archive-keyring.gpg] https://apt.repos.intel.com/oneapi all main" \
+            | sudo tee /etc/apt/sources.list.d/oneAPI.list >/dev/null
+          sudo apt-get update
+          sudo apt-get install -y intel-oneapi-mkl-devel
+
+      - name: Build PLINK 2 with AVX2 and static oneMKL
+        shell: bash
+        run: |
+          set -eo pipefail
+          source /opt/intel/oneapi/setvars.sh
+          set -u
+          mkl_lib_dir="$(
+            dirname "$(find "$MKLROOT" -name libmkl_core.a -print -quit)"
+          )"
+          test -f "$mkl_lib_dir/libmkl_intel_ilp64.a"
+          test -f "$mkl_lib_dir/libmkl_gnu_thread.a"
+          static_blas_flags="\
+          -Wl,--start-group \
+          $mkl_lib_dir/libmkl_intel_ilp64.a \
+          $mkl_lib_dir/libmkl_gnu_thread.a \
+          $mkl_lib_dir/libmkl_core.a \
+          -Wl,--end-group -lgomp"
+          make -C 2.0/build_dynamic clean
+          make -C 2.0/build_dynamic -j2 \
+            DEBUG=-DNDEBUG \
+            NO_AVX2= \
+            NO_SSE42= \
+            DYNAMIC_MKL=1 \
+            MKLROOT="$MKLROOT" \
+            MKL_IOMP5_DIR="$mkl_lib_dir" \
+            BLASFLAGS="$static_blas_flags"
+
+      - name: Build and test conditional-rANS tools
+        run: |
+          make -C 2.0 -f Makefile.pgen_rans -j2 \
+            BASEFLAGS="-O3 -DNDEBUG -march=x86-64-v3 -ffp-contract=off -DZSTD_MULTITHREAD -DIGNORE_BUNDLED_ZSTD" \
+            test pgen_rans libpgen_rans
+
+      - name: Smoke-test binaries
+        shell: bash
+        run: |
+          set -euo pipefail
+          2.0/build_dynamic/plink2 --version | tee /tmp/plink2-version.txt
+          grep -q AVX2 /tmp/plink2-version.txt
+          grep -q Intel /tmp/plink2-version.txt
+          2.0/bin/pgen_rans --help
+          if ldd 2.0/build_dynamic/plink2 | grep -Eq 'mkl|iomp'; then
+            echo "PLINK has an unexpected dynamic oneMKL dependency." >&2
+            exit 1
+          fi
+
+      - name: Package Linux artifact
+        shell: bash
+        run: |
+          set -euo pipefail
+          artifact_dir="$RUNNER_TEMP/plink2-linux-x86_64-v3-mkl"
+          mkdir -p "$artifact_dir/bin" "$artifact_dir/include" \
+            "$artifact_dir/lib"
+          install -m 755 2.0/build_dynamic/plink2 \
+            "$artifact_dir/bin/plink2"
+          install -m 755 2.0/build_dynamic/pgen_compress \
+            "$artifact_dir/bin/pgen_compress"
+          install -m 755 2.0/bin/pgen_rans \
+            "$artifact_dir/bin/pgen_rans"
+          install -m 644 2.0/bin/libpgen_rans.a \
+            "$artifact_dir/lib/libpgen_rans.a"
+          install -m 644 \
+            2.0/pgen_rans_codec.h \
+            2.0/pgen_rans_container.h \
+            2.0/pgen_rans_cpu.h \
+            2.0/pgen_rans_reader.h \
+            "$artifact_dir/include/"
+          install -m 644 1.9/LICENSE "$artifact_dir/LICENSE"
+          {
+            echo "commit=$GITHUB_SHA"
+            echo "runner=$(uname -srvmo)"
+            echo "compiler=$(g++ --version | head -1)"
+            echo "cpu_floor=x86-64-v3"
+            echo "linear_algebra=static-oneMKL-ILP64"
+            2.0/build_dynamic/plink2 --version
+          } >"$artifact_dir/build-info.txt"
+          (
+            cd "$artifact_dir"
+            sha256sum bin/* include/* lib/* >SHA256SUMS
+          )
+
+      - name: Upload Linux artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: plink2-linux-x86_64-v3-mkl-${{ github.sha }}
+          path: ${{ runner.temp }}/plink2-linux-x86_64-v3-mkl
+          if-no-files-found: error
+          retention-days: 14
+
+  macos-cpu:
+    name: ${{ matrix.name }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: macOS Apple Silicon with Accelerate
+            runner: macos-15
+            expected_arch: arm64
+            artifact: plink2-macos-arm64-accelerate
+          - name: macOS Intel AVX2 with Accelerate
+            runner: macos-15-intel
+            expected_arch: x86_64
+            artifact: plink2-macos-x86_64-v3-accelerate
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 60
+
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v5
+
+      - name: Install zstd
+        run: brew install zstd
+
+      - name: Validate runner architecture
+        run: test "$(uname -m)" = "${{ matrix.expected_arch }}"
+
+      - name: Build PLINK 2
+        shell: bash
+        run: |
+          set -euo pipefail
+          make -C 2.0/build_dynamic clean
+          if [[ "$(uname -m)" == "x86_64" ]]; then
+            make -C 2.0/build_dynamic -j3 \
+              DEBUG=-DNDEBUG \
+              NO_AVX2= \
+              NO_SSE42=
+          else
+            make -C 2.0/build_dynamic -j3 \
+              "DEBUG=-DNDEBUG -mcpu=apple-m1"
+          fi
+
+      - name: Build and test conditional-rANS tools
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [[ "$(uname -m)" == "x86_64" ]]; then
+            cpu_flags="-march=x86-64-v3"
+          else
+            cpu_flags="-mcpu=apple-m1"
+          fi
+          make -C 2.0 -f Makefile.pgen_rans -j3 \
+            BASEFLAGS="-O3 -DNDEBUG $cpu_flags -ffp-contract=off -DZSTD_MULTITHREAD -DIGNORE_BUNDLED_ZSTD" \
+            test pgen_rans libpgen_rans
+
+      - name: Smoke-test binaries
+        shell: bash
+        run: |
+          set -euo pipefail
+          2.0/build_dynamic/plink2 --version | tee /tmp/plink2-version.txt
+          if [[ "$(uname -m)" == "x86_64" ]]; then
+            grep -q AVX2 /tmp/plink2-version.txt
+          else
+            grep -q M1 /tmp/plink2-version.txt
+          fi
+          otool -L 2.0/build_dynamic/plink2 | grep -q Accelerate
+          2.0/bin/pgen_rans --help
+
+      - name: Package macOS artifact
+        shell: bash
+        run: |
+          set -euo pipefail
+          artifact_dir="$RUNNER_TEMP/${{ matrix.artifact }}"
+          mkdir -p "$artifact_dir/bin" "$artifact_dir/include" \
+            "$artifact_dir/lib"
+          install -m 755 2.0/build_dynamic/plink2 \
+            "$artifact_dir/bin/plink2"
+          install -m 755 2.0/build_dynamic/pgen_compress \
+            "$artifact_dir/bin/pgen_compress"
+          install -m 755 2.0/bin/pgen_rans \
+            "$artifact_dir/bin/pgen_rans"
+          install -m 644 2.0/bin/libpgen_rans.a \
+            "$artifact_dir/lib/libpgen_rans.a"
+          install -m 644 \
+            2.0/pgen_rans_codec.h \
+            2.0/pgen_rans_container.h \
+            2.0/pgen_rans_cpu.h \
+            2.0/pgen_rans_reader.h \
+            "$artifact_dir/include/"
+          install -m 644 1.9/LICENSE "$artifact_dir/LICENSE"
+          {
+            echo "commit=$GITHUB_SHA"
+            echo "runner=$(uname -srvmo)"
+            echo "compiler=$(c++ --version | head -1)"
+            echo "cpu_floor=${{ matrix.expected_arch }}"
+            echo "linear_algebra=Apple-Accelerate"
+            2.0/build_dynamic/plink2 --version
+          } >"$artifact_dir/build-info.txt"
+          (
+            cd "$artifact_dir"
+            shasum -a 256 bin/* include/* lib/* >SHA256SUMS
+          )
+
+      - name: Upload macOS artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.artifact }}-${{ github.sha }}
+          path: ${{ runner.temp }}/${{ matrix.artifact }}
+          if-no-files-found: error
+          retention-days: 14
+
+  linux-cuda:
+    name: Linux CUDA decoder for T4 and A100
+    runs-on: ubuntu-22.04
+    container:
+      image: nvidia/cuda:12.6.3-devel-ubuntu22.04
+    timeout-minutes: 45
+
+    steps:
+      - name: Install build dependencies
+        run: |
+          apt-get update
+          DEBIAN_FRONTEND=noninteractive apt-get install -y \
+            build-essential \
+            git \
+            zlib1g-dev
+
+      - name: Check out source
+        uses: actions/checkout@v5
+
+      - name: Build T4/A100 CUDA fat binary
+        run: |
+          make -C 2.0 -f Makefile.pgen_rans_cuda -j2 \
+            CUDAROOT=/usr/local/cuda \
+            CUDA_ARCHS="75 80"
+
+      - name: Inspect CUDA images and smoke-test
+        shell: bash
+        run: |
+          set -euo pipefail
+          2.0/bin/pgen_rans_cuda_benchmark --help
+          /usr/local/cuda/bin/cuobjdump --list-elf \
+            2.0/bin/pgen_rans_cuda_benchmark \
+            | tee /tmp/cuda-images.txt
+          grep -q sm_75 /tmp/cuda-images.txt
+          grep -q sm_80 /tmp/cuda-images.txt
+
+      - name: Package CUDA artifact
+        shell: bash
+        run: |
+          set -euo pipefail
+          artifact_dir="$RUNNER_TEMP/pgen-rans-cuda-sm75-sm80"
+          mkdir -p "$artifact_dir/bin"
+          install -m 755 2.0/bin/pgen_rans_cuda_benchmark \
+            "$artifact_dir/bin/pgen_rans_cuda_benchmark"
+          install -m 644 1.9/LICENSE "$artifact_dir/LICENSE"
+          {
+            echo "commit=$GITHUB_SHA"
+            echo "runner=$(uname -srvmo)"
+            echo "cuda_architectures=sm_75,sm_80"
+            /usr/local/cuda/bin/nvcc --version
+          } >"$artifact_dir/build-info.txt"
+          (
+            cd "$artifact_dir"
+            sha256sum bin/* >SHA256SUMS
+          )
+
+      - name: Upload CUDA artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: pgen-rans-cuda-sm75-sm80-${{ github.sha }}
+          path: ${{ runner.temp }}/pgen-rans-cuda-sm75-sm80
+          if-no-files-found: error
+          retention-days: 14
