@@ -3,6 +3,8 @@ name: Build compression artifacts
 on:
   workflow_dispatch:
   push:
+    branches:
+      - "feature/compression"
     tags:
       - "compression-v*"
 
