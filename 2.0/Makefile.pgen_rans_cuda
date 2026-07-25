@@ -1,0 +1,27 @@
+.DEFAULT_GOAL := pgen_rans_cuda_benchmark
+
+include Makefile
+
+CUDAROOT ?= /usr/local/cuda
+NVCC ?= $(CUDAROOT)/bin/nvcc
+CUDA_ARCH ?= 80
+PGENRANSCUDAOBJ = pgen_rans_codec.o pgen_rans_container.o \
+	pgen_rans_cpu.o pgen_rans_cuda.o pgen_rans_cuda_benchmark.o
+
+.PHONY: pgen_rans_cuda_benchmark
+
+pgen_rans_cuda.o: pgen_rans_cuda.cu pgen_rans_cuda.h
+	$(NVCC) -O3 -std=c++17 -lineinfo -arch=sm_$(CUDA_ARCH) \
+		-Xcompiler -Wall,-Wextra,-Wshadow \
+		-I. -c $< -o $@
+
+pgen_rans_cuda_benchmark.o: pgen_rans_cuda_benchmark.cc
+	$(CXX) -O3 -std=c++17 -Wall -Wextra -Wshadow \
+		-I$(CUDAROOT)/include -I. -c $< -o $@
+
+pgen_rans_cuda_benchmark: $(PGENRANSCUDAOBJ)
+	$(MKDIR) -p bin
+	$(NVCC) -std=c++17 -arch=sm_$(CUDA_ARCH) $(PGENRANSCUDAOBJ) \
+		-o bin/pgen_rans_cuda_benchmark -lpthread
+
+CLEAN += bin/pgen_rans_cuda_benchmark

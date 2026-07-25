@@ -166,3 +166,26 @@ bin/pgen_rans benchmark cohort.pgen cohort.pgr \
 The report separates bounded block-read time from warm decode time. The
 reported serial total is intentionally conservative; a production caller can
 double-buffer block reads and decoding.
+
+## CUDA prototype
+
+The CUDA decoder batches multiple container blocks, launches one warp per
+record, and preserves the two-level dependency graph with separate anchor and
+target kernels. Each lane owns one rANS state. Warp ballots assemble the low
+and high genotype bits into the standard packed 64-bit output word.
+
+On a CUDA machine, build and run the exact CPU/GPU comparison with:
+
+```sh
+make -f Makefile.pgen_rans_cuda CUDA_ARCH=80
+bin/pgen_rans_cuda_benchmark cohort.pgr \
+  --blocks 80 \
+  --batch-blocks 8 \
+  --iterations 3 \
+  --cpu-threads 16
+```
+
+The benchmark reports block-read, host-to-device, anchor-kernel,
+target-kernel, and complete decoder wall times separately. GPU output is
+copied back once per batch and compared byte-for-byte with the persistent
+CPU block decoder.
