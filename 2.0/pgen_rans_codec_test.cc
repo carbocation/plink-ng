@@ -203,6 +203,36 @@ void TestDeterministicRecords() {
             params);
 }
 
+void TestLargeDefaultRoundTrips() {
+  constexpr uint32_t kSampleCt = 32769;
+  std::mt19937_64 rng(0x6176783531327261ULL);
+  std::vector<uint8_t> reference1(kSampleCt);
+  std::vector<uint8_t> reference2(kSampleCt);
+  std::vector<uint8_t> marginal(kSampleCt);
+  std::vector<uint8_t> one_reference(kSampleCt);
+  std::vector<uint8_t> two_reference(kSampleCt);
+  for (uint32_t sample_idx = 0; sample_idx != kSampleCt; ++sample_idx) {
+    reference1[sample_idx] = rng() % 4;
+    reference2[sample_idx] = rng() % 4;
+    marginal[sample_idx] = rng() % 4;
+    one_reference[sample_idx] =
+        (reference1[sample_idx] < 2)
+            ? reference1[sample_idx]
+            : (rng() % 4);
+    const uint32_t context =
+        4 * reference1[sample_idx] + reference2[sample_idx];
+    two_reference[sample_idx] =
+        (context & 1) ? (context % 4) : (rng() % 4);
+  }
+  const CodecParams params;
+  RoundTrip(marginal, reference1, reference2, RecordMode::kMarginal,
+            params);
+  RoundTrip(one_reference, reference1, reference2,
+            RecordMode::kOneReference, params);
+  RoundTrip(two_reference, reference1, reference2,
+            RecordMode::kTwoReference, params);
+}
+
 void TestInvalidArguments() {
   const std::vector<uint64_t> genotypes = Pack({0, 1, 2, 3});
   std::vector<uint8_t> record;
@@ -227,6 +257,7 @@ void TestInvalidArguments() {
 int main() {
   TestRandomRoundTrips();
   TestDeterministicRecords();
+  TestLargeDefaultRoundTrips();
   TestInvalidArguments();
   puts("pgen_rans_codec_test: PASS");
   return 0;

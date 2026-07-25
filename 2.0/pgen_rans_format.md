@@ -120,6 +120,12 @@ all remaining records independently across a persistent worker pool. The
 32-state record path advances the independent states in sample order and emits
 one complete 64-bit packed genotype word per round.
 
+On x86-64 GCC and Clang builds, default 32-state/12-bit records use a
+runtime-dispatched AVX-512 decoder for cohorts with at least 32768 samples.
+It advances 16 states at once through a block-local decode table while
+retaining the scalar path for smaller cohorts and CPUs without AVX-512.
+The binary therefore keeps its existing x86-64-v3 compatibility floor.
+
 `PackedVariantReader` is the CPU-facing compatibility layer. It accepts
 contiguous ranges or arbitrary variant-index lists, groups requests by block,
 decodes each required block once, and copies exact `(sample_count + 3) / 4`
