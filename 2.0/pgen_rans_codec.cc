@@ -16,6 +16,14 @@ constexpr uint8_t kModeMask = 3;
 constexpr uint8_t kEntropyPayloadFlag = 1U << 2;
 constexpr uint8_t kKnownFlagMask = kModeMask | kEntropyPayloadFlag;
 
+#if defined(_MSC_VER)
+#define PGEN_RANS_ALWAYS_INLINE __forceinline
+#elif defined(__GNUC__) || defined(__clang__)
+#define PGEN_RANS_ALWAYS_INLINE inline __attribute__((always_inline))
+#else
+#define PGEN_RANS_ALWAYS_INLINE inline
+#endif
+
 struct ModelRow {
   std::array<uint32_t, 4> frequencies = {};
   std::array<uint32_t, 4> cumulative = {};
@@ -339,23 +347,22 @@ void RansEncodeSymbol(uint32_t cumulative, uint32_t frequency,
            (*state % frequency) + cumulative;
 }
 
-bool RansDecodeSymbol(const ModelRow& row, uint32_t scale_bits,
-                      const uint8_t* lane_start, const uint8_t** lane_iter,
-                      uint32_t* state, uint8_t* symbol, std::string* error) {
+template <uint32_t kScaleBits>
+PGEN_RANS_ALWAYS_INLINE bool RansDecodeSymbol(
+    const ModelRow& row, uint32_t runtime_scale_bits,
+    const uint8_t* lane_start, const uint8_t** lane_iter,
+    uint32_t* state, uint8_t* symbol, std::string* error) {
+  const uint32_t scale_bits =
+      kScaleBits ? kScaleBits : runtime_scale_bits;
   const uint32_t slot = *state & ((1U << scale_bits) - 1);
-  uint32_t selected_symbol = 4;
-  for (uint32_t candidate = 0; candidate != 4; ++candidate) {
-    const uint32_t frequency = row.frequencies[candidate];
-    if (frequency && (slot >= row.cumulative[candidate]) &&
-        (slot < row.cumulative[candidate] + frequency)) {
-      selected_symbol = candidate;
-      break;
-    }
-  }
-  if (selected_symbol == 4) {
-    SetError("rANS slot is not covered by the decoded model.", error);
-    return false;
-  }
+  // ParseModel() guarantees monotonically increasing cumulative
+  // frequencies ending at 1 << scale_bits.  Repeated boundaries skip
+  // zero-frequency symbols, so these comparisons replace a branchy
+  // four-symbol interval search.
+  const uint32_t selected_symbol =
+      static_cast<uint32_t>(slot >= row.cumulative[1]) +
+      static_cast<uint32_t>(slot >= row.cumulative[2]) +
+      static_cast<uint32_t>(slot >= row.cumulative[3]);
   const uint32_t frequency = row.frequencies[selected_symbol];
   *state = frequency * (*state >> scale_bits) + slot -
            row.cumulative[selected_symbol];
@@ -368,6 +375,120 @@ bool RansDecodeSymbol(const ModelRow& row, uint32_t scale_bits,
   }
   *symbol = static_cast<uint8_t>(selected_symbol);
   return true;
+}
+
+template <RecordMode kMode, uint32_t kScaleBits>
+bool DecodeEntropyWords32(
+    const Model& model, const uint64_t* reference1,
+    const uint64_t* reference2, uint32_t sample_ct,
+    uint32_t runtime_scale_bits,
+    const std::array<const uint8_t*, 256>& lane_starts,
+    std::array<const uint8_t*, 256>* lane_iters,
+    std::array<uint32_t, 256>* states, uint64_t* target,
+    std::string* error) {
+  const uint32_t full_word_ct = sample_ct / 32;
+  for (uint32_t word_idx = 0; word_idx != full_word_ct; ++word_idx) {
+    const uint64_t reference1_word =
+        (kMode == RecordMode::kMarginal) ? 0 : reference1[word_idx];
+    const uint64_t reference2_word =
+        (kMode == RecordMode::kTwoReference) ? reference2[word_idx] : 0;
+    uint64_t packed_word = 0;
+    for (uint32_t lane = 0; lane != 32; ++lane) {
+      uint32_t context = 0;
+      if (kMode != RecordMode::kMarginal) {
+        context =
+            static_cast<uint32_t>((reference1_word >> (2 * lane)) & 3U);
+      }
+      if (kMode == RecordMode::kTwoReference) {
+        context =
+            4 * context +
+            static_cast<uint32_t>(
+                (reference2_word >> (2 * lane)) & 3U);
+      }
+      const ModelRow& row = model.rows[context];
+      if (!row.active_symbol_ct) {
+        SetError("Reference selects an absent model context.", error);
+        return false;
+      }
+      uint8_t symbol;
+      if (row.active_symbol_ct == 1) {
+        symbol = row.deterministic_symbol;
+      } else if (!RansDecodeSymbol<kScaleBits>(
+                     row, runtime_scale_bits, lane_starts[lane],
+                     &((*lane_iters)[lane]), &((*states)[lane]), &symbol,
+                     error)) {
+        return false;
+      }
+      packed_word |= static_cast<uint64_t>(symbol) << (2 * lane);
+    }
+    target[word_idx] = packed_word;
+  }
+  const uint32_t tail_sample_ct = sample_ct % 32;
+  if (tail_sample_ct) {
+    const uint32_t word_idx = full_word_ct;
+    const uint64_t reference1_word =
+        (kMode == RecordMode::kMarginal) ? 0 : reference1[word_idx];
+    const uint64_t reference2_word =
+        (kMode == RecordMode::kTwoReference) ? reference2[word_idx] : 0;
+    uint64_t packed_word = 0;
+    for (uint32_t lane = 0; lane != tail_sample_ct; ++lane) {
+      uint32_t context = 0;
+      if (kMode != RecordMode::kMarginal) {
+        context =
+            static_cast<uint32_t>((reference1_word >> (2 * lane)) & 3U);
+      }
+      if (kMode == RecordMode::kTwoReference) {
+        context =
+            4 * context +
+            static_cast<uint32_t>(
+                (reference2_word >> (2 * lane)) & 3U);
+      }
+      const ModelRow& row = model.rows[context];
+      if (!row.active_symbol_ct) {
+        SetError("Reference selects an absent model context.", error);
+        return false;
+      }
+      uint8_t symbol;
+      if (row.active_symbol_ct == 1) {
+        symbol = row.deterministic_symbol;
+      } else if (!RansDecodeSymbol<kScaleBits>(
+                     row, runtime_scale_bits, lane_starts[lane],
+                     &((*lane_iters)[lane]), &((*states)[lane]), &symbol,
+                     error)) {
+        return false;
+      }
+      packed_word |= static_cast<uint64_t>(symbol) << (2 * lane);
+    }
+    target[word_idx] = packed_word;
+  }
+  return true;
+}
+
+template <uint32_t kScaleBits>
+bool DecodeEntropyRecord32(
+    RecordMode mode, const Model& model, const uint64_t* reference1,
+    const uint64_t* reference2, uint32_t sample_ct,
+    uint32_t runtime_scale_bits,
+    const std::array<const uint8_t*, 256>& lane_starts,
+    std::array<const uint8_t*, 256>* lane_iters,
+    std::array<uint32_t, 256>* states, uint64_t* target,
+    std::string* error) {
+  switch (mode) {
+    case RecordMode::kMarginal:
+      return DecodeEntropyWords32<RecordMode::kMarginal, kScaleBits>(
+          model, reference1, reference2, sample_ct, runtime_scale_bits,
+          lane_starts, lane_iters, states, target, error);
+    case RecordMode::kOneReference:
+      return DecodeEntropyWords32<RecordMode::kOneReference, kScaleBits>(
+          model, reference1, reference2, sample_ct, runtime_scale_bits,
+          lane_starts, lane_iters, states, target, error);
+    case RecordMode::kTwoReference:
+      return DecodeEntropyWords32<RecordMode::kTwoReference, kScaleBits>(
+          model, reference1, reference2, sample_ct, runtime_scale_bits,
+          lane_starts, lane_iters, states, target, error);
+  }
+  SetError("Unknown rANS record mode.", error);
+  return false;
 }
 
 bool ParsePrefix(const uint8_t* record, size_t record_size,
@@ -629,7 +750,6 @@ bool DecodeRecordToBuffer(const uint8_t* record, size_t record_size,
     SetError("Entropy-payload flag does not match the decoded model.", error);
     return false;
   }
-  memset(target, 0, static_cast<size_t>(packed_word_ct) * sizeof(uint64_t));
   if (!model.has_entropy) {
     if (offset != record_size) {
       SetError("Deterministic record has trailing payload.", error);
@@ -698,34 +818,22 @@ bool DecodeRecordToBuffer(const uint8_t* record, size_t record_size,
         record + offset + lane_boundaries[lane + 1];
   }
   if (state_ct == 32) {
-    for (uint32_t word_idx = 0; word_idx != packed_word_ct; ++word_idx) {
-      const uint32_t first_sample = 32 * word_idx;
-      const uint32_t word_sample_ct =
-          std::min(32U, sample_ct - first_sample);
-      uint64_t packed_word = 0;
-      for (uint32_t lane = 0; lane != word_sample_ct; ++lane) {
-        const uint32_t sample_idx = first_sample + lane;
-        const uint32_t context = ContextIndex(
-            parsed_metadata.mode, reference1, reference2, sample_idx);
-        const ModelRow& row = model.rows[context];
-        if (!row.active_symbol_ct) {
-          SetError("Reference selects an absent model context.", error);
-          return false;
-        }
-        uint8_t symbol;
-        if (row.active_symbol_ct == 1) {
-          symbol = row.deterministic_symbol;
-        } else if (!RansDecodeSymbol(
-                       row, params.scale_bits, lane_starts[lane],
-                       &(lane_iters[lane]), &(states[lane]), &symbol,
-                       error)) {
-          return false;
-        }
-        packed_word |= static_cast<uint64_t>(symbol) << (2 * lane);
-      }
-      target[word_idx] = packed_word;
+    const bool decode_ok =
+        (params.scale_bits == 12)
+            ? DecodeEntropyRecord32<12>(
+                  parsed_metadata.mode, model, reference1, reference2,
+                  sample_ct, params.scale_bits, lane_starts, &lane_iters,
+                  &states, target, error)
+            : DecodeEntropyRecord32<0>(
+                  parsed_metadata.mode, model, reference1, reference2,
+                  sample_ct, params.scale_bits, lane_starts, &lane_iters,
+                  &states, target, error);
+    if (!decode_ok) {
+      return false;
     }
   } else {
+    memset(target, 0,
+           static_cast<size_t>(packed_word_ct) * sizeof(uint64_t));
     for (uint32_t first_sample = 0; first_sample < sample_ct;
          first_sample += state_ct) {
       const uint32_t round_sample_ct =
@@ -742,7 +850,7 @@ bool DecodeRecordToBuffer(const uint8_t* record, size_t record_size,
         uint8_t symbol;
         if (row.active_symbol_ct == 1) {
           symbol = row.deterministic_symbol;
-        } else if (!RansDecodeSymbol(
+        } else if (!RansDecodeSymbol<0>(
                        row, params.scale_bits, lane_starts[lane],
                        &(lane_iters[lane]), &(states[lane]), &symbol,
                        error)) {
