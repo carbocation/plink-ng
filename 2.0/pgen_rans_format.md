@@ -107,6 +107,13 @@ Version 1 readers validate that block-table entries cover the variants and
 file exactly, blocks are contiguous, restart offsets agree with record
 lengths, record lengths span each block payload, and the block CRC32C matches.
 
+The reference reader exposes the file header and block table through a
+caller-supplied `read_at(offset, length)` callback. Opening a file requires one
+fixed-header read and one block-table read; fetching a block then requires
+exactly one bounded read matching its table entry. A validated block view
+points directly into that caller-owned byte buffer, so CPU and GPU adapters do
+not need to copy every record into a separate allocation.
+
 ## Reference CLI
 
 Build from `2.0/`:

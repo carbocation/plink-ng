@@ -420,12 +420,36 @@ bool ContainerReader::Open(const std::string& path, std::string* error) {
     return false;
   }
   file_size_ = static_cast<uint64_t>(file_size);
-  if (!Seek(file_, 0, error)) {
+  return OpenIndex(error);
+}
+
+bool ContainerReader::OpenReadAt(uint64_t file_size,
+                                 ReadAtCallback read_at,
+                                 void* read_at_context,
+                                 std::string* error) {
+  Close();
+  if ((!read_at) || (file_size < kFileHeaderByteCt)) {
+    SetError("Invalid conditional-rANS ranged reader.", error);
+    return false;
+  }
+  read_at_ = read_at;
+  read_at_context_ = read_at_context;
+  file_size_ = file_size;
+  return OpenIndex(error);
+}
+
+bool ContainerReader::OpenIndex(std::string* error) {
+  if ((!file_) && (!read_at_)) {
+    SetError("Container reader has no byte source.", error);
+    return false;
+  }
+  if (file_size_ < kFileHeaderByteCt) {
+    SetError("Container is shorter than its fixed header.", error);
     Close();
     return false;
   }
   std::array<uint8_t, kFileHeaderByteCt> header;
-  if (!ReadBytes(file_, header.data(), header.size(), error)) {
+  if (!ReadAt(0, header.data(), header.size(), error)) {
     Close();
     return false;
   }
@@ -474,8 +498,8 @@ bool ContainerReader::Open(const std::string& path, std::string* error) {
   }
   std::vector<uint8_t> serialized_index(
       static_cast<size_t>(params_.block_ct) * kBlockIndexByteCt);
-  if (!ReadBytes(file_, serialized_index.data(), serialized_index.size(),
-                 error)) {
+  if (!ReadAt(kFileHeaderByteCt, serialized_index.data(),
+              serialized_index.size(), error)) {
     Close();
     return false;
   }
@@ -527,14 +551,41 @@ void ContainerReader::Close() {
     fclose(file_);
   }
   file_ = nullptr;
+  read_at_ = nullptr;
+  read_at_context_ = nullptr;
   params_ = {};
   block_index_.clear();
   file_size_ = 0;
 }
 
-bool ContainerReader::ReadBlock(uint32_t block_idx, EncodedBlock* block,
-                                std::string* error) {
-  if ((!file_) || (block_idx >= block_index_.size()) || (!block)) {
+bool ContainerReader::ReadAt(uint64_t offset, uint8_t* destination,
+                             size_t byte_ct, std::string* error) {
+  if ((offset > file_size_) || (byte_ct > file_size_ - offset)) {
+    SetError("Conditional-rANS ranged read is outside the file.", error);
+    return false;
+  }
+  if (read_at_) {
+    return read_at_(read_at_context_, offset, destination, byte_ct, error);
+  }
+  return Seek(file_, offset, error) &&
+         ReadBytes(file_, destination, byte_ct, error);
+}
+
+ByteSpan EncodedBlockView::record(uint32_t variant_offset) const {
+  if (variant_offset >= variant_ct()) {
+    return {};
+  }
+  const uint32_t begin = record_offsets_[variant_offset];
+  const uint32_t end = record_offsets_[variant_offset + 1];
+  return {record_data_ + begin, static_cast<size_t>(end - begin)};
+}
+
+bool ContainerReader::ReadBlockView(uint32_t block_idx,
+                                    std::vector<uint8_t>* storage,
+                                    EncodedBlockView* block,
+                                    std::string* error) {
+  if (((!file_) && (!read_at_)) || (block_idx >= block_index_.size()) ||
+      (!storage) || (!block)) {
     SetError("Invalid block read request.", error);
     return false;
   }
@@ -543,12 +594,30 @@ bool ContainerReader::ReadBlock(uint32_t block_idx, EncodedBlock* block,
     SetError("Block exceeds platform memory limits.", error);
     return false;
   }
-  std::vector<uint8_t> serialized(static_cast<size_t>(entry.byte_ct));
-  if ((!Seek(file_, entry.file_offset, error)) ||
-      (!ReadBytes(file_, serialized.data(), serialized.size(), error))) {
+  storage->resize(static_cast<size_t>(entry.byte_ct));
+  if (!ReadAt(entry.file_offset, storage->data(), storage->size(), error)) {
     return false;
   }
-  if (Crc32c(serialized.data(), serialized.size()) != entry.checksum) {
+  return ParseBlockView(block_idx, storage->data(), storage->size(), block,
+                        error);
+}
+
+bool ContainerReader::ParseBlockView(uint32_t block_idx,
+                                     const uint8_t* data,
+                                     size_t byte_ct,
+                                     EncodedBlockView* block,
+                                     std::string* error) const {
+  if (((!file_) && (!read_at_)) || (block_idx >= block_index_.size()) ||
+      (!data) || (!block)) {
+    SetError("Invalid block parse request.", error);
+    return false;
+  }
+  const BlockIndexEntry& entry = block_index_[block_idx];
+  if (byte_ct != entry.byte_ct) {
+    SetError("Conditional-rANS block byte count mismatch.", error);
+    return false;
+  }
+  if (Crc32c(data, byte_ct) != entry.checksum) {
     SetError("Conditional-rANS block checksum mismatch.", error);
     return false;
   }
@@ -559,14 +628,13 @@ bool ContainerReader::ReadBlock(uint32_t block_idx, EncodedBlock* block,
   uint16_t anchor_ct;
   uint16_t restart_variant_ct;
   uint16_t restart_offset_ct;
-  if ((!ReadU32(serialized.data(), serialized.size(), &offset, &magic)) ||
-      (!ReadU32(serialized.data(), serialized.size(), &offset,
-                &first_variant)) ||
-      (!ReadU16(serialized.data(), serialized.size(), &offset, &variant_ct)) ||
-      (!ReadU16(serialized.data(), serialized.size(), &offset, &anchor_ct)) ||
-      (!ReadU16(serialized.data(), serialized.size(), &offset,
+  if ((!ReadU32(data, byte_ct, &offset, &magic)) ||
+      (!ReadU32(data, byte_ct, &offset, &first_variant)) ||
+      (!ReadU16(data, byte_ct, &offset, &variant_ct)) ||
+      (!ReadU16(data, byte_ct, &offset, &anchor_ct)) ||
+      (!ReadU16(data, byte_ct, &offset,
                 &restart_variant_ct)) ||
-      (!ReadU16(serialized.data(), serialized.size(), &offset,
+      (!ReadU16(data, byte_ct, &offset,
                 &restart_offset_ct)) ||
       (magic != kBlockMagic) || (first_variant != entry.first_variant) ||
       (variant_ct != entry.variant_ct) ||
@@ -583,8 +651,7 @@ bool ContainerReader::ReadBlock(uint32_t block_idx, EncodedBlock* block,
   }
   std::vector<uint32_t> record_lengths(variant_ct);
   for (uint32_t& record_length : record_lengths) {
-    if ((!ReadU24(serialized.data(), serialized.size(), &offset,
-                  &record_length)) ||
+    if ((!ReadU24(data, byte_ct, &offset, &record_length)) ||
         (!record_length)) {
       SetError("Invalid or truncated block record-length table.", error);
       return false;
@@ -592,8 +659,7 @@ bool ContainerReader::ReadBlock(uint32_t block_idx, EncodedBlock* block,
   }
   std::vector<uint32_t> restart_offsets(restart_offset_ct);
   for (uint32_t& restart_offset : restart_offsets) {
-    if (!ReadU32(serialized.data(), serialized.size(), &offset,
-                 &restart_offset)) {
+    if (!ReadU32(data, byte_ct, &offset, &restart_offset)) {
       SetError("Truncated block restart-offset table.", error);
       return false;
     }
@@ -615,28 +681,53 @@ bool ContainerReader::ReadBlock(uint32_t block_idx, EncodedBlock* block,
     cumulative_record_bytes += record_lengths[variant_offset];
   }
   if ((restart_idx != restart_offsets.size()) ||
-      (cumulative_record_bytes != serialized.size() - record_data_offset)) {
+      (cumulative_record_bytes != byte_ct - record_data_offset) ||
+      (cumulative_record_bytes > UINT32_MAX)) {
     SetError("Block record lengths do not span its payload.", error);
     return false;
   }
-  block->first_variant = first_variant;
-  block->records.clear();
-  block->records.reserve(variant_ct);
-  size_t record_offset = record_data_offset;
+  block->record_data_ = data + record_data_offset;
+  block->record_data_byte_ct_ =
+      static_cast<size_t>(cumulative_record_bytes);
+  block->first_variant_ = first_variant;
+  block->anchor_ct_ = anchor_ct;
+  block->record_offsets_.clear();
+  block->record_offsets_.reserve(static_cast<size_t>(variant_ct) + 1);
+  uint32_t record_offset = 0;
   for (const uint32_t record_length : record_lengths) {
-    const auto record_begin =
-        serialized.begin() + static_cast<std::ptrdiff_t>(record_offset);
-    block->records.emplace_back(
-        record_begin,
-        record_begin + static_cast<std::ptrdiff_t>(record_length));
+    block->record_offsets_.push_back(record_offset);
     record_offset += record_length;
+  }
+  block->record_offsets_.push_back(record_offset);
+  return true;
+}
+
+bool ContainerReader::ReadBlock(uint32_t block_idx, EncodedBlock* block,
+                                std::string* error) {
+  if (!block) {
+    SetError("Invalid block read request.", error);
+    return false;
+  }
+  std::vector<uint8_t> storage;
+  EncodedBlockView view;
+  if (!ReadBlockView(block_idx, &storage, &view, error)) {
+    return false;
+  }
+  block->first_variant = view.first_variant();
+  block->records.clear();
+  block->records.reserve(view.variant_ct());
+  for (uint32_t variant_offset = 0;
+       variant_offset != view.variant_ct(); ++variant_offset) {
+    const ByteSpan record = view.record(variant_offset);
+    block->records.emplace_back(record.data, record.data + record.size);
   }
   return true;
 }
 
 bool ContainerReader::FindBlock(uint32_t variant_idx, uint32_t* block_idx,
                                 std::string* error) const {
-  if ((!file_) || (!block_idx) || (variant_idx >= params_.variant_ct)) {
+  if (((!file_) && (!read_at_)) || (!block_idx) ||
+      (variant_idx >= params_.variant_ct)) {
     SetError("Variant index is outside the container.", error);
     return false;
   }

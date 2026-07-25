@@ -4,6 +4,8 @@
 #include "pgen_rans_container.h"
 
 #include <algorithm>
+#include <cerrno>
+#include <cstring>
 #include <cstdio>
 #include <cstdlib>
 #include <string>
@@ -16,6 +18,7 @@ using pgen_rans::CodecParams;
 using pgen_rans::ContainerParams;
 using pgen_rans::ContainerReader;
 using pgen_rans::ContainerWriter;
+using pgen_rans::EncodedBlockView;
 using pgen_rans::DecodeRecord;
 using pgen_rans::EncodeRecord;
 using pgen_rans::EncodedBlock;
@@ -71,6 +74,45 @@ void ExpectEqual(const std::vector<uint64_t>& observed,
       Fail("decoded container genotype mismatch");
     }
   }
+}
+
+struct MemoryReader {
+  std::vector<uint8_t> bytes;
+  std::vector<std::pair<uint64_t, size_t>> reads;
+};
+
+bool ReadMemory(void* context, uint64_t offset, uint8_t* destination,
+                size_t byte_ct, std::string* error) {
+  MemoryReader* reader = static_cast<MemoryReader*>(context);
+  if ((offset > reader->bytes.size()) ||
+      (byte_ct > reader->bytes.size() - offset)) {
+    *error = "memory read is outside the source";
+    return false;
+  }
+  memcpy(destination, reader->bytes.data() + offset, byte_ct);
+  reader->reads.emplace_back(offset, byte_ct);
+  return true;
+}
+
+MemoryReader LoadMemoryReader(const std::string& path) {
+  FILE* input = fopen(path.c_str(), "rb");
+  if (!input) {
+    Fail(std::string("could not open temporary container: ") +
+         strerror(errno));
+  }
+  Expect(fseeko(input, 0, SEEK_END) == 0,
+         "could not query temporary container size");
+  const off_t byte_ct = ftello(input);
+  Expect(byte_ct >= 0, "could not read temporary container size");
+  Expect(fseeko(input, 0, SEEK_SET) == 0,
+         "could not rewind temporary container");
+  MemoryReader result;
+  result.bytes.resize(static_cast<size_t>(byte_ct));
+  Expect(fread(result.bytes.data(), 1, result.bytes.size(), input) ==
+             result.bytes.size(),
+         "could not read temporary container");
+  Expect(fclose(input) == 0, "could not close temporary container");
+  return result;
 }
 
 }  // namespace
@@ -191,6 +233,35 @@ int main() {
                   kSampleCt);
     }
   }
+  reader.Close();
+
+  MemoryReader memory_reader = LoadMemoryReader(path);
+  Expect(reader.OpenReadAt(memory_reader.bytes.size(), ReadMemory,
+                           &memory_reader, &error),
+         "ranged reader open failed: " + error);
+  Expect(memory_reader.reads.size() == 2,
+         "ranged open did not issue exactly header and index reads");
+  std::vector<uint8_t> block_storage;
+  EncodedBlockView block_view;
+  Expect(reader.ReadBlockView(1, &block_storage, &block_view, &error),
+         "ranged block read failed: " + error);
+  Expect(memory_reader.reads.size() == 3,
+         "ranged block read issued more than one request");
+  const auto& ranged_entry = reader.block_index()[1];
+  Expect(memory_reader.reads.back() ==
+             std::make_pair(ranged_entry.file_offset,
+                            static_cast<size_t>(ranged_entry.byte_ct)),
+         "ranged block request did not match the block index");
+  Expect(block_view.first_variant() == kBlockVariantCt,
+         "block view first variant mismatch");
+  Expect(block_view.variant_ct() == kVariantCt - kBlockVariantCt,
+         "block view variant count mismatch");
+  for (uint32_t offset = 0; offset != block_view.variant_ct(); ++offset) {
+    const pgen_rans::ByteSpan record = block_view.record(offset);
+    Expect(record.data && record.size, "block view returned an empty record");
+  }
+  Expect(!block_view.record(block_view.variant_ct()).data,
+         "block view accepted an out-of-range record");
   reader.Close();
 
   FILE* corrupt_file = fopen(path.c_str(), "r+b");
