@@ -200,7 +200,7 @@ int main(int argc, char** argv) {
   uint64_t checksum = 0;
   int return_code = 1;
 
-  for (size_t batch_start = 0; batch_start != selected_blocks.size();
+  for (size_t batch_start = 0; batch_start < selected_blocks.size();
        batch_start += opts.batch_block_ct) {
     const size_t batch_size =
         std::min(static_cast<size_t>(opts.batch_block_ct),
