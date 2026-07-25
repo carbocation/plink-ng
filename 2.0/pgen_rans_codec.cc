@@ -413,9 +413,17 @@ PGEN_RANS_ALWAYS_INLINE bool RansDecodeSymbol(
 }
 
 #if PGEN_RANS_X86_RUNTIME_DISPATCH
-constexpr uint32_t kDecodeTableSymbolShift = 24;
 constexpr uint32_t kDecodeTableAbsentFlag = 1U << 30;
 constexpr uint32_t kDecodeTableDeterministicFlag = 1U << 31;
+
+struct alignas(64) Avx512DecodeModel12 {
+  // The three cumulative boundaries for all 16 contexts fit in three
+  // zmm registers.  Entries are indexed by 4 * context + symbol and
+  // fit in four more.  Keeping the complete model in registers avoids
+  // a random gather from a 256 KiB slot-to-symbol table.
+  std::array<std::array<uint32_t, 16>, 3> thresholds = {};
+  std::array<uint32_t, 64> entries = {};
+};
 
 bool HasAvx512Decoder() {
   static const bool result = []() {
@@ -429,56 +437,62 @@ bool HasAvx512Decoder() {
   return result;
 }
 
-uint32_t* BuildDecodeTable12(const Model& model) {
-  alignas(64) static thread_local
-      std::array<uint32_t, 16 * kDefaultSlotCt> decode_table;
-  for (uint32_t context = 0; context != model.row_ct; ++context) {
-    uint32_t* const row_table =
-        decode_table.data() + context * kDefaultSlotCt;
+void BuildAvx512DecodeModel12(
+    const Model& model, Avx512DecodeModel12* decode_model) {
+  for (uint32_t context = 0; context != 16; ++context) {
     const uint32_t active_symbol_ct =
-        model.active_symbol_cts[context];
+        (context < model.row_ct)
+            ? model.active_symbol_cts[context]
+            : 0;
     if (!active_symbol_ct) {
-      std::fill(
-          row_table, row_table + kDefaultSlotCt,
-          kDecodeTableAbsentFlag |
-              kDecodeTableDeterministicFlag);
+      for (uint32_t boundary = 0; boundary != 3; ++boundary) {
+        decode_model->thresholds[boundary][context] =
+            kDefaultSlotCt;
+      }
+      for (uint32_t symbol = 0; symbol != 4; ++symbol) {
+        decode_model->entries[4 * context + symbol] =
+            kDecodeTableAbsentFlag |
+            kDecodeTableDeterministicFlag;
+      }
       continue;
     }
     if (active_symbol_ct == 1) {
-      const uint32_t entry =
-          kDecodeTableDeterministicFlag |
-          (static_cast<uint32_t>(
-               model.deterministic_symbols[context])
-           << kDecodeTableSymbolShift);
-      std::fill(row_table, row_table + kDefaultSlotCt, entry);
+      const uint32_t deterministic_symbol =
+          model.deterministic_symbols[context];
+      for (uint32_t boundary = 1; boundary != 4; ++boundary) {
+        decode_model->thresholds[boundary - 1][context] =
+            (deterministic_symbol >= boundary)
+                ? 0
+                : kDefaultSlotCt;
+      }
+      for (uint32_t symbol = 0; symbol != 4; ++symbol) {
+        decode_model->entries[4 * context + symbol] =
+            kDecodeTableDeterministicFlag;
+      }
       continue;
     }
     const ModelRow& row = model.rows[context];
+    for (uint32_t boundary = 1; boundary != 4; ++boundary) {
+      decode_model->thresholds[boundary - 1][context] =
+          row.cumulative[boundary];
+    }
     for (uint32_t symbol = 0; symbol != 4; ++symbol) {
-      const uint32_t frequency = row.frequencies[symbol];
-      if (!frequency) {
-        continue;
-      }
-      const uint32_t cumulative = row.cumulative[symbol];
-      const uint32_t entry =
-          frequency |
-          (cumulative << kDefaultScaleBits) |
-          (symbol << kDecodeTableSymbolShift);
-      std::fill(
-          row_table + cumulative,
-          row_table + cumulative + frequency, entry);
+      decode_model->entries[4 * context + symbol] =
+          row.frequencies[symbol] |
+          (row.cumulative[symbol] << kDefaultScaleBits);
     }
   }
-  return decode_table.data();
 }
 
 template <RecordMode kMode, uint32_t kGroup>
 PGEN_RANS_TARGET_AVX512 PGEN_RANS_ALWAYS_INLINE
 bool RansDecodeGroup16Avx512(
-    const uint32_t* decode_table, uint64_t reference1_word,
+    const Avx512DecodeModel12& decode_model,
+    uint64_t reference1_word,
     uint64_t reference2_word,
-    const std::array<const uint8_t*, 256>& lane_starts,
-    std::array<const uint8_t*, 256>* lane_iters, __m512i* state,
+    const uint8_t* lane_base, uint32_t lane_payload_size,
+    const __m512i& lane_start_offsets,
+    __m512i* lane_iter_offsets, __m512i* state,
     uint32_t* packed_symbols, uint32_t* absent_context_mask,
     std::string* error) {
   const __m512i shifts = _mm512_setr_epi32(
@@ -510,16 +524,77 @@ bool RansDecodeGroup16Avx512(
 
   const __m512i slots = _mm512_and_si512(
       *state, _mm512_set1_epi32(kDefaultSlotCt - 1));
-  const __m512i table_indices = _mm512_or_si512(
-      _mm512_slli_epi32(contexts, kDefaultScaleBits), slots);
-  const __m512i entries = _mm512_i32gather_epi32(
-      table_indices, decode_table, sizeof(uint32_t));
-  *absent_context_mask |= static_cast<uint32_t>(
-      _mm512_movepi32_mask(_mm512_slli_epi32(entries, 1)));
-  const __mmask16 deterministic_mask =
-      _mm512_movepi32_mask(entries);
-  const __mmask16 entropy_mask =
-      static_cast<__mmask16>(~deterministic_mask);
+  __m512i threshold0;
+  __m512i threshold1;
+  __m512i threshold2;
+  if constexpr (kMode == RecordMode::kMarginal) {
+    threshold0 = _mm512_set1_epi32(
+        static_cast<int>(decode_model.thresholds[0][0]));
+    threshold1 = _mm512_set1_epi32(
+        static_cast<int>(decode_model.thresholds[1][0]));
+    threshold2 = _mm512_set1_epi32(
+        static_cast<int>(decode_model.thresholds[2][0]));
+  } else {
+    threshold0 = _mm512_permutexvar_epi32(
+        contexts,
+        _mm512_load_si512(
+            decode_model.thresholds[0].data()));
+    threshold1 = _mm512_permutexvar_epi32(
+        contexts,
+        _mm512_load_si512(
+            decode_model.thresholds[1].data()));
+    threshold2 = _mm512_permutexvar_epi32(
+        contexts,
+        _mm512_load_si512(
+            decode_model.thresholds[2].data()));
+  }
+  const __mmask16 above0 = _mm512_cmp_epu32_mask(
+      slots, threshold0, _MM_CMPINT_GE);
+  const __mmask16 above1 = _mm512_cmp_epu32_mask(
+      slots, threshold1, _MM_CMPINT_GE);
+  const __mmask16 above2 = _mm512_cmp_epu32_mask(
+      slots, threshold2, _MM_CMPINT_GE);
+  const __m512i selected_symbols = _mm512_add_epi32(
+      _mm512_add_epi32(
+          _mm512_maskz_set1_epi32(above0, 1),
+          _mm512_maskz_set1_epi32(above1, 1)),
+      _mm512_maskz_set1_epi32(above2, 1));
+  const __m512i entry_indices = _mm512_add_epi32(
+      _mm512_slli_epi32(contexts, 2), selected_symbols);
+  __m512i entries;
+  if constexpr (kMode == RecordMode::kTwoReference) {
+    const __m512i entries01 = _mm512_permutex2var_epi32(
+        _mm512_load_si512(decode_model.entries.data()),
+        entry_indices,
+        _mm512_load_si512(
+            decode_model.entries.data() + 16));
+    const __m512i entries23 = _mm512_permutex2var_epi32(
+        _mm512_load_si512(
+            decode_model.entries.data() + 32),
+        entry_indices,
+        _mm512_load_si512(
+            decode_model.entries.data() + 48));
+    const __mmask16 high_entry_mask =
+        _mm512_cmp_epu32_mask(
+            entry_indices, _mm512_set1_epi32(32),
+            _MM_CMPINT_GE);
+    entries = _mm512_mask_mov_epi32(
+        entries01, high_entry_mask, entries23);
+  } else {
+    entries = _mm512_permutexvar_epi32(
+        entry_indices,
+        _mm512_load_si512(decode_model.entries.data()));
+  }
+  __mmask16 entropy_mask = 0xffffU;
+  if constexpr (kMode != RecordMode::kMarginal) {
+    *absent_context_mask |= static_cast<uint32_t>(
+        _mm512_movepi32_mask(
+            _mm512_slli_epi32(entries, 1)));
+    const __mmask16 deterministic_mask =
+        _mm512_movepi32_mask(entries);
+    entropy_mask =
+        static_cast<__mmask16>(~deterministic_mask);
+  }
   const __m512i frequencies = _mm512_and_si512(
       entries, _mm512_set1_epi32(kDefaultSlotCt - 1));
   const __m512i cumulatives = _mm512_and_si512(
@@ -538,38 +613,81 @@ bool RansDecodeGroup16Avx512(
       _mm512_cmp_epu32_mask(
           *state, _mm512_set1_epi32(kRansLowerBound),
           _MM_CMPINT_LT);
-  if (renormalization_mask) {
-    alignas(64) uint32_t state_lanes[16];
-    _mm512_store_si512(state_lanes, *state);
-    const uint32_t first_lane = 16 * kGroup;
-    while (renormalization_mask) {
-      const uint32_t group_lane = static_cast<uint32_t>(
-          __builtin_ctz(static_cast<uint32_t>(
-              renormalization_mask)));
-      renormalization_mask =
-          static_cast<__mmask16>(
-              renormalization_mask &
-              (renormalization_mask - 1));
-      const uint32_t lane = first_lane + group_lane;
-      while (state_lanes[group_lane] < kRansLowerBound) {
-        if ((*lane_iters)[lane] == lane_starts[lane]) {
-          SetError("Truncated rANS lane payload.", error);
-          return false;
-        }
-        state_lanes[group_lane] =
-            (state_lanes[group_lane] << 8) |
-            *--((*lane_iters)[lane]);
-      }
+  // AVX-512 has no byte gather, but a dword gather whose low byte is
+  // the requested byte is still substantially cheaper than spilling
+  // every state and chasing individual lane pointers.  Mask the rare
+  // lane whose dword would cross the end of the record and refill it
+  // scalarly to preserve strict input bounds.
+  while (renormalization_mask) {
+    const __mmask16 available_mask =
+        _mm512_cmp_epu32_mask(
+            *lane_iter_offsets, lane_start_offsets,
+            _MM_CMPINT_GT);
+    if (renormalization_mask &
+        static_cast<__mmask16>(~available_mask)) {
+      SetError("Truncated rANS lane payload.", error);
+      return false;
     }
-    *state = _mm512_load_si512(state_lanes);
+    const __m512i next_offsets = _mm512_mask_sub_epi32(
+        *lane_iter_offsets, renormalization_mask,
+        *lane_iter_offsets, _mm512_set1_epi32(1));
+    __mmask16 gather_mask = 0;
+    if (lane_payload_size >= sizeof(uint32_t)) {
+      gather_mask =
+          renormalization_mask &
+          _mm512_cmp_epu32_mask(
+              next_offsets,
+              _mm512_set1_epi32(
+                  static_cast<int>(
+                      lane_payload_size - sizeof(uint32_t))),
+              _MM_CMPINT_LE);
+    }
+    const __m512i input_dwords = _mm512_mask_i32gather_epi32(
+        _mm512_setzero_si512(), gather_mask,
+        next_offsets, lane_base, 1);
+    const __m512i renormalized_states = _mm512_or_si512(
+        _mm512_slli_epi32(*state, 8),
+        _mm512_and_si512(
+            input_dwords, _mm512_set1_epi32(255)));
+    *state = _mm512_mask_mov_epi32(
+        *state, gather_mask,
+        renormalized_states);
+    *lane_iter_offsets = _mm512_mask_mov_epi32(
+        *lane_iter_offsets, renormalization_mask,
+        next_offsets);
+    __mmask16 scalar_mask =
+        renormalization_mask &
+        static_cast<__mmask16>(~gather_mask);
+    if (scalar_mask) {
+      alignas(64) uint32_t state_lanes[16];
+      alignas(64) uint32_t iter_offsets[16];
+      _mm512_store_si512(state_lanes, *state);
+      _mm512_store_si512(iter_offsets, *lane_iter_offsets);
+      while (scalar_mask) {
+        const uint32_t lane = static_cast<uint32_t>(
+            __builtin_ctz(
+                static_cast<uint32_t>(scalar_mask)));
+        scalar_mask = static_cast<__mmask16>(
+            scalar_mask & (scalar_mask - 1));
+        state_lanes[lane] =
+            (state_lanes[lane] << 8) |
+            lane_base[iter_offsets[lane]];
+      }
+      *state = _mm512_load_si512(state_lanes);
+    }
+    renormalization_mask =
+        entropy_mask &
+        _mm512_cmp_epu32_mask(
+            *state, _mm512_set1_epi32(kRansLowerBound),
+            _MM_CMPINT_LT);
   }
 
   const uint32_t low_bits = static_cast<uint32_t>(
       _mm512_movepi32_mask(_mm512_slli_epi32(
-          entries, 31 - kDecodeTableSymbolShift)));
+          selected_symbols, 31)));
   const uint32_t high_bits = static_cast<uint32_t>(
       _mm512_movepi32_mask(_mm512_slli_epi32(
-          entries, 30 - kDecodeTableSymbolShift)));
+          selected_symbols, 30)));
   *packed_symbols = static_cast<uint32_t>(
       _pdep_u64(low_bits, 0x55555555ULL) |
       (_pdep_u64(high_bits, 0x55555555ULL) << 1));
@@ -585,7 +703,27 @@ bool DecodeEntropyWords32Avx512(
     std::array<const uint8_t*, 256>* lane_iters,
     std::array<uint32_t, 256>* states, uint64_t* target,
     std::string* error) {
-  const uint32_t* const decode_table = BuildDecodeTable12(model);
+  Avx512DecodeModel12 decode_model;
+  BuildAvx512DecodeModel12(model, &decode_model);
+  const uint8_t* const lane_base = lane_starts[0];
+  alignas(64) uint32_t lane_start_offset_values[32];
+  alignas(64) uint32_t lane_iter_offset_values[32];
+  for (uint32_t lane = 0; lane != 32; ++lane) {
+    lane_start_offset_values[lane] = static_cast<uint32_t>(
+        lane_starts[lane] - lane_base);
+    lane_iter_offset_values[lane] = static_cast<uint32_t>(
+        (*lane_iters)[lane] - lane_base);
+  }
+  const uint32_t lane_payload_size =
+      lane_iter_offset_values[31];
+  const __m512i lane_start_offsets0 =
+      _mm512_load_si512(lane_start_offset_values);
+  const __m512i lane_start_offsets1 =
+      _mm512_load_si512(lane_start_offset_values + 16);
+  __m512i lane_iter_offsets0 =
+      _mm512_load_si512(lane_iter_offset_values);
+  __m512i lane_iter_offsets1 =
+      _mm512_load_si512(lane_iter_offset_values + 16);
   __m512i state0 = _mm512_loadu_si512(&(states->at(0)));
   __m512i state1 = _mm512_loadu_si512(&(states->at(16)));
   uint32_t absent_context_mask = 0;
@@ -598,12 +736,14 @@ bool DecodeEntropyWords32Avx512(
     uint32_t packed0;
     uint32_t packed1;
     if (!RansDecodeGroup16Avx512<kMode, 0>(
-            decode_table, reference1_word, reference2_word,
-            lane_starts, lane_iters, &state0, &packed0,
+            decode_model, reference1_word, reference2_word,
+            lane_base, lane_payload_size, lane_start_offsets0,
+            &lane_iter_offsets0, &state0, &packed0,
             &absent_context_mask, error) ||
         !RansDecodeGroup16Avx512<kMode, 1>(
-            decode_table, reference1_word, reference2_word,
-            lane_starts, lane_iters, &state1, &packed1,
+            decode_model, reference1_word, reference2_word,
+            lane_base, lane_payload_size, lane_start_offsets1,
+            &lane_iter_offsets1, &state1, &packed1,
             &absent_context_mask, error)) {
       return false;
     }
@@ -613,6 +753,14 @@ bool DecodeEntropyWords32Avx512(
   }
   _mm512_storeu_si512(&(states->at(0)), state0);
   _mm512_storeu_si512(&(states->at(16)), state1);
+  _mm512_store_si512(
+      lane_iter_offset_values, lane_iter_offsets0);
+  _mm512_store_si512(
+      lane_iter_offset_values + 16, lane_iter_offsets1);
+  for (uint32_t lane = 0; lane != 32; ++lane) {
+    (*lane_iters)[lane] =
+        lane_base + lane_iter_offset_values[lane];
+  }
 
   const uint32_t tail_sample_ct = sample_ct % 32;
   if (tail_sample_ct) {
@@ -636,17 +784,23 @@ bool DecodeEntropyWords32Avx512(
       }
       const uint32_t slot =
           (*states)[lane] & (kDefaultSlotCt - 1);
-      const uint32_t entry =
-          decode_table[context * kDefaultSlotCt + slot];
-      absent_context_mask |= entry & kDecodeTableAbsentFlag;
-      const uint8_t symbol = static_cast<uint8_t>(
-          (entry >> kDecodeTableSymbolShift) & 3U);
-      if (!(entry & kDecodeTableDeterministicFlag)) {
-        const uint32_t frequency =
-            entry & (kDefaultSlotCt - 1);
-        const uint32_t cumulative =
-            (entry >> kDefaultScaleBits) &
-            (kDefaultSlotCt - 1);
+      const uint32_t active_symbol_ct =
+          model.active_symbol_cts[context];
+      if (!active_symbol_ct) {
+        absent_context_mask |= kDecodeTableAbsentFlag;
+      }
+      uint8_t symbol = model.deterministic_symbols[context];
+      if (active_symbol_ct > 1) {
+        const ModelRow& row = model.rows[context];
+        symbol = static_cast<uint8_t>(
+            static_cast<uint32_t>(
+                slot >= row.cumulative[1]) +
+            static_cast<uint32_t>(
+                slot >= row.cumulative[2]) +
+            static_cast<uint32_t>(
+                slot >= row.cumulative[3]));
+        const uint32_t frequency = row.frequencies[symbol];
+        const uint32_t cumulative = row.cumulative[symbol];
         (*states)[lane] =
             frequency *
                 ((*states)[lane] >> kDefaultScaleBits) +
