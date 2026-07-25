@@ -1,0 +1,15 @@
+.DEFAULT_GOAL := pgen_entropy_oracle
+
+include Makefile
+
+PGENORACLESRC = $(PGENLIB_CCSRC) pgen_entropy_oracle.cc
+PGENORACLEOBJ = $(PGENORACLESRC:.cc=.o)
+
+.PHONY: pgen_entropy_oracle
+
+pgen_entropy_oracle: $(PGENORACLEOBJ)
+	$(MKDIR) -p bin
+	$(CXX) $(PGENORACLEOBJ) \
+		-o bin/pgen_entropy_oracle $(LDFLAGS)
+
+CLEAN += bin/pgen_entropy_oracle
