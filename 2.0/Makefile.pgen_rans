@@ -1,0 +1,27 @@
+.DEFAULT_GOAL := pgen_rans_codec_test
+
+include Makefile
+
+PGENRANSCODECOBJ = pgen_rans_codec.o
+PGENRANSTESTOBJ = $(PGENRANSCODECOBJ) pgen_rans_codec_test.o
+PGENRANSCONTAINEROBJ = pgen_rans_container.o
+PGENRANSCONTAINERTESTOBJ = $(PGENRANSCODECOBJ) \
+	pgen_rans_container.o pgen_rans_container_test.o
+
+.PHONY: pgen_rans_codec_test pgen_rans_container_test test
+
+pgen_rans_codec_test: $(PGENRANSTESTOBJ)
+	$(MKDIR) -p bin
+	$(CXX) $(PGENRANSTESTOBJ) \
+		-o bin/pgen_rans_codec_test $(LDFLAGS)
+
+pgen_rans_container_test: $(PGENRANSCONTAINERTESTOBJ)
+	$(MKDIR) -p bin
+	$(CXX) $(PGENRANSCONTAINERTESTOBJ) \
+		-o bin/pgen_rans_container_test $(LDFLAGS)
+
+test: pgen_rans_codec_test pgen_rans_container_test
+	bin/pgen_rans_codec_test
+	bin/pgen_rans_container_test
+
+CLEAN += bin/pgen_rans_codec_test bin/pgen_rans_container_test
