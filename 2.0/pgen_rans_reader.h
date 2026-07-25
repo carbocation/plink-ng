@@ -43,6 +43,9 @@ class PackedVariantReader {
                        uint32_t subset_sample_ct, std::string* error);
   void ClearSampleSubset();
 
+  bool ReadVariant(uint32_t variant, uint8_t* output,
+                   size_t output_byte_ct, PackedReadStats* stats,
+                   std::string* error);
   bool ReadRange(uint32_t first_variant, uint32_t variant_ct,
                  uint8_t* output, size_t output_variant_stride,
                  PackedReadStats* stats, std::string* error);

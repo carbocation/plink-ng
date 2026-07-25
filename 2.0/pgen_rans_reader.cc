@@ -215,24 +215,28 @@ struct PackedVariantReader::Impl {
         }
         active_block_idx = block_idx;
       }
-      const uint32_t variant_offset =
-          request.first - block_view.first_variant();
-      const uint8_t* source = reinterpret_cast<const uint8_t*>(
-          decoded_block.data() +
-          static_cast<size_t>(variant_offset) * word_stride);
-      if (!sample_subset.empty()) {
-        source = projected_block.data() +
-                 static_cast<size_t>(variant_offset) * packed_byte_ct;
-      }
       uint8_t* destination =
           output +
           static_cast<size_t>(request.second) * output_variant_stride;
-      memcpy(destination, source, packed_byte_ct);
+      CopyDecodedVariant(request.first, destination);
     }
     if (stats) {
       stats->returned_variant_ct += variant_ct;
     }
     return true;
+  }
+
+  void CopyDecodedVariant(uint32_t variant, uint8_t* output) const {
+    const uint32_t variant_offset =
+        variant - block_view.first_variant();
+    const uint8_t* source = reinterpret_cast<const uint8_t*>(
+        decoded_block.data() +
+        static_cast<size_t>(variant_offset) * word_stride);
+    if (!sample_subset.empty()) {
+      source = projected_block.data() +
+               static_cast<size_t>(variant_offset) * packed_byte_ct;
+    }
+    memcpy(output, source, packed_byte_ct);
   }
 
   ContainerReader reader;
@@ -289,6 +293,26 @@ void PackedVariantReader::ClearSampleSubset() {
   impl_->ClearSampleSubset();
 }
 
+bool PackedVariantReader::ReadVariant(
+    uint32_t variant, uint8_t* output, size_t output_byte_ct,
+    PackedReadStats* stats, std::string* error) {
+  if ((!output) || (output_byte_ct < impl_->packed_byte_ct) ||
+      (variant >= impl_->reader.params().variant_ct)) {
+    SetError("Invalid conditional-rANS packed variant request.", error);
+    return false;
+  }
+  uint32_t block_idx;
+  if (!impl_->reader.FindBlock(variant, &block_idx, error) ||
+      !impl_->DecodeBlock(block_idx, stats, error)) {
+    return false;
+  }
+  impl_->CopyDecodedVariant(variant, output);
+  if (stats) {
+    ++stats->returned_variant_ct;
+  }
+  return true;
+}
+
 bool PackedVariantReader::ReadRange(
     uint32_t first_variant, uint32_t variant_ct, uint8_t* output,
     size_t output_variant_stride, PackedReadStats* stats,
@@ -300,12 +324,27 @@ bool PackedVariantReader::ReadRange(
     SetError("Conditional-rANS packed range is out of bounds.", error);
     return false;
   }
-  std::vector<uint32_t> variants(variant_ct);
-  for (uint32_t offset = 0; offset != variant_ct; ++offset) {
-    variants[offset] = first_variant + offset;
+  if ((!output) || (output_variant_stride < impl_->packed_byte_ct) ||
+      (variant_ct >
+       std::numeric_limits<size_t>::max() / output_variant_stride)) {
+    SetError("Invalid conditional-rANS packed range output.", error);
+    return false;
   }
-  return impl_->ReadList(variants.data(), variant_ct, output,
-                         output_variant_stride, stats, error);
+  for (uint32_t offset = 0; offset != variant_ct; ++offset) {
+    const uint32_t variant = first_variant + offset;
+    uint32_t block_idx;
+    if (!impl_->reader.FindBlock(variant, &block_idx, error) ||
+        !impl_->DecodeBlock(block_idx, stats, error)) {
+      return false;
+    }
+    impl_->CopyDecodedVariant(
+        variant, output + static_cast<size_t>(offset) *
+                              output_variant_stride);
+  }
+  if (stats) {
+    stats->returned_variant_ct += variant_ct;
+  }
+  return true;
 }
 
 bool PackedVariantReader::ReadList(

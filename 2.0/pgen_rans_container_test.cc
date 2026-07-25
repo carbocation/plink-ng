@@ -380,6 +380,15 @@ int main() {
              kVariantCt, 1, packed_output.data(), output_stride,
              &packed_stats, &error),
          "packed reader accepted an out-of-range request");
+  std::vector<uint8_t> single_output(packed_byte_ct, 0);
+  Expect(packed_reader.ReadVariant(
+             4, single_output.data(), single_output.size(),
+             &packed_stats, &error),
+         "packed single-variant read failed: " + error);
+  Expect(!memcmp(single_output.data(), source[4].data(), packed_byte_ct),
+         "packed single-variant genotype mismatch");
+  Expect(packed_stats.returned_variant_ct == 15,
+         "packed single-variant accounting mismatch");
   const uint32_t sample_subset[] = {0, 2, 33, 999, 1002};
   Expect(packed_reader.SetSampleSubset(
              sample_subset, 5, &error),
