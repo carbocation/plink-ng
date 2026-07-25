@@ -192,6 +192,25 @@ int main() {
     }
   }
   reader.Close();
+
+  FILE* corrupt_file = fopen(path.c_str(), "r+b");
+  Expect(corrupt_file != nullptr, "could not reopen temporary container");
+  Expect(fseeko(corrupt_file, -1, SEEK_END) == 0,
+         "could not seek to container payload");
+  const int original_byte = fgetc(corrupt_file);
+  Expect(original_byte != EOF, "could not read container payload byte");
+  Expect(fseeko(corrupt_file, -1, SEEK_CUR) == 0,
+         "could not rewind container payload byte");
+  Expect(fputc(original_byte ^ 1, corrupt_file) != EOF,
+         "could not corrupt container payload byte");
+  Expect(fclose(corrupt_file) == 0, "could not close corrupted container");
+  Expect(reader.Open(path, &error),
+         "corrupted container index could not be opened: " + error);
+  EncodedBlock corrupted_block;
+  Expect(!reader.ReadBlock(1, &corrupted_block, &error),
+         "block payload bit flip was not detected");
+  reader.Close();
+
   Expect(unlink(path.c_str()) == 0, "temporary file cleanup failed");
   puts("pgen_rans_container_test: PASS");
   return 0;

@@ -90,7 +90,8 @@ and anchor sizes, rANS parameters, restart interval, block count, and offsets
 of the block table and block-data region. It is followed by a fixed 32-byte
 entry for every block containing the first variant, variant count, file
 offset, and byte count. This permits a client to issue one bounded ranged read
-for a block without scanning earlier variant records.
+for a block without scanning earlier variant records. Each entry also stores a
+CRC32C checksum of the complete serialized block.
 
 Each block starts with a 16-byte header followed by:
 
@@ -104,4 +105,36 @@ restart interval is 64 variants.
 
 Version 1 readers validate that block-table entries cover the variants and
 file exactly, blocks are contiguous, restart offsets agree with record
-lengths, and record lengths span each block payload.
+lengths, record lengths span each block payload, and the block CRC32C matches.
+
+## Reference CLI
+
+Build from `2.0/`:
+
+```sh
+make -f Makefile.pgen_rans pgen_rans
+```
+
+Encode an unphased, biallelic hardcall PGEN:
+
+```sh
+bin/pgen_rans encode cohort.pgen cohort.pgr \
+  --pvar cohort.pvar \
+  --block-variants 128 \
+  --anchors 32 \
+  --two-ref-shortlist 4 \
+  --threads 8
+```
+
+Then perform a byte-for-byte packed-hardcall round trip:
+
+```sh
+bin/pgen_rans verify cohort.pgen cohort.pgr
+```
+
+`inspect` validates the container and summarizes its record modes without
+decoding genotypes:
+
+```sh
+bin/pgen_rans inspect cohort.pgr
+```

@@ -31,6 +31,7 @@ struct BlockIndexEntry {
   uint32_t variant_ct = 0;
   uint64_t file_offset = 0;
   uint64_t byte_ct = 0;
+  uint32_t checksum = 0;
 };
 
 std::vector<uint32_t> ScheduledAnchorOffsets(uint32_t block_variant_ct,

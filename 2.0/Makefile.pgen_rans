@@ -7,8 +7,16 @@ PGENRANSTESTOBJ = $(PGENRANSCODECOBJ) pgen_rans_codec_test.o
 PGENRANSCONTAINEROBJ = pgen_rans_container.o
 PGENRANSCONTAINERTESTOBJ = $(PGENRANSCODECOBJ) \
 	pgen_rans_container.o pgen_rans_container_test.o
+PGENRANSTOOLSRC = $(PGENLIB_CCSRC) pgen_rans_codec.cc \
+	pgen_rans_container.cc pgen_rans_tool.cc
+PGENRANSTOOLOBJ = $(PGENRANSTOOLSRC:.cc=.o)
 
-.PHONY: pgen_rans_codec_test pgen_rans_container_test test
+.PHONY: pgen_rans pgen_rans_codec_test pgen_rans_container_test test
+
+pgen_rans: $(PGENRANSTOOLOBJ)
+	$(MKDIR) -p bin
+	$(CXX) $(PGENRANSTOOLOBJ) \
+		-o bin/pgen_rans $(LDFLAGS)
 
 pgen_rans_codec_test: $(PGENRANSTESTOBJ)
 	$(MKDIR) -p bin
@@ -24,4 +32,5 @@ test: pgen_rans_codec_test pgen_rans_container_test
 	bin/pgen_rans_codec_test
 	bin/pgen_rans_container_test
 
-CLEAN += bin/pgen_rans_codec_test bin/pgen_rans_container_test
+CLEAN += bin/pgen_rans bin/pgen_rans_codec_test \
+	bin/pgen_rans_container_test

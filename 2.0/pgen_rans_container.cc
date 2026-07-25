@@ -20,11 +20,38 @@ constexpr uint32_t kBlockIndexByteCt = 32;
 constexpr uint32_t kBlockHeaderByteCt = 16;
 constexpr uint32_t kBlockMagic = 0x314b4c42U;
 constexpr uint32_t kMaximumRecordByteCt = 0xffffffU;
+constexpr uint32_t kCrc32cPolynomial = 0x82f63b78U;
 
 void SetError(const std::string& message, std::string* error) {
   if (error) {
     *error = message;
   }
+}
+
+const std::array<uint32_t, 256>& Crc32cTable() {
+  static const std::array<uint32_t, 256> table = []() {
+    std::array<uint32_t, 256> result = {};
+    for (uint32_t value = 0; value != result.size(); ++value) {
+      uint32_t remainder = value;
+      for (uint32_t bit = 0; bit != 8; ++bit) {
+        remainder = (remainder >> 1) ^
+                    ((0U - (remainder & 1U)) & kCrc32cPolynomial);
+      }
+      result[value] = remainder;
+    }
+    return result;
+  }();
+  return table;
+}
+
+uint32_t Crc32c(const uint8_t* data, size_t byte_ct) {
+  const std::array<uint32_t, 256>& table = Crc32cTable();
+  uint32_t checksum = UINT32_MAX;
+  for (size_t byte_idx = 0; byte_idx != byte_ct; ++byte_idx) {
+    checksum =
+        table[(checksum ^ data[byte_idx]) & 0xffU] ^ (checksum >> 8);
+  }
+  return ~checksum;
 }
 
 void AppendU16(uint16_t value, std::vector<uint8_t>* output) {
@@ -174,7 +201,8 @@ std::vector<uint8_t> SerializeBlockIndex(
     AppendU32(entry.variant_ct, &output);
     AppendU64(entry.file_offset, &output);
     AppendU64(entry.byte_ct, &output);
-    AppendU64(0, &output);
+    AppendU32(entry.checksum, &output);
+    AppendU32(0, &output);
   }
   return output;
 }
@@ -328,7 +356,8 @@ bool ContainerWriter::WriteBlock(const EncodedBlock& block,
     return false;
   }
   block_index_.push_back(
-      {block.first_variant, block_variant_ct, file_offset, block_byte_ct});
+      {block.first_variant, block_variant_ct, file_offset, block_byte_ct,
+       Crc32c(serialized.data(), serialized.size())});
   next_variant_ += block_variant_ct;
   return true;
 }
@@ -455,7 +484,8 @@ bool ContainerReader::Open(const std::string& path, std::string* error) {
   uint32_t next_variant = 0;
   uint64_t next_file_offset = data_offset;
   for (BlockIndexEntry& entry : block_index_) {
-    uint64_t reserved;
+    uint32_t checksum;
+    uint32_t reserved;
     if ((!ReadU32(serialized_index.data(), serialized_index.size(), &offset,
                   &entry.first_variant)) ||
         (!ReadU32(serialized_index.data(), serialized_index.size(), &offset,
@@ -464,7 +494,9 @@ bool ContainerReader::Open(const std::string& path, std::string* error) {
                   &entry.file_offset)) ||
         (!ReadU64(serialized_index.data(), serialized_index.size(), &offset,
                   &entry.byte_ct)) ||
-        (!ReadU64(serialized_index.data(), serialized_index.size(), &offset,
+        (!ReadU32(serialized_index.data(), serialized_index.size(), &offset,
+                  &checksum)) ||
+        (!ReadU32(serialized_index.data(), serialized_index.size(), &offset,
                   &reserved)) ||
         reserved || (entry.first_variant != next_variant) ||
         (!entry.variant_ct) ||
@@ -477,6 +509,7 @@ bool ContainerReader::Open(const std::string& path, std::string* error) {
       Close();
       return false;
     }
+    entry.checksum = checksum;
     next_variant += entry.variant_ct;
     next_file_offset += entry.byte_ct;
   }
@@ -513,6 +546,10 @@ bool ContainerReader::ReadBlock(uint32_t block_idx, EncodedBlock* block,
   std::vector<uint8_t> serialized(static_cast<size_t>(entry.byte_ct));
   if ((!Seek(file_, entry.file_offset, error)) ||
       (!ReadBytes(file_, serialized.data(), serialized.size(), error))) {
+    return false;
+  }
+  if (Crc32c(serialized.data(), serialized.size()) != entry.checksum) {
+    SetError("Conditional-rANS block checksum mismatch.", error);
     return false;
   }
   size_t offset = 0;
