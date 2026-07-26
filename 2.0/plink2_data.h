@@ -61,7 +61,8 @@ FLAGSET_DEF_START()
   kfMakePgenErasePhase = (1 << 21),
   kfMakePgenEraseDosage = (1 << 22),
   kfMakePgenFillMissingFromDosage = (1 << 23),
-  kfMakePgenWriterVer = (1 << 24)
+  kfMakePgenWriterVer = (1 << 24),
+  kfMakePgenRans = (1 << 25)
 FLAGSET_DEF_END(MakePlink2Flags);
 
 FLAGSET_DEF_START()

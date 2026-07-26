@@ -39,7 +39,7 @@ struct Options {
 void PrintUsage(FILE* out) {
   fputs(
       "Usage:\n"
-      "  pgen_rans_cuda_benchmark <input.pgr> [options]\n"
+      "  pgen_rans_cuda_benchmark <rans.pgen> [options]\n"
       "\n"
       "Options:\n"
       "  --blocks <n>         Deterministic block strata (default 80).\n"
@@ -306,9 +306,9 @@ int main(int argc, char** argv) {
     printf("  checksum:                   %016llx\n",
            static_cast<unsigned long long>(checksum));
     printf("\nTiming\n");
-    printf("  PGR block bytes:            %llu\n",
+    printf("  rANS-PGEN block bytes:      %llu\n",
            static_cast<unsigned long long>(block_bytes));
-    printf("  PGR block read seconds:     %.6f\n", block_read_seconds);
+    printf("  rANS-PGEN read seconds:     %.6f\n", block_read_seconds);
     printf("  H2D upload seconds:         %.6f\n", upload_seconds);
     printf("  anchor kernel seconds:      %.6f\n", anchor_seconds);
     printf("  target kernel seconds:      %.6f\n", target_seconds);

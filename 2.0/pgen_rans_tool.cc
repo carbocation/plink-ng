@@ -35,7 +35,7 @@ using pgen_rans::DecodeMultiallelicPatches;
 using pgen_rans::DecodeRecord;
 using pgen_rans::EncodeInput;
 using pgen_rans::EncodeParams;
-using pgen_rans::EncodePgr;
+using pgen_rans::EncodePgenRans;
 using pgen_rans::EncodeStats;
 using pgen_rans::EncodedBlock;
 using pgen_rans::EncodedBlockView;
@@ -75,10 +75,10 @@ struct PvarData {
 void PrintUsage(FILE* out) {
   fputs(
       "Usage:\n"
-      "  pgen_rans encode <input.pgen> <output.pgr> [options]\n"
-      "  pgen_rans verify <input.pgen> <input.pgr> [options]\n"
-      "  pgen_rans benchmark <input.pgen> <input.pgr> [options]\n"
-      "  pgen_rans inspect <input.pgr>\n"
+      "  pgen_rans encode <source.pgen> <rans.pgen> [options]\n"
+      "  pgen_rans verify <source.pgen> <rans.pgen> [options]\n"
+      "  pgen_rans benchmark <source.pgen> <rans.pgen> [options]\n"
+      "  pgen_rans inspect <rans.pgen>\n"
       "\n"
       "Encode options:\n"
       "  --pvar <file>              Required plain-text PVAR schema.\n"
@@ -607,7 +607,7 @@ class PgenInput {
     return GetPgfiVrecWidth(&pgfi_, variant_idx);
   }
   PgenFileInfo* pgfi() { return &pgfi_; }
-  PgenReader* pgr() { return &pgr_; }
+  PgenReader* reader() { return &pgr_; }
 
  private:
   bool AllocatePatchBuffers(std::string* error) {
@@ -674,7 +674,7 @@ int Encode(const Options& opts) {
   input.variant_ct = variant_ct;
   input.variant_metadata = pvar.variants.data();
   input.pgfi = pgen.pgfi();
-  input.pgr = pgen.pgr();
+  input.pgen_reader = pgen.reader();
   EncodeParams params;
   params.block_variant_ct = opts.block_variant_ct;
   params.anchor_ct = opts.anchor_ct;
@@ -685,7 +685,7 @@ int Encode(const Options& opts) {
   params.rans_scale_bits = opts.rans_scale_bits;
   params.thread_ct = opts.thread_ct;
   EncodeStats stats;
-  if (EncodePgr(opts.output_fname, input, params, &stats, &error)) {
+  if (EncodePgenRans(opts.output_fname, input, params, &stats, &error)) {
     fprintf(stderr, "\nError: %s\n", error.c_str());
     return 1;
   }
@@ -766,7 +766,7 @@ int Verify(const Options& opts) {
   const ContainerParams& params = reader.params();
   if ((params.sample_ct != pgen.sample_ct()) ||
       (params.variant_ct > pgen.variant_ct())) {
-    fputs("Error: PGEN/container dimension mismatch.\n", stderr);
+    fputs("Error: Source/conditional-PGEN dimension mismatch.\n", stderr);
     return 1;
   }
   const uint32_t verify_variant_ct =
@@ -944,7 +944,7 @@ int Benchmark(const Options& opts) {
   const ContainerParams& params = reader.params();
   if ((params.sample_ct != pgen.sample_ct()) ||
       (params.variant_ct > pgen.variant_ct())) {
-    fputs("Error: PGEN/container dimension mismatch.\n", stderr);
+    fputs("Error: Source/conditional-PGEN dimension mismatch.\n", stderr);
     return 1;
   }
   const std::vector<uint32_t> selected_blocks =
@@ -1090,7 +1090,7 @@ int Benchmark(const Options& opts) {
                ? calls / average_decode_seconds / 1.0e9L
                : 0.0L);
     printf("  serial read + decode:    %.6f\n", pgr_serial_seconds);
-    printf("  PGEN/PGR serial speedup: %.3f\n",
+    printf("  source/rANS-PGEN serial speedup: %.3f\n",
            (pgr_serial_seconds > 0.0)
                ? pgen_seconds / pgr_serial_seconds
                : 0.0);
@@ -1161,7 +1161,7 @@ int Inspect(const Options& opts) {
       }
     }
   }
-  printf("Conditional-rANS container\n");
+  printf("Conditional-rANS PGEN\n");
   printf("  samples:                 %u\n", params.sample_ct);
   printf("  variants:                %u\n", params.variant_ct);
   printf("  blocks:                  %u\n", params.block_ct);

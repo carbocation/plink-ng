@@ -80,21 +80,40 @@ jobs:
           2.0/build_dynamic/plink2 --version | tee /tmp/plink2-version.txt
           grep -q AVX2 /tmp/plink2-version.txt
           grep -q Intel /tmp/plink2-version.txt
-          2.0/build_dynamic/plink2 --help pgr make-pgr | grep -q -- --make-pgr
+          2.0/build_dynamic/plink2 --help make-pgen | grep -q 'rans:'
           2.0/bin/pgen_rans --help
-          smoke_prefix="$RUNNER_TEMP/pgr-smoke"
+          smoke_prefix="$RUNNER_TEMP/rans-pgen-smoke"
           2.0/build_dynamic/plink2 \
             --pfile 2.0/pgenlibr/inst/extdata/chr21_phase3_start vzs \
             --make-pgen erase-phase erase-dosage \
             --out "$smoke_prefix-input"
+          if 2.0/build_dynamic/plink2 \
+            --pfile 2.0/pgenlibr/inst/extdata/chr21_phase3_start vzs \
+            --make-pgen format=rans \
+            --out "$smoke_prefix-implicit-loss"; then
+            echo "Conditional PGEN silently discarded phase/dosage." >&2
+            exit 1
+          fi
+          2.0/build_dynamic/plink2 \
+            --pfile 2.0/pgenlibr/inst/extdata/chr21_phase3_start vzs \
+            --make-pgen format=rans erase-phase erase-dosage \
+            --threads 2 \
+            --out "$smoke_prefix-explicit-erasure"
+          2.0/build_dynamic/plink2 \
+            --pfile "$smoke_prefix-explicit-erasure" \
+            --validate \
+            --out "$smoke_prefix-explicit-erasure-validation"
           2.0/build_dynamic/plink2 \
             --pfile "$smoke_prefix-input" \
-            --make-pgr \
+            --make-pgen format=rans \
             --threads 2 \
             --out "$smoke_prefix"
           2.0/bin/pgen_rans verify \
-            "$smoke_prefix-input.pgen" "$smoke_prefix.pgr" \
+            "$smoke_prefix-input.pgen" "$smoke_prefix.pgen" \
             --pvar "$smoke_prefix.pvar"
+          test "$(od -An -tu1 -j2 -N1 "$smoke_prefix.pgen" |
+            tr -d ' ')" = 128
+          test -s "$smoke_prefix.pgen"
           test -s "$smoke_prefix.pvar"
           test -s "$smoke_prefix.psam"
           2.0/build_dynamic/plink2 \
@@ -102,12 +121,26 @@ jobs:
             --export A \
             --out "$smoke_prefix-pgen-export"
           2.0/build_dynamic/plink2 \
-            --pgr "$smoke_prefix" \
+            --pfile "$smoke_prefix" \
             --export A \
-            --out "$smoke_prefix-pgr-export"
-          cmp "$smoke_prefix-pgen-export.raw" "$smoke_prefix-pgr-export.raw"
+            --out "$smoke_prefix-rans-export"
+          cmp "$smoke_prefix-pgen-export.raw" "$smoke_prefix-rans-export.raw"
           2.0/build_dynamic/plink2 \
-            --pgr "$smoke_prefix" \
+            --pfile "$smoke_prefix" \
+            --make-pgen format=rans \
+            --threads 2 \
+            --out "$smoke_prefix-recode"
+          2.0/build_dynamic/plink2 \
+            --pfile "$smoke_prefix-recode" \
+            --validate \
+            --export A \
+            --out "$smoke_prefix-recode-export"
+          cmp "$smoke_prefix-pgen-export.raw" \
+            "$smoke_prefix-recode-export.raw"
+          cmp "$smoke_prefix.pvar" "$smoke_prefix-recode.pvar"
+          cmp "$smoke_prefix.psam" "$smoke_prefix-recode.psam"
+          2.0/build_dynamic/plink2 \
+            --pfile "$smoke_prefix" \
             --make-pgen \
             --out "$smoke_prefix-roundtrip"
           2.0/build_dynamic/plink2 \
@@ -130,7 +163,7 @@ jobs:
             --out "$smoke_prefix-pca-input"
           2.0/build_dynamic/plink2 \
             --pfile "$smoke_prefix-pca-input" \
-            --make-pgr \
+            --make-pgen format=rans \
             --threads 2 \
             --out "$smoke_prefix-pca"
           2.0/build_dynamic/plink2 \
@@ -138,13 +171,27 @@ jobs:
             --pca 3 \
             --out "$smoke_prefix-pgen-pca"
           2.0/build_dynamic/plink2 \
-            --pgr "$smoke_prefix-pca" \
+            --pfile "$smoke_prefix-pca" \
             --pca 3 \
-            --out "$smoke_prefix-pgr-pca"
+            --out "$smoke_prefix-rans-pca"
           cmp "$smoke_prefix-pgen-pca.eigenval" \
-            "$smoke_prefix-pgr-pca.eigenval"
+            "$smoke_prefix-rans-pca.eigenval"
           cmp "$smoke_prefix-pgen-pca.eigenvec" \
-            "$smoke_prefix-pgr-pca.eigenvec"
+            "$smoke_prefix-rans-pca.eigenvec"
+          if 2.0/build_dynamic/plink2 \
+            --pgr "$smoke_prefix" \
+            --write-snplist \
+            --out "$smoke_prefix-legacy-input"; then
+            echo "Retired --pgr input was unexpectedly accepted." >&2
+            exit 1
+          fi
+          if 2.0/build_dynamic/plink2 \
+            --pfile "$smoke_prefix-input" \
+            --make-pgr \
+            --out "$smoke_prefix-legacy-output"; then
+            echo "Retired --make-pgr output was unexpectedly accepted." >&2
+            exit 1
+          fi
           if ldd 2.0/build_dynamic/plink2 | grep -Eq 'mkl|iomp'; then
             echo "PLINK has an unexpected dynamic oneMKL dependency." >&2
             exit 1
@@ -260,21 +307,40 @@ jobs:
             grep -q M1 /tmp/plink2-version.txt
           fi
           otool -L 2.0/build_dynamic/plink2 | grep -q Accelerate
-          2.0/build_dynamic/plink2 --help pgr make-pgr | grep -q -- --make-pgr
+          2.0/build_dynamic/plink2 --help make-pgen | grep -q 'rans:'
           2.0/bin/pgen_rans --help
-          smoke_prefix="$RUNNER_TEMP/pgr-smoke"
+          smoke_prefix="$RUNNER_TEMP/rans-pgen-smoke"
           2.0/build_dynamic/plink2 \
             --pfile 2.0/pgenlibr/inst/extdata/chr21_phase3_start vzs \
             --make-pgen erase-phase erase-dosage \
             --out "$smoke_prefix-input"
+          if 2.0/build_dynamic/plink2 \
+            --pfile 2.0/pgenlibr/inst/extdata/chr21_phase3_start vzs \
+            --make-pgen format=rans \
+            --out "$smoke_prefix-implicit-loss"; then
+            echo "Conditional PGEN silently discarded phase/dosage." >&2
+            exit 1
+          fi
+          2.0/build_dynamic/plink2 \
+            --pfile 2.0/pgenlibr/inst/extdata/chr21_phase3_start vzs \
+            --make-pgen format=rans erase-phase erase-dosage \
+            --threads 2 \
+            --out "$smoke_prefix-explicit-erasure"
+          2.0/build_dynamic/plink2 \
+            --pfile "$smoke_prefix-explicit-erasure" \
+            --validate \
+            --out "$smoke_prefix-explicit-erasure-validation"
           2.0/build_dynamic/plink2 \
             --pfile "$smoke_prefix-input" \
-            --make-pgr \
+            --make-pgen format=rans \
             --threads 2 \
             --out "$smoke_prefix"
           2.0/bin/pgen_rans verify \
-            "$smoke_prefix-input.pgen" "$smoke_prefix.pgr" \
+            "$smoke_prefix-input.pgen" "$smoke_prefix.pgen" \
             --pvar "$smoke_prefix.pvar"
+          test "$(od -An -tu1 -j2 -N1 "$smoke_prefix.pgen" |
+            tr -d ' ')" = 128
+          test -s "$smoke_prefix.pgen"
           test -s "$smoke_prefix.pvar"
           test -s "$smoke_prefix.psam"
           2.0/build_dynamic/plink2 \
@@ -282,12 +348,26 @@ jobs:
             --export A \
             --out "$smoke_prefix-pgen-export"
           2.0/build_dynamic/plink2 \
-            --pgr "$smoke_prefix" \
+            --pfile "$smoke_prefix" \
             --export A \
-            --out "$smoke_prefix-pgr-export"
-          cmp "$smoke_prefix-pgen-export.raw" "$smoke_prefix-pgr-export.raw"
+            --out "$smoke_prefix-rans-export"
+          cmp "$smoke_prefix-pgen-export.raw" "$smoke_prefix-rans-export.raw"
           2.0/build_dynamic/plink2 \
-            --pgr "$smoke_prefix" \
+            --pfile "$smoke_prefix" \
+            --make-pgen format=rans \
+            --threads 2 \
+            --out "$smoke_prefix-recode"
+          2.0/build_dynamic/plink2 \
+            --pfile "$smoke_prefix-recode" \
+            --validate \
+            --export A \
+            --out "$smoke_prefix-recode-export"
+          cmp "$smoke_prefix-pgen-export.raw" \
+            "$smoke_prefix-recode-export.raw"
+          cmp "$smoke_prefix.pvar" "$smoke_prefix-recode.pvar"
+          cmp "$smoke_prefix.psam" "$smoke_prefix-recode.psam"
+          2.0/build_dynamic/plink2 \
+            --pfile "$smoke_prefix" \
             --make-pgen \
             --out "$smoke_prefix-roundtrip"
           2.0/build_dynamic/plink2 \
@@ -310,7 +390,7 @@ jobs:
             --out "$smoke_prefix-pca-input"
           2.0/build_dynamic/plink2 \
             --pfile "$smoke_prefix-pca-input" \
-            --make-pgr \
+            --make-pgen format=rans \
             --threads 2 \
             --out "$smoke_prefix-pca"
           2.0/build_dynamic/plink2 \
@@ -318,13 +398,27 @@ jobs:
             --pca 3 \
             --out "$smoke_prefix-pgen-pca"
           2.0/build_dynamic/plink2 \
-            --pgr "$smoke_prefix-pca" \
+            --pfile "$smoke_prefix-pca" \
             --pca 3 \
-            --out "$smoke_prefix-pgr-pca"
+            --out "$smoke_prefix-rans-pca"
           cmp "$smoke_prefix-pgen-pca.eigenval" \
-            "$smoke_prefix-pgr-pca.eigenval"
+            "$smoke_prefix-rans-pca.eigenval"
           cmp "$smoke_prefix-pgen-pca.eigenvec" \
-            "$smoke_prefix-pgr-pca.eigenvec"
+            "$smoke_prefix-rans-pca.eigenvec"
+          if 2.0/build_dynamic/plink2 \
+            --pgr "$smoke_prefix" \
+            --write-snplist \
+            --out "$smoke_prefix-legacy-input"; then
+            echo "Retired --pgr input was unexpectedly accepted." >&2
+            exit 1
+          fi
+          if 2.0/build_dynamic/plink2 \
+            --pfile "$smoke_prefix-input" \
+            --make-pgr \
+            --out "$smoke_prefix-legacy-output"; then
+            echo "Retired --make-pgr output was unexpectedly accepted." >&2
+            exit 1
+          fi
 
       - name: Package macOS artifact
         shell: bash

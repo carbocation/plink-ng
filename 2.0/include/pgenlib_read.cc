@@ -877,6 +877,24 @@ PglErr PgfiInitPhase1(const char* fname, const char* pgi_fname, uint32_t raw_var
     pgfip->gflags |= kfPgenGlobalAllNonref;
   }
 
+  if (file_type_code == kPgenDeveloperRansStorageMode) {
+    if (unlikely((fsize < 96) || (header_ctrl & 0x3f) ||
+                 (!nonref_flags_storage))) {
+      snprintf(
+          errstr_buf, kPglErrstrBufBlen,
+          "Error: %s has an invalid conditional-rANS PGEN header.\n", fname);
+      return kPglRetMalformedInput;
+    }
+    // PgfiInitPhase2() is intentionally bypassed for this developer storage
+    // mode.  Use an otherwise-invalid Phase 1 value to let PLINK recognize
+    // the alternate backend without changing PgenFileInfo's layout.
+    pgfip->const_fpos_offset = UINT64_MAX;
+    pgfip->const_vrtype = UINT32_MAX;
+    pgfip->const_vrec_width = 0;
+    *pgfi_alloc_cacheline_ct_ptr = 0;
+    return kPglRetSuccess;
+  }
+
   if (file_type_code < 16) {
     // plink 2 binary, single constant-width vrtype
     pgfip->const_fpos_offset = 12;
@@ -1103,6 +1121,14 @@ PglErr PgfiInitPhase2Ex(PgenHeaderCtrl header_ctrl, uint32_t allele_cts_already_
   // *max_vrec_width_ptr technically only needs to be set in single-variant
   // fread() mode, but its computation is not currently optimized out in the
   // other two modes.
+
+  if (pgfip->const_fpos_offset == UINT64_MAX) {
+    snprintf(
+        errstr_buf, kPglErrstrBufBlen,
+        "Error: Conditional-rANS PGEN storage requires its alternate "
+        "hardcall backend.\n");
+    return kPglRetNotYetSupported;
+  }
 
   // possible todo: add option to skip validation when allele_cts/nonref_flags
   // are already loaded.  but let's play it safe for now.
@@ -6746,6 +6772,14 @@ PglErr PgrGetM(const uintptr_t* __restrict sample_include, PgrSampleSubsetIndex 
   }
   PgenReaderMain* pgrp = GetPgrp(pgr_ptr);
   const uint32_t* sample_include_cumulative_popcounts = GetSicp(pssi);
+  if (pgrp->hardcall_backend) {
+    if (!pgrp->hardcall_backend->get_m) {
+      return kPglRetNotYetSupported;
+    }
+    return pgrp->hardcall_backend->get_m(
+        pgrp->hardcall_backend->context, sample_include,
+        sample_include_cumulative_popcounts, sample_ct, vidx, pgvp);
+  }
   const uint32_t vrtype = GetPgfiVrtype(&(pgrp->fi), vidx);
   const uint32_t multiallelic_hc_present = VrtypeMultiallelicHc(vrtype);
   if (!multiallelic_hc_present) {

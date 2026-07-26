@@ -5,6 +5,7 @@
 #include <algorithm>
 #include <array>
 #include <cstring>
+#include <vector>
 
 #include "include/plink2_base.h"
 #include "include/plink2_bits.h"
@@ -22,21 +23,22 @@ PglErr ReadFailure(const std::string& message, std::string* last_error) {
 
 }  // namespace
 
-PlinkPgrAdapter::PlinkPgrAdapter() {
+PlinkRansAdapter::PlinkRansAdapter() {
   backend_.context = this;
   backend_.get = &Get;
   backend_.get_allele = &GetAllele;
   backend_.get_counts = &GetCounts;
   backend_.get_packed = &GetPacked;
+  backend_.get_m = &GetM;
   backend_.get_raw = &GetRaw;
 }
 
-PlinkPgrAdapter::~PlinkPgrAdapter() {
+PlinkRansAdapter::~PlinkRansAdapter() {
   Close();
 }
 
-bool PlinkPgrAdapter::Open(const std::string& path, uint32_t thread_ct,
-                           std::string* error) {
+bool PlinkRansAdapter::Open(const std::string& path, uint32_t thread_ct,
+                            std::string* error) {
   Close();
   if (!reader_.Open(path, thread_ct, error)) {
     return false;
@@ -50,7 +52,8 @@ bool PlinkPgrAdapter::Open(const std::string& path, uint32_t thread_ct,
           static_cast<uintptr_t>(raw_word_ct_) * sizeof(uintptr_t),
           &count_genovec_)) {
     if (error) {
-      *error = "Out of memory allocating the PGR PLINK adapter.";
+      *error =
+          "Out of memory allocating the conditional-rANS PGEN adapter.";
     }
     Close();
     return false;
@@ -58,7 +61,22 @@ bool PlinkPgrAdapter::Open(const std::string& path, uint32_t thread_ct,
   return true;
 }
 
-void PlinkPgrAdapter::Close() {
+bool PlinkRansAdapter::Validate(std::string* error) {
+  std::vector<uint8_t> packed(reader_.packed_variant_byte_ct());
+  MultiallelicPatches patches;
+  for (uint32_t vidx = 0; vidx != reader_.variant_ct(); ++vidx) {
+    if (!reader_.ReadVariant(
+            vidx, packed.data(), packed.size(), nullptr, error) ||
+        ((reader_.max_allele_ct() > 2) &&
+         (!reader_.ReadVariantPatches(
+             vidx, &patches, nullptr, error)))) {
+      return false;
+    }
+  }
+  return true;
+}
+
+void PlinkRansAdapter::Close() {
   aligned_free_cond(count_genovec_);
   aligned_free_cond(raw_genovec_);
   count_genovec_ = nullptr;
@@ -68,42 +86,42 @@ void PlinkPgrAdapter::Close() {
   last_error_.clear();
 }
 
-void PlinkPgrAdapter::Install(PgenFileInfo* pgfi, PgenReader* pgr) {
+void PlinkRansAdapter::Install(PgenFileInfo* pgfi, PgenReader* pgr) {
   pgfi->multiread_backend = &backend_;
   PgenReaderMain* pgrp = &GET_PRIVATE(*pgr, m);
   pgrp->fi = *pgfi;
   pgrp->hardcall_backend = &backend_;
 }
 
-uint32_t PlinkPgrAdapter::sample_ct() const {
+uint32_t PlinkRansAdapter::sample_ct() const {
   return reader_.raw_sample_ct();
 }
 
-uint32_t PlinkPgrAdapter::variant_ct() const {
+uint32_t PlinkRansAdapter::variant_ct() const {
   return reader_.variant_ct();
 }
 
-uint32_t PlinkPgrAdapter::max_allele_ct() const {
+uint32_t PlinkRansAdapter::max_allele_ct() const {
   return reader_.max_allele_ct();
 }
 
-bool PlinkPgrAdapter::all_nonref() const {
+bool PlinkRansAdapter::all_nonref() const {
   return reader_.all_nonref();
 }
 
-bool PlinkPgrAdapter::has_mixed_nonref_flags() const {
+bool PlinkRansAdapter::has_mixed_nonref_flags() const {
   return reader_.has_mixed_nonref_flags();
 }
 
-bool PlinkPgrAdapter::variant_is_nonref(uint32_t variant) const {
+bool PlinkRansAdapter::variant_is_nonref(uint32_t variant) const {
   return reader_.variant_is_nonref(variant);
 }
 
-const std::string& PlinkPgrAdapter::last_error() const {
+const std::string& PlinkRansAdapter::last_error() const {
   return last_error_;
 }
 
-bool PlinkPgrAdapter::ReadRaw(uint32_t vidx) {
+bool PlinkRansAdapter::ReadRaw(uint32_t vidx) {
   std::fill(raw_genovec_, raw_genovec_ + raw_word_ct_, 0);
   std::string error;
   if (!reader_.ReadVariant(
@@ -116,7 +134,7 @@ bool PlinkPgrAdapter::ReadRaw(uint32_t vidx) {
   return true;
 }
 
-void PlinkPgrAdapter::CopySubset(
+void PlinkRansAdapter::CopySubset(
     const uintptr_t* sample_include, uint32_t sample_ct,
     uintptr_t* destination) const {
   if (sample_ct == reader_.raw_sample_ct()) {
@@ -129,7 +147,7 @@ void PlinkPgrAdapter::CopySubset(
   }
 }
 
-PglErr PlinkPgrAdapter::ReadBase(
+PglErr PlinkRansAdapter::ReadBase(
     const uintptr_t* sample_include, uint32_t sample_ct,
     uint32_t vidx, uintptr_t* genovec) {
   if ((!sample_ct) || (!genovec) ||
@@ -144,7 +162,7 @@ PglErr PlinkPgrAdapter::ReadBase(
   return kPglRetSuccess;
 }
 
-PglErr PlinkPgrAdapter::ReadAllele(
+PglErr PlinkRansAdapter::ReadAllele(
     const uintptr_t* sample_include, uint32_t sample_ct,
     uint32_t vidx, uint32_t allele_idx, uintptr_t* allele_countvec) {
   if ((!sample_ct) || (!allele_countvec) ||
@@ -163,7 +181,8 @@ PglErr PlinkPgrAdapter::ReadAllele(
     }
   }
   if (allele_idx >= patches.allele_ct) {
-    last_error_ = "Requested allele is outside the PGR variant.";
+    last_error_ =
+        "Requested allele is outside the conditional-rANS PGEN variant.";
     return kPglRetInconsistentInput;
   }
   const uint32_t raw_sample_ct = reader_.raw_sample_ct();
@@ -219,7 +238,75 @@ PglErr PlinkPgrAdapter::ReadAllele(
   return kPglRetSuccess;
 }
 
-PglErr PlinkPgrAdapter::ReadRawRecord(
+PglErr PlinkRansAdapter::ReadMultiallelic(
+    const uintptr_t* sample_include,
+    const uint32_t* sample_include_cumulative_popcounts,
+    uint32_t sample_ct, uint32_t vidx, PgenVariant* pgv) {
+  if ((!sample_ct) || (!pgv) || (!pgv->genovec) ||
+      (!pgv->patch_01_set) || (!pgv->patch_01_vals) ||
+      (!pgv->patch_10_set) || (!pgv->patch_10_vals) ||
+      (sample_ct > reader_.raw_sample_ct()) ||
+      ((sample_ct != reader_.raw_sample_ct()) &&
+       ((!sample_include) ||
+        (!sample_include_cumulative_popcounts)))) {
+    return kPglRetImproperFunctionCall;
+  }
+  if (!ReadRaw(vidx)) {
+    return kPglRetReadFail;
+  }
+  CopySubset(sample_include, sample_ct, pgv->genovec);
+  pgv->patch_01_ct = 0;
+  pgv->patch_10_ct = 0;
+  ZeroWArr(BitCtToWordCt(sample_ct), pgv->patch_01_set);
+  ZeroWArr(BitCtToWordCt(sample_ct), pgv->patch_10_set);
+
+  MultiallelicPatches patches;
+  std::string error;
+  if (!reader_.ReadVariantPatches(
+          vidx, &patches, nullptr, &error)) {
+    return ReadFailure(error, &last_error_);
+  }
+  for (size_t patch_idx = 0;
+       patch_idx != patches.patch_01_sample_ids.size(); ++patch_idx) {
+    const uint32_t raw_sample_idx =
+        patches.patch_01_sample_ids[patch_idx];
+    if (sample_include && (!IsSet(sample_include, raw_sample_idx))) {
+      continue;
+    }
+    const uint32_t sample_idx =
+        sample_include
+            ? RawToSubsettedPos(
+                  sample_include, sample_include_cumulative_popcounts,
+                  raw_sample_idx)
+            : raw_sample_idx;
+    SetBit(sample_idx, pgv->patch_01_set);
+    pgv->patch_01_vals[pgv->patch_01_ct++] =
+        patches.patch_01_values[patch_idx];
+  }
+  for (size_t patch_idx = 0;
+       patch_idx != patches.patch_10_sample_ids.size(); ++patch_idx) {
+    const uint32_t raw_sample_idx =
+        patches.patch_10_sample_ids[patch_idx];
+    if (sample_include && (!IsSet(sample_include, raw_sample_idx))) {
+      continue;
+    }
+    const uint32_t sample_idx =
+        sample_include
+            ? RawToSubsettedPos(
+                  sample_include, sample_include_cumulative_popcounts,
+                  raw_sample_idx)
+            : raw_sample_idx;
+    SetBit(sample_idx, pgv->patch_10_set);
+    pgv->patch_10_vals[2 * pgv->patch_10_ct] =
+        patches.patch_10_values[2 * patch_idx];
+    pgv->patch_10_vals[2 * pgv->patch_10_ct + 1] =
+        patches.patch_10_values[2 * patch_idx + 1];
+    ++pgv->patch_10_ct;
+  }
+  return kPglRetSuccess;
+}
+
+PglErr PlinkRansAdapter::ReadRawRecord(
     uint32_t vidx, PgenGlobalFlags read_gflags,
     uintptr_t** loadbuf_iter_ptr,
     unsigned char* loaded_vrtype_ptr) {
@@ -265,7 +352,8 @@ PglErr PlinkPgrAdapter::ReadRawRecord(
   }
   if ((patches.patch_01_values.size() != rare01_ct) ||
       (patches.patch_10_values.size() != 2 * rare10_ct)) {
-    last_error_ = "Malformed PGR multiallelic patch vectors.";
+    last_error_ =
+        "Malformed conditional-rANS PGEN multiallelic patch vectors.";
     return kPglRetMalformedInput;
   }
   if (loaded_vrtype_ptr) {
@@ -286,7 +374,8 @@ PglErr PlinkPgrAdapter::ReadRawRecord(
       const uint32_t sample_idx =
           patches.patch_01_sample_ids[patch_idx];
       if (sample_idx >= raw_sample_ct) {
-        last_error_ = "PGR multiallelic patch sample is out of range.";
+        last_error_ =
+            "Conditional-rANS PGEN multiallelic patch sample is out of range.";
         return kPglRetMalformedInput;
       }
       SetBit(sample_idx, patch_set);
@@ -309,7 +398,8 @@ PglErr PlinkPgrAdapter::ReadRawRecord(
       const uint32_t sample_idx =
           patches.patch_10_sample_ids[patch_idx];
       if (sample_idx >= raw_sample_ct) {
-        last_error_ = "PGR multiallelic patch sample is out of range.";
+        last_error_ =
+            "Conditional-rANS PGEN multiallelic patch sample is out of range.";
         return kPglRetMalformedInput;
       }
       SetBit(sample_idx, patch_set);
@@ -328,28 +418,28 @@ PglErr PlinkPgrAdapter::ReadRawRecord(
   return kPglRetSuccess;
 }
 
-PglErr PlinkPgrAdapter::Get(
+PglErr PlinkRansAdapter::Get(
     void* context, const uintptr_t* sample_include,
     const uint32_t*, uint32_t sample_ct, uint32_t vidx,
     uintptr_t* genovec) {
-  return static_cast<PlinkPgrAdapter*>(context)->ReadBase(
+  return static_cast<PlinkRansAdapter*>(context)->ReadBase(
       sample_include, sample_ct, vidx, genovec);
 }
 
-PglErr PlinkPgrAdapter::GetAllele(
+PglErr PlinkRansAdapter::GetAllele(
     void* context, const uintptr_t* sample_include,
     const uint32_t*, uint32_t sample_ct, uint32_t vidx,
     uint32_t allele_idx, uintptr_t* allele_countvec) {
-  return static_cast<PlinkPgrAdapter*>(context)->ReadAllele(
+  return static_cast<PlinkRansAdapter*>(context)->ReadAllele(
       sample_include, sample_ct, vidx, allele_idx, allele_countvec);
 }
 
-PglErr PlinkPgrAdapter::GetCounts(
+PglErr PlinkRansAdapter::GetCounts(
     void* context, const uintptr_t* sample_include,
     const uint32_t*, uint32_t sample_ct, uint32_t vidx,
     uint32_t* genocounts) {
-  PlinkPgrAdapter* adapter =
-      static_cast<PlinkPgrAdapter*>(context);
+  PlinkRansAdapter* adapter =
+      static_cast<PlinkRansAdapter*>(context);
   const PglErr reterr = adapter->ReadBase(
       sample_include, sample_ct, vidx, adapter->count_genovec_);
   if (reterr) {
@@ -363,27 +453,39 @@ PglErr PlinkPgrAdapter::GetCounts(
   return kPglRetSuccess;
 }
 
-PglErr PlinkPgrAdapter::GetPacked(
+PglErr PlinkRansAdapter::GetPacked(
     void* context, uint32_t vidx, unsigned char* packed_genotypes,
     uint32_t packed_byte_ct) {
-  PlinkPgrAdapter* adapter =
-      static_cast<PlinkPgrAdapter*>(context);
+  PlinkRansAdapter* adapter =
+      static_cast<PlinkRansAdapter*>(context);
   std::string error;
   if (!adapter->reader_.ReadVariant(
           vidx, packed_genotypes, packed_byte_ct, nullptr, &error)) {
-    fprintf(stderr, "Error: PGR block materialization failed at variant %u: %s\n",
-            vidx, error.c_str());
+    fprintf(
+        stderr,
+        "Error: Conditional-rANS PGEN block materialization failed at "
+        "variant %u: %s\n",
+        vidx, error.c_str());
     return ReadFailure(error, &adapter->last_error_);
   }
   return kPglRetSuccess;
 }
 
-PglErr PlinkPgrAdapter::GetRaw(
+PglErr PlinkRansAdapter::GetM(
+    void* context, const uintptr_t* sample_include,
+    const uint32_t* sample_include_cumulative_popcounts,
+    uint32_t sample_ct, uint32_t vidx, PgenVariant* pgv) {
+  return static_cast<PlinkRansAdapter*>(context)->ReadMultiallelic(
+      sample_include, sample_include_cumulative_popcounts, sample_ct,
+      vidx, pgv);
+}
+
+PglErr PlinkRansAdapter::GetRaw(
     void* context, uint32_t vidx,
     PgenGlobalFlags read_gflags,
     uintptr_t** loadbuf_iter_ptr,
     unsigned char* loaded_vrtype_ptr) {
-  return static_cast<PlinkPgrAdapter*>(context)->ReadRawRecord(
+  return static_cast<PlinkRansAdapter*>(context)->ReadRawRecord(
       vidx, read_gflags, loadbuf_iter_ptr, loaded_vrtype_ptr);
 }
 

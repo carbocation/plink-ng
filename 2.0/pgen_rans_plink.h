@@ -11,18 +11,20 @@
 
 namespace pgen_rans {
 
-// Adapts a PGR hardcall stream to the narrow packed-hardcall seam in
-// PgenReader.  PLINK's existing sample-subset, allele, score, and export code
-// remains responsible for interpretation above this boundary.
-class PlinkPgrAdapter {
+// Adapts a conditional-rANS PGEN hardcall stream to the narrow
+// packed-hardcall seam in PgenReader.  PLINK's existing sample-subset, allele,
+// score, and export code remains responsible for interpretation above this
+// boundary.
+class PlinkRansAdapter {
  public:
-  PlinkPgrAdapter();
-  ~PlinkPgrAdapter();
-  PlinkPgrAdapter(const PlinkPgrAdapter&) = delete;
-  PlinkPgrAdapter& operator=(const PlinkPgrAdapter&) = delete;
+  PlinkRansAdapter();
+  ~PlinkRansAdapter();
+  PlinkRansAdapter(const PlinkRansAdapter&) = delete;
+  PlinkRansAdapter& operator=(const PlinkRansAdapter&) = delete;
 
   bool Open(const std::string& path, uint32_t thread_ct,
             std::string* error);
+  bool Validate(std::string* error);
   void Close();
   void Install(plink2::PgenFileInfo* pgfi, plink2::PgenReader* pgr);
 
@@ -51,6 +53,10 @@ class PlinkPgrAdapter {
   static plink2::PglErr GetPacked(
       void* context, uint32_t vidx, unsigned char* packed_genotypes,
       uint32_t packed_byte_ct);
+  static plink2::PglErr GetM(
+      void* context, const uintptr_t* sample_include,
+      const uint32_t* sample_include_cumulative_popcounts,
+      uint32_t sample_ct, uint32_t vidx, plink2::PgenVariant* pgv);
   static plink2::PglErr GetRaw(
       void* context, uint32_t vidx,
       plink2::PgenGlobalFlags read_gflags,
@@ -63,6 +69,10 @@ class PlinkPgrAdapter {
   plink2::PglErr ReadAllele(
       const uintptr_t* sample_include, uint32_t sample_ct,
       uint32_t vidx, uint32_t allele_idx, uintptr_t* allele_countvec);
+  plink2::PglErr ReadMultiallelic(
+      const uintptr_t* sample_include,
+      const uint32_t* sample_include_cumulative_popcounts,
+      uint32_t sample_ct, uint32_t vidx, plink2::PgenVariant* pgv);
   bool ReadRaw(uint32_t vidx);
   plink2::PglErr ReadRawRecord(
       uint32_t vidx, plink2::PgenGlobalFlags read_gflags,

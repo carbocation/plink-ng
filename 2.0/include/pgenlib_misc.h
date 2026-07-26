@@ -811,6 +811,9 @@ uint32_t CountNybble(const void* nybblearr, uintptr_t nybble_word, uintptr_t nyb
 //      versions of the PGEN specification, and 0 is off-limits (PLINK 1
 //      sample-major .bed).
 //      0x80..0xff can be safely used by developers for their own purposes.
+//      This fork assigns developer mode 0x80 to block-local conditional-rANS
+//      hardcalls.  An upstream version must use an officially assigned mode.
+CONSTI32(kPgenDeveloperRansStorageMode, 0x80);
 //
 // 3. If not plink1-format,
 //    a. 4-byte # of variants; call this M.

@@ -353,7 +353,7 @@ bool EncodeVariant(const uintptr_t* target,
 bool ValidateInputs(const EncodeInput& input, EncodeParams* params,
                     std::string* error) {
   if ((!input.sample_ct) || (!input.variant_ct) || (!input.pgfi) ||
-      (!input.pgr)) {
+      (!input.pgen_reader)) {
     *error = "Invalid conditional-rANS encoder input.";
     return false;
   }
@@ -401,11 +401,13 @@ bool ValidateInputs(const EncodeInput& input, EncodeParams* params,
   if (params->anchor_ct < 2) {
     params->two_ref_shortlist = 0;
   }
-  if (input.pgfi->gflags &
-      (kfPgenGlobalHardcallPhasePresent | kfPgenGlobalDosagePresent |
-       kfPgenGlobalDosagePhasePresent)) {
+  if (((input.pgfi->gflags & kfPgenGlobalHardcallPhasePresent) &&
+       (!input.discard_phase)) ||
+      ((input.pgfi->gflags &
+        (kfPgenGlobalDosagePresent | kfPgenGlobalDosagePhasePresent)) &&
+       (!input.discard_dosage))) {
     *error =
-        "Conditional-rANS output requires unphased hardcalls without dosage.";
+        "Conditional-rANS output requires explicit phase/dosage erasure.";
     return false;
   }
   if ((input.pgfi->max_allele_ct > 2) && (!input.variant_metadata)) {
@@ -429,9 +431,10 @@ bool ValidateInputs(const EncodeInput& input, EncodeParams* params,
 
 }  // namespace
 
-PglErr EncodePgr(const std::string& output_path, const EncodeInput& input,
-                 const EncodeParams& requested_params, EncodeStats* stats,
-                 std::string* error) {
+PglErr EncodePgenRans(const std::string& output_path,
+                      const EncodeInput& input,
+                      const EncodeParams& requested_params,
+                      EncodeStats* stats, std::string* error) {
   EncodeParams params = requested_params;
   if (!ValidateInputs(input, &params, error)) {
     return kPglRetInconsistentInput;
@@ -500,9 +503,9 @@ PglErr EncodePgr(const std::string& output_path, const EncodeInput& input,
                             BitCtToWordCt(input.raw_sample_ct),
                             sample_include_cumulative_popcounts.data());
     PgrSetSampleSubsetIndex(sample_include_cumulative_popcounts.data(),
-                            input.pgr, &pssi);
+                            input.pgen_reader, &pssi);
   } else {
-    PgrClearSampleSubsetIndex(input.pgr, &pssi);
+    PgrClearSampleSubsetIndex(input.pgen_reader, &pssi);
   }
 
   const uint32_t genovec_word_stride =
@@ -576,7 +579,7 @@ PglErr EncodePgr(const std::string& output_path, const EncodeInput& input,
         pgl_error =
             PgrGetM(
                 input.sample_include, pssi, input.sample_ct,
-                variant_uidx, input.pgr, &pgv);
+                variant_uidx, input.pgen_reader, &pgv);
         if (!pgl_error) {
           CopyPgenPatches(
               pgv, allele_ct, &multiallelic_patches[offset]);
@@ -585,7 +588,7 @@ PglErr EncodePgr(const std::string& output_path, const EncodeInput& input,
         pgl_error =
             PgrGet(
                 input.sample_include, pssi, input.sample_ct,
-                variant_uidx, input.pgr, genovec);
+                variant_uidx, input.pgen_reader, genovec);
       }
       if (pgl_error) {
         *error = "PGEN hardcall load failed at variant " +

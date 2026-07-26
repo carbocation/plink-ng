@@ -11,6 +11,9 @@
 
 namespace pgen_rans {
 
+constexpr uint8_t kPgenRansStorageMode = 0x80;
+constexpr uint32_t kPgenRansFormatVersion = 1;
+
 struct ContainerParams {
   ContainerParams(uint32_t samples = 0, uint32_t variants = 0,
                   uint32_t block_variants = 128,

@@ -118,13 +118,9 @@ PglErr DispHelp(const char* const* argvk, uint32_t param_ct) {
     // explicit gzipped .pvar/.bim support was tried, and then rejected since
     // decompression was too slow
     // Zstd should have the necessary x86 performance characteristics, though
-    HelpPrint("pfile\0pgr\0pgen\0pgi\0bfile\0bed\0", &help_ctrl, 1,
+    HelpPrint("pfile\0pgen\0pgi\0bfile\0bed\0", &help_ctrl, 1,
 "  --pfile <prefix> ['vzs']  : Specify .pgen[ + .pgen.pgi] + .pvar[.zst] +\n"
 "                              .psam prefix.\n"
-"  --pgr <prefix>            : Specify .pgr + .pvar + .psam prefix.  This\n"
-"                              supports --score[-list], --freq, --export A/Av,\n"
-"                              --indep-pairwise, --r-unphased, --clump, --pca,\n"
-"                              --make-pgen, --write-snplist, and --write-samples.\n"
 "  --pgen <filename>         : Specify full name of .pgen/.bed file.\n"
 "  --pgi <filename>          : Specify full name of .pgen.pgi file.\n"
                );
@@ -313,17 +309,6 @@ PglErr DispHelp(const char* const* argvk, uint32_t param_ct) {
 "    * 'force-first' causes only the first instance of duplicate-ID variants to\n"
 "      be kept, under all circumstances.\n\n"
               );
-    HelpPrint("make-pgr\0", &help_ctrl, 1,
-"  --make-pgr\n"
-"    Write filtered unphased hardcalls and matching .pvar/.psam metadata to\n"
-"    <output prefix>.pgr/.pvar/.psam with\n"
-"    block-local conditional-rANS compression.  The experimental .pgr container\n"
-"    is separate from the PGEN format; exact multiallelic calls are retained in\n"
-"    sparse patches.\n"
-"    Existing sample and variant filters determine the hardcalls written.\n"
-"    Encoding uses the existing --threads setting, which defaults to all\n"
-"    available logical CPUs.\n\n"
-              );
     HelpPrint("make-pgen\0make-bpgen\0make-bed\0make-just-pvar\0make-just-psam\0make-pfile\0make-bpfile\0make-bfile\0", &help_ctrl, 1,
 "  --make-pgen ['vzs'] ['format='<code>] ['trim-alts'] ['erase-phase']\n"
 "              ['erase-dosage'] ['fill-missing-from-dosage'] ['writer-ver']\n"
@@ -349,12 +334,15 @@ PglErr DispHelp(const char* const* argvk, uint32_t param_ct) {
 "      chromosome filters), this supports all of PLINK's filtering flags.\n"
 "    * The 'vzs' modifier causes the variant file (.pvar/.bim) to be\n"
 "      Zstd-compressed.\n"
-"    * The 'format' modifier requests an uncompressed fixed-variant-width .pgen\n"
-"      file.  (These do not directly support multiallelic variants.)  The\n"
-"      following format code is currently supported:\n"
+"    * The 'format' modifier selects a .pgen storage mode.  The following codes\n"
+"      are currently supported:\n"
 "        2: just like .bed, except with an extended (12-byte instead of 3-byte)\n"
 "           header containing variant/sample counts, and rotated genotype codes\n"
 "           (00 = hom ref, 01 = het, 10 = hom alt, 11 = missing).\n"
+"        rans: block-local conditional-rANS unphased hardcalls, including exact\n"
+"              multiallelic calls.  This is a developer PGEN storage mode which\n"
+"              older pgenlib versions do not support.  If phase or dosage is\n"
+"              present, the corresponding erase-... modifier is required.\n"
                /*
 "        3: unphased dosage data\n"
 "        4: phased dosage data\n"

@@ -30,6 +30,8 @@ using pgen_rans::DecodeRecord;
 using pgen_rans::EncodeRecord;
 using pgen_rans::EncodedBlock;
 using pgen_rans::GetPackedGenotype;
+using pgen_rans::kPgenRansFormatVersion;
+using pgen_rans::kPgenRansStorageMode;
 using pgen_rans::MultiallelicPatches;
 using pgen_rans::PackedWordCt;
 using pgen_rans::RecordMetadata;
@@ -274,13 +276,24 @@ int main() {
   reader.Close();
 
   MemoryReader memory_reader = LoadMemoryReader(path);
-  MemoryReader obsolete_reader = memory_reader;
-  obsolete_reader.bytes[6] = '2';
-  ContainerReader obsolete_container;
-  Expect(!obsolete_container.OpenReadAt(
-             obsolete_reader.bytes.size(), ReadMemory,
-             &obsolete_reader, &error),
-         "obsolete experimental container identity was accepted");
+  Expect(
+      (memory_reader.bytes.size() >= 96) &&
+          (memory_reader.bytes[0] == 0x6c) &&
+          (memory_reader.bytes[1] == 0x1b) &&
+          (memory_reader.bytes[2] == kPgenRansStorageMode) &&
+          (memory_reader.bytes[3] == kVariantCt) &&
+          (memory_reader.bytes[7] == (kSampleCt & 0xff)) &&
+          (memory_reader.bytes[8] == (kSampleCt >> 8)) &&
+          (memory_reader.bytes[11] == 0xc0) &&
+          (memory_reader.bytes[12] == kPgenRansFormatVersion),
+      "conditional-rANS PGEN framing mismatch");
+  MemoryReader unsupported_mode_reader = memory_reader;
+  unsupported_mode_reader.bytes[2] = 0x81;
+  ContainerReader unsupported_mode_container;
+  Expect(!unsupported_mode_container.OpenReadAt(
+             unsupported_mode_reader.bytes.size(), ReadMemory,
+             &unsupported_mode_reader, &error),
+         "unsupported PGEN storage mode was accepted");
   Expect(reader.OpenReadAt(memory_reader.bytes.size(), ReadMemory,
                            &memory_reader, &error),
          "ranged reader open failed: " + error);

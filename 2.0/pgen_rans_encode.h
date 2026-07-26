@@ -37,7 +37,9 @@ struct EncodeInput {
   const uint32_t* variant_uidxs = nullptr;
   const VariantMetadata* variant_metadata = nullptr;
   plink2::PgenFileInfo* pgfi = nullptr;
-  plink2::PgenReader* pgr = nullptr;
+  plink2::PgenReader* pgen_reader = nullptr;
+  bool discard_phase = false;
+  bool discard_dosage = false;
 };
 
 struct EncodeStats {
@@ -56,10 +58,10 @@ struct EncodeStats {
   double elapsed_seconds = 0.0;
 };
 
-plink2::PglErr EncodePgr(const std::string& output_path,
-                         const EncodeInput& input,
-                         const EncodeParams& params, EncodeStats* stats,
-                         std::string* error);
+plink2::PglErr EncodePgenRans(const std::string& output_path,
+                              const EncodeInput& input,
+                              const EncodeParams& params, EncodeStats* stats,
+                              std::string* error);
 
 }  // namespace pgen_rans
 

@@ -27,9 +27,8 @@
 namespace pgen_rans {
 namespace {
 
-constexpr std::array<uint8_t, 8> kFileMagic = {
-    'P', 'G', 'R', 'A', 'N', 'S', '4', '\0'};
-constexpr uint32_t kFormatVersion = 4;
+constexpr std::array<uint8_t, 3> kFileMagic = {
+    0x6c, 0x1b, kPgenRansStorageMode};
 constexpr uint32_t kFileHeaderByteCt = 96;
 constexpr uint32_t kBlockIndexByteCt = 32;
 constexpr uint32_t kBlockHeaderByteCt = 16;
@@ -267,23 +266,31 @@ std::vector<uint8_t> SerializeHeader(const ContainerParams& params,
   const uint64_t metadata_byte_ct = metadata.nonref_flags.size();
   const uint64_t data_offset = metadata_offset + metadata_byte_ct;
   output.insert(output.end(), kFileMagic.begin(), kFileMagic.end());
-  AppendU32(kFormatVersion, &output);
-  AppendU32(kFileHeaderByteCt, &output);
-  AppendU32(params.sample_ct, &output);
   AppendU32(params.variant_ct, &output);
+  AppendU32(params.sample_ct, &output);
+  uint8_t header_ctrl = 0x40;
+  if (metadata.all_nonref) {
+    header_ctrl = 0x80;
+  } else if (!metadata.nonref_flags.empty()) {
+    header_ctrl = 0xc0;
+  }
+  output.push_back(header_ctrl);
+  AppendU32(kPgenRansFormatVersion, &output);
+  AppendU32(kFileHeaderByteCt, &output);
   AppendU32(params.block_variant_ct, &output);
   AppendU32(params.anchor_ct, &output);
   AppendU32(params.state_ct, &output);
   AppendU32(params.scale_bits, &output);
   AppendU32(params.restart_variant_ct, &output);
   AppendU32(params.block_ct, &output);
-  AppendU32(flags, &output);
   AppendU32(params.max_allele_ct, &output);
+  AppendU32(flags, &output);
   AppendU64(block_table_offset, &output);
   AppendU64(metadata_offset, &output);
   AppendU64(metadata_byte_ct, &output);
   AppendU64(data_offset, &output);
   AppendU64(0, &output);
+  AppendU32(0, &output);
   return output;
 }
 
@@ -585,23 +592,32 @@ bool ContainerReader::OpenIndex(std::string* error) {
     return false;
   }
   if (!std::equal(kFileMagic.begin(), kFileMagic.end(), header.begin())) {
-    SetError("Invalid conditional-rANS container magic.", error);
+    SetError("Invalid conditional-rANS PGEN storage mode.", error);
     Close();
     return false;
   }
   size_t offset = kFileMagic.size();
   uint32_t version;
   uint32_t header_byte_ct;
+  uint32_t header_ctrl;
   uint32_t flags;
   uint64_t block_table_offset;
   uint64_t metadata_offset;
   uint64_t metadata_byte_ct;
   uint64_t data_offset;
-  uint64_t reserved;
+  uint64_t reserved64;
+  uint32_t reserved32;
+  if ((!ReadU32(header.data(), header.size(), &offset,
+                &params_.variant_ct)) ||
+      (!ReadU32(header.data(), header.size(), &offset, &params_.sample_ct)) ||
+      (offset >= header.size())) {
+    SetError("Truncated conditional-rANS PGEN header.", error);
+    Close();
+    return false;
+  }
+  header_ctrl = header[offset++];
   if ((!ReadU32(header.data(), header.size(), &offset, &version)) ||
       (!ReadU32(header.data(), header.size(), &offset, &header_byte_ct)) ||
-      (!ReadU32(header.data(), header.size(), &offset, &params_.sample_ct)) ||
-      (!ReadU32(header.data(), header.size(), &offset, &params_.variant_ct)) ||
       (!ReadU32(header.data(), header.size(), &offset,
                 &params_.block_variant_ct)) ||
       (!ReadU32(header.data(), header.size(), &offset, &params_.anchor_ct)) ||
@@ -610,9 +626,9 @@ bool ContainerReader::OpenIndex(std::string* error) {
       (!ReadU32(header.data(), header.size(), &offset,
                 &params_.restart_variant_ct)) ||
       (!ReadU32(header.data(), header.size(), &offset, &params_.block_ct)) ||
-      (!ReadU32(header.data(), header.size(), &offset, &flags)) ||
       (!ReadU32(header.data(), header.size(), &offset,
                 &params_.max_allele_ct)) ||
+      (!ReadU32(header.data(), header.size(), &offset, &flags)) ||
       (!ReadU64(header.data(), header.size(), &offset,
                 &block_table_offset)) ||
       (!ReadU64(header.data(), header.size(), &offset,
@@ -620,8 +636,9 @@ bool ContainerReader::OpenIndex(std::string* error) {
       (!ReadU64(header.data(), header.size(), &offset,
                 &metadata_byte_ct)) ||
       (!ReadU64(header.data(), header.size(), &offset, &data_offset)) ||
-      (!ReadU64(header.data(), header.size(), &offset, &reserved))) {
-    SetError("Truncated conditional-rANS container header.", error);
+      (!ReadU64(header.data(), header.size(), &offset, &reserved64)) ||
+      (!ReadU32(header.data(), header.size(), &offset, &reserved32))) {
+    SetError("Truncated conditional-rANS PGEN header.", error);
     Close();
     return false;
   }
@@ -634,9 +651,15 @@ bool ContainerReader::OpenIndex(std::string* error) {
       static_cast<uint64_t>(params_.block_ct) * kBlockIndexByteCt;
   const uint64_t expected_nonref_byte_ct =
       (static_cast<uint64_t>(params_.variant_ct) + 7) / 8;
-  if ((version != kFormatVersion) ||
+  const uint32_t expected_nonref_storage =
+      (flags & kContainerFlagNonrefBitmap)
+          ? 3
+          : ((flags & kContainerFlagAllNonref) ? 2 : 1);
+  if ((version != kPgenRansFormatVersion) ||
       (header_byte_ct != kFileHeaderByteCt) ||
       (block_table_offset != kFileHeaderByteCt) ||
+      (header_ctrl & 0x3f) ||
+      ((header_ctrl >> 6) != expected_nonref_storage) ||
       (flags & ~kContainerKnownFlags) ||
       ((flags & kContainerFlagNonrefBitmap) &&
        (flags & kContainerFlagAllNonref)) ||
@@ -646,10 +669,10 @@ bool ContainerReader::OpenIndex(std::string* error) {
             ? expected_nonref_byte_ct
             : 0)) ||
       (data_offset != expected_data_offset) || (data_offset > file_size_) ||
-      reserved ||
+      reserved64 || reserved32 || (offset != header.size()) ||
       (!ValidateParams(params_, error))) {
     if (error && error->empty()) {
-      *error = "Invalid conditional-rANS container header.";
+      *error = "Invalid conditional-rANS PGEN header.";
     }
     Close();
     return false;

@@ -62,6 +62,10 @@ typedef struct PgrHardcallBackendStruct {
   PglErr (*get_packed)(void* context, uint32_t vidx,
                        unsigned char* packed_genotypes,
                        uint32_t packed_byte_ct);
+  PglErr (*get_m)(
+      void* context, const uintptr_t* sample_include,
+      const uint32_t* sample_include_cumulative_popcounts,
+      uint32_t sample_ct, uint32_t vidx, PgenVariant* pgv);
   PglErr (*get_raw)(
       void* context, uint32_t vidx, PgenGlobalFlags read_gflags,
       uintptr_t** loadbuf_iter_ptr, unsigned char* loaded_vrtype_ptr);

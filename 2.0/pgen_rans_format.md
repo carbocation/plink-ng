@@ -1,7 +1,9 @@
 # Conditional-rANS genotype record format
 
-This document defines the experimental record codec used by the standalone
-PGEN compression prototype. It is not an assigned PGEN storage mode.
+This document defines developer PGEN storage mode `0x80`, used by this fork
+for block-local conditional-rANS hardcalls.  The mode number is not an
+upstream assignment; an accepted PGEN revision must replace it with an
+officially reserved storage-mode value.
 
 All integers are little-endian. Genotypes use the PGEN two-bit hardcall
 alphabet: `0`, `1`, `2`, and `3` (missing). For multiallelic variants this
@@ -32,7 +34,7 @@ The first byte contains:
 - bits 4-7: reserved and zero.
 
 One-reference records next store one byte containing the anchor ordinal.
-Two-reference records store two distinct anchor ordinals. Version 4 therefore
+Two-reference records store two distinct anchor ordinals. The current format
 supports at most 256 anchors per block.
 
 The probability model follows:
@@ -121,28 +123,43 @@ A conforming decoder rejects:
 - lanes that do not terminate at the rANS lower-bound state.
 - invalid suffix versions, lengths, allele codes, sample ordering, or padding.
 
-## Standalone container
+## PGEN storage-mode framing
 
-The reference implementation wraps records in an experimental `.pgr` file.
-This is deliberately separate from PGEN storage-mode assignment.
-Version 4 files begin with `PGRANS4\0` and carry format version 4 in the
-container header. Earlier experimental container identities are not supported.
+The file begins with the standard PGEN magic bytes `6c 1b`, followed by
+developer storage mode `80`.  Bytes 3-10 contain the standard little-endian
+variant and sample counts, and byte 11 uses PGEN's normal provisional-REF
+summary bits.  The storage-mode-specific header continues through byte 95:
 
-The 96-byte file header stores the version, sample and variant counts, block
-and anchor sizes, rANS parameters, restart interval, block count, maximum
-allele count, metadata flags, and offsets of the block table, metadata, and
-block-data regions. It is followed by a fixed 32-byte entry for every block
-containing the first variant, variant count, file offset, and byte count. This
-permits a client to issue one bounded ranged read for a block without scanning
-earlier variant records. Each entry also stores a CRC32C checksum of the
-complete serialized block.
+| Offset | Width | Value |
+| --- | ---: | --- |
+| 12 | 4 | conditional-rANS format version (`1`) |
+| 16 | 4 | header size (`96`) |
+| 20 | 4 | variants per block |
+| 24 | 4 | anchor count |
+| 28 | 4 | rANS state count |
+| 32 | 4 | rANS scale bits |
+| 36 | 4 | cumulative-offset restart interval |
+| 40 | 4 | block count |
+| 44 | 4 | maximum allele count |
+| 48 | 4 | storage-mode flags |
+| 52 | 8 | block-table offset |
+| 60 | 8 | metadata offset |
+| 68 | 8 | metadata byte count |
+| 76 | 8 | block-data offset |
+| 84 | 12 | reserved, zero |
 
-Version 4 preserves PGEN's provisional/nonreference REF status. Uniform
+The header is followed by a fixed 32-byte entry for every block containing
+the first variant, variant count, file offset, and byte count. This permits a
+client to issue one bounded ranged read for a block without scanning earlier
+variant records. Each entry also stores a CRC32C checksum of the complete
+serialized block.
+
+The format preserves PGEN's provisional/nonreference REF status. Uniform
 trusted and uniform provisional files consume only a header flag. Mixed files
 store one bit per variant between the block table and block data. The bitmap is
 small enough to fetch with the block table during open, so ranged readers still
 need only two initial requests. PVAR/PSAM remain the authoritative variant and
-sample metadata; the container's counts, maximum allele count, and REF-status
+sample metadata; the PGEN header's counts, maximum allele count, and REF-status
 summary let readers reject mismatched companion files.
 
 Each block starts with a 16-byte header followed by:
@@ -155,9 +172,9 @@ To find a record, a reader starts from the closest preceding cumulative
 restart and sums at most `restart_interval - 1` 24-bit lengths. The default
 restart interval is 64 variants.
 
-Version 4 readers validate that block-table entries cover the variants and
-file exactly, blocks are contiguous, restart offsets agree with record
-lengths, record lengths span each block payload, and the block CRC32C matches.
+Readers validate that block-table entries cover the variants and file exactly,
+blocks are contiguous, restart offsets agree with record lengths, record
+lengths span each block payload, and the block CRC32C matches.
 
 The reference reader exposes the file header and block table through a
 caller-supplied `read_at(offset, length)` callback. Opening a file requires one
@@ -215,21 +232,24 @@ standard filtering and threading options:
 ```sh
 plink2 --pfile cohort \
   --chr 22 \
-  --make-pgr \
+  --make-pgen format=rans \
   --threads 16 \
   --out cohort-chr22
 ```
 
-This writes a complete `cohort-chr22.pgr/.pvar/.psam` fileset. The command
-intentionally has no benchmark-only limit options; use normal PLINK selectors
-such as `--chr`, `--from-bp`/`--to-bp`, and `--extract` to bound an encoding
-run.
+This writes a normal `cohort-chr22.pgen/.pvar/.psam` fileset. The `.pgen`
+header identifies the conditional-rANS storage mode; no alternate extension
+or input flag is involved. The command intentionally has no benchmark-only
+limit options; use normal PLINK selectors such as `--chr`,
+`--from-bp`/`--to-bp`, and `--extract` to bound an encoding run.
+When the input contains phase or dosage, add the corresponding `erase-phase`
+or `erase-dosage` modifier explicitly; the writer refuses silent loss.
 
 The main binary can read that fileset through the existing packed-hardcall
 analysis seam:
 
 ```sh
-plink2 --pgr cohort-chr22 \
+plink2 --pfile cohort-chr22 \
   --score weights.txt \
   --out scores
 ```
@@ -238,19 +258,20 @@ The initial production surface includes `--score[-list]`, `--freq`,
 `--export A/Av`, `--indep-pairwise`, `--r-unphased`, `--clump`, `--pca`,
 `--make-pgen`, `--write-snplist`, and `--write-samples`. Sample, position, ID,
 and genotype-frequency filters can be applied with these commands. Standard
-`--make-pgen` reconstructs an exact hardcall PGEN fileset; phase and dosage
-cannot be reconstructed because PGR does not store them. PGR filesets with
-more than two alleles at any variant currently require `--read-freq` for
+`--make-pgen` without `format=rans` reconstructs an exact hardcall PGEN in the
+upstream general-purpose storage mode; phase and dosage cannot be reconstructed
+because the conditional-rANS mode does not store them. Conditional-rANS files
+with more than two alleles at any variant currently require `--read-freq` for
 scoring; multiallelic `--make-pgen`, `--r-unphased`, and allele-aware A/Av
 exports are exact, while PCA, frequency scans, LD pruning, clumping, and
-genotype-frequency filters are currently limited to biallelic PGR filesets.
-Merge and other construction commands continue to use PGEN as their working
-format.
+genotype-frequency filters are currently limited to biallelic filesets.
+Merge and other construction commands continue to use the upstream
+general-purpose PGEN storage mode as their working format.
 
 Encode an unphased hardcall PGEN, including exact multiallelic calls:
 
 ```sh
-bin/pgen_rans encode cohort.pgen cohort.pgr \
+bin/pgen_rans encode cohort.pgen cohort-rans.pgen \
   --pvar cohort.pvar \
   --block-variants 128 \
   --anchors 32 \
@@ -264,14 +285,14 @@ PVAR so allele counts are available before PGEN reader initialization.
 Then perform a byte-for-byte packed-hardcall and exact sparse-patch round trip:
 
 ```sh
-bin/pgen_rans verify cohort.pgen cohort.pgr --pvar cohort.pvar
+bin/pgen_rans verify cohort.pgen cohort-rans.pgen --pvar cohort.pvar
 ```
 
-`inspect` validates the container and summarizes its record modes without
+`inspect` validates the PGEN and summarizes its record modes without
 decoding genotypes:
 
 ```sh
-bin/pgen_rans inspect cohort.pgr
+bin/pgen_rans inspect cohort-rans.pgen
 ```
 
 `benchmark` deterministically samples block strata, decodes each block with a
@@ -279,7 +300,7 @@ persistent CPU worker pool, and compares every packed output word with
 `PgrGet()` from the source PGEN:
 
 ```sh
-bin/pgen_rans benchmark cohort.pgen cohort.pgr \
+bin/pgen_rans benchmark cohort.pgen cohort-rans.pgen \
   --threads 16 \
   --blocks 80 \
   --iterations 3
@@ -301,7 +322,7 @@ On a CUDA machine, build and run the exact CPU/GPU comparison with:
 
 ```sh
 make -f Makefile.pgen_rans_cuda CUDA_ARCH=80
-bin/pgen_rans_cuda_benchmark cohort.pgr \
+bin/pgen_rans_cuda_benchmark cohort-rans.pgen \
   --blocks 80 \
   --batch-blocks 8 \
   --iterations 3 \
