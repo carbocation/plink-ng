@@ -17,6 +17,7 @@
 namespace {
 
 using pgen_rans::CodecParams;
+using pgen_rans::AppendMultiallelicPatches;
 using pgen_rans::ContainerParams;
 using pgen_rans::ContainerReader;
 using pgen_rans::ContainerWriter;
@@ -28,6 +29,7 @@ using pgen_rans::DecodeRecord;
 using pgen_rans::EncodeRecord;
 using pgen_rans::EncodedBlock;
 using pgen_rans::GetPackedGenotype;
+using pgen_rans::MultiallelicPatches;
 using pgen_rans::PackedWordCt;
 using pgen_rans::RecordMetadata;
 using pgen_rans::RecordMode;
@@ -135,6 +137,17 @@ int main() {
   for (uint32_t variant_idx = 0; variant_idx != kVariantCt; ++variant_idx) {
     source.push_back(MakeVariant(variant_idx, kSampleCt));
   }
+  std::vector<MultiallelicPatches> source_patches(kVariantCt);
+  source_patches[4].allele_ct = 3;
+  source_patches[4].patch_01_sample_ids = {0, 99, 1002};
+  source_patches[4].patch_01_values = {2, 2, 2};
+  source_patches[4].patch_10_sample_ids = {17, 1001};
+  source_patches[4].patch_10_values = {1, 2, 2, 2};
+  source_patches[12].allele_ct = 5;
+  source_patches[12].patch_01_sample_ids = {2, 127, 999};
+  source_patches[12].patch_01_values = {2, 3, 4};
+  source_patches[12].patch_10_sample_ids = {3, 128};
+  source_patches[12].patch_10_values = {1, 4, 2, 3};
 
   const std::string path = TemporaryPath();
   std::string error;
@@ -180,6 +193,13 @@ int main() {
                  reference1, reference2, codec_params,
                  &(block.records[variant_offset]), &error),
              "record encode failed: " + error);
+      const uint32_t variant_idx = first_variant + variant_offset;
+      if (source_patches[variant_idx].allele_ct > 2) {
+        Expect(AppendMultiallelicPatches(
+                   kSampleCt, source_patches[variant_idx],
+                   &(block.records[variant_offset]), &error),
+               "record patch encode failed: " + error);
+      }
     }
     Expect(writer.WriteBlock(block, &error),
            "block write failed: " + error);
@@ -242,7 +262,7 @@ int main() {
 
   MemoryReader memory_reader = LoadMemoryReader(path);
   MemoryReader obsolete_reader = memory_reader;
-  obsolete_reader.bytes[6] = '1';
+  obsolete_reader.bytes[6] = '2';
   ContainerReader obsolete_container;
   Expect(!obsolete_container.OpenReadAt(
              obsolete_reader.bytes.size(), ReadMemory,
@@ -396,6 +416,21 @@ int main() {
          "packed single-variant genotype mismatch");
   Expect(packed_stats.returned_variant_ct == 15,
          "packed single-variant accounting mismatch");
+  MultiallelicPatches observed_patches;
+  Expect(packed_reader.ReadVariantPatches(
+             4, &observed_patches, &packed_stats, &error),
+         "packed patch read failed: " + error);
+  Expect(
+      (observed_patches.allele_ct == source_patches[4].allele_ct) &&
+          (observed_patches.patch_01_sample_ids ==
+           source_patches[4].patch_01_sample_ids) &&
+          (observed_patches.patch_01_values ==
+           source_patches[4].patch_01_values) &&
+          (observed_patches.patch_10_sample_ids ==
+           source_patches[4].patch_10_sample_ids) &&
+          (observed_patches.patch_10_values ==
+           source_patches[4].patch_10_values),
+      "packed patch read mismatch");
   const uint32_t sample_subset[] = {0, 2, 33, 999, 1002};
   Expect(packed_reader.SetSampleSubset(
              sample_subset, 5, &error),
@@ -406,6 +441,12 @@ int main() {
          "packed reader subset sample count mismatch");
   Expect(packed_reader.packed_variant_byte_ct() == 2,
          "packed reader subset byte count mismatch");
+  Expect(packed_reader.ReadVariantPatches(
+             12, &observed_patches, &packed_stats, &error),
+         "packed subset patch read failed: " + error);
+  Expect(observed_patches.patch_01_sample_ids ==
+             source_patches[12].patch_01_sample_ids,
+         "packed subset patch IDs did not retain raw sample order");
   std::vector<uint8_t> subset_output(5 * 4, 0xa5);
   Expect(packed_reader.ReadList(
              requested_variants, 5, subset_output.data(), 4,

@@ -311,9 +311,10 @@ PglErr DispHelp(const char* const* argvk, uint32_t param_ct) {
               );
     HelpPrint("make-pgr\0", &help_ctrl, 1,
 "  --make-pgr\n"
-"    Write filtered unphased biallelic hardcalls to <output prefix>.pgr with\n"
+"    Write filtered unphased hardcalls to <output prefix>.pgr with\n"
 "    block-local conditional-rANS compression.  The experimental .pgr container\n"
-"    is separate from the PGEN format; retain matching .pvar and .psam metadata.\n"
+"    is separate from the PGEN format; exact multiallelic calls are retained in\n"
+"    sparse patches.  Keep the matching .pvar and .psam metadata.\n"
 "    Existing sample and variant filters determine the hardcalls written.\n"
 "    Encoding uses the existing --threads setting, which defaults to all\n"
 "    available logical CPUs.\n\n"

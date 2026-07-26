@@ -313,6 +313,28 @@ bool PackedVariantReader::ReadVariant(
   return true;
 }
 
+bool PackedVariantReader::ReadVariantPatches(
+    uint32_t variant, MultiallelicPatches* patches,
+    PackedReadStats* stats, std::string* error) {
+  if ((!patches) ||
+      (variant >= impl_->reader.params().variant_ct)) {
+    SetError("Invalid conditional-rANS multiallelic patch request.",
+             error);
+    return false;
+  }
+  uint32_t block_idx;
+  if (!impl_->reader.FindBlock(variant, &block_idx, error) ||
+      !impl_->DecodeBlock(block_idx, stats, error)) {
+    return false;
+  }
+  const ByteSpan record =
+      impl_->block_view.record(
+          variant - impl_->block_view.first_variant());
+  return DecodeMultiallelicPatches(
+      record.data, record.size, impl_->reader.params().sample_ct,
+      patches, error);
+}
+
 bool PackedVariantReader::ReadRange(
     uint32_t first_variant, uint32_t variant_ct, uint8_t* output,
     size_t output_variant_stride, PackedReadStats* stats,

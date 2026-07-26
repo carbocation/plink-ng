@@ -4,7 +4,9 @@ This document defines the experimental record codec used by the standalone
 PGEN compression prototype. It is not an assigned PGEN storage mode.
 
 All integers are little-endian. Genotypes use the PGEN two-bit hardcall
-alphabet: `0`, `1`, `2`, and `3` (missing).
+alphabet: `0`, `1`, `2`, and `3` (missing). For multiallelic variants this
+base stream has PGEN's usual ALT-collapsed meaning; a sparse suffix restores
+the exact allele codes.
 
 ## Decode graph
 
@@ -26,10 +28,11 @@ The first byte contains:
 
 - bits 0-1: mode (`0` marginal, `1` one reference, `2` two references);
 - bit 2: rANS state and byte-renormalization payload are present;
-- bits 3-7: reserved and zero.
+- bit 3: a multiallelic patch suffix is present;
+- bits 4-7: reserved and zero.
 
 One-reference records next store one byte containing the anchor ordinal.
-Two-reference records store two distinct anchor ordinals. Version 2 therefore
+Two-reference records store two distinct anchor ordinals. Version 3 therefore
 supports at most 256 anchors per block.
 
 The probability model follows:
@@ -72,6 +75,37 @@ mask, while CUDA lanes read a coalesced span in warp order.
 If every populated row is deterministic, the state table and refill payload
 are omitted.
 
+## Multiallelic patch suffix
+
+Every variant with three or more alleles has a suffix, including variants
+where the selected samples happen to contain no non-ALT1 calls. The suffix
+follows the complete base record and ends with a four-byte suffix length, so a
+collapsed decoder can find the base-record boundary in constant time.
+
+The suffix contains:
+
+1. one-byte patch format version (`1`);
+2. one-byte allele count (`3` through `255`);
+3. one-byte patch flags selecting a sample bitmap for `patch_01` and/or
+   `patch_10`;
+4. 32-bit `patch_01` and `patch_10` call counts;
+5. sample IDs for each patch class, represented independently as either
+   strictly increasing delta varints or a `ceil(sample_count / 8)` bitmap,
+   whichever is smaller;
+6. bit-packed allele codes.
+
+`patch_01` identifies ref/ALT calls whose ALT is not ALT1 and stores one allele
+code per sample. Its stored value is `allele_code - 2`, using
+`ceil(log2(allele_count - 2))` bits. `patch_10` identifies two-ALT calls other
+than ALT1/ALT1 and stores two allele codes per sample. Each stored value is
+`allele_code - 1`, using `ceil(log2(allele_count - 1))` bits. These are the
+same sparse semantics exposed by PGEN's `PgrGetM()`.
+
+CPU and CUDA block decoders intentionally ignore this suffix when emitting
+the standard packed 2-bit analysis matrix. Allele-aware callers decode the
+sparse suffix separately; `PackedVariantReader::ReadVariantPatches()` exposes
+it in the stored sample order.
+
 ## Canonical validation
 
 A conforming decoder rejects:
@@ -85,12 +119,13 @@ A conforming decoder rejects:
 - nonzero refill-interleaved padding;
 - refill-interleaved payloads that are not consumed exactly;
 - lanes that do not terminate at the rANS lower-bound state.
+- invalid suffix versions, lengths, allele codes, sample ordering, or padding.
 
 ## Standalone container
 
 The reference implementation wraps records in an experimental `.pgr` file.
 This is deliberately separate from PGEN storage-mode assignment.
-Version 2 files begin with `PGRANS2\0` and carry format version 2 in the
+Version 3 files begin with `PGRANS3\0` and carry format version 3 in the
 container header. Earlier experimental container identities are not supported.
 
 The 64-byte file header stores the version, sample and variant counts, block
@@ -111,7 +146,7 @@ To find a record, a reader starts from the closest preceding cumulative
 restart and sums at most `restart_interval - 1` 24-bit lengths. The default
 restart interval is 64 variants.
 
-Version 2 readers validate that block-table entries cover the variants and
+Version 3 readers validate that block-table entries cover the variants and
 file exactly, blocks are contiguous, restart offsets agree with record
 lengths, record lengths span each block payload, and the block CRC32C matches.
 
@@ -182,7 +217,7 @@ benchmark-only limit options; use normal PLINK selectors such as `--chr`,
 change the sample or variant set, generate or retain `.psam` and `.pvar`
 metadata with the same selection.
 
-Encode an unphased, biallelic hardcall PGEN:
+Encode an unphased hardcall PGEN, including exact multiallelic calls:
 
 ```sh
 bin/pgen_rans encode cohort.pgen cohort.pgr \
@@ -193,10 +228,13 @@ bin/pgen_rans encode cohort.pgen cohort.pgr \
   --threads 8
 ```
 
-Then perform a byte-for-byte packed-hardcall round trip:
+The standalone encoder and exact verifier require the matching plain-text
+PVAR so allele counts are available before PGEN reader initialization.
+
+Then perform a byte-for-byte packed-hardcall and exact sparse-patch round trip:
 
 ```sh
-bin/pgen_rans verify cohort.pgen cohort.pgr
+bin/pgen_rans verify cohort.pgen cohort.pgr --pvar cohort.pvar
 ```
 
 `inspect` validates the container and summarizes its record modes without

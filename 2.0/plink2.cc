@@ -577,16 +577,19 @@ PglErr MakePgr(const uintptr_t* sample_include,
   for (uint32_t variant_idx = 0; variant_idx != variant_ct; ++variant_idx) {
     const uint32_t variant_uidx =
         BitIter1(variant_include, &variant_uidx_base, &variant_include_bits);
-    if (allele_idx_offsets &&
-        (allele_idx_offsets[variant_uidx + 1] -
-             allele_idx_offsets[variant_uidx] !=
-         2)) {
-      logerrputs("Error: --make-pgr currently requires all remaining variants to be biallelic.\n");
+    const uintptr_t allele_ct =
+        allele_idx_offsets
+            ? allele_idx_offsets[variant_uidx + 1] -
+                  allele_idx_offsets[variant_uidx]
+            : 2;
+    if ((allele_ct < 2) || (allele_ct > 255)) {
+      logerrputs("Error: --make-pgr encountered an unsupported allele count.\n");
       return kPglRetInconsistentInput;
     }
     variant_uidxs[variant_idx] = variant_uidx;
     metadata[variant_idx].chrom_code = GetVariantChr(cip, variant_uidx);
     metadata[variant_idx].bp = variant_bps[variant_uidx];
+    metadata[variant_idx].allele_ct = S_CAST(uint16_t, allele_ct);
   }
 
   pgen_rans::EncodeInput input;
@@ -594,7 +597,6 @@ PglErr MakePgr(const uintptr_t* sample_include,
   input.sample_ct = sample_ct;
   input.raw_variant_ct = raw_variant_ct;
   input.variant_ct = variant_ct;
-  input.variants_are_biallelic = true;
   input.sample_include =
       (sample_ct == raw_sample_ct)? nullptr : sample_include;
   input.variant_uidxs = variant_uidxs.data();
@@ -623,6 +625,14 @@ PglErr MakePgr(const uintptr_t* sample_include,
   logprintf("  Marginal/one-reference/two-reference records: %" PRIu64 "/%" PRIu64 "/%" PRIu64 "\n",
             stats.marginal_ct, stats.one_reference_ct,
             stats.two_reference_ct);
+  if (stats.multiallelic_ct) {
+    logprintf("  Multiallelic variants: %" PRIu64
+              "; ref/ALT patches: %" PRIu64
+              "; ALT/ALT patches: %" PRIu64
+              "; patch bytes: %" PRIu64 ".\n",
+              stats.multiallelic_ct, stats.patch_01_ct,
+              stats.patch_10_ct, stats.multiallelic_patch_bytes);
+  }
   logprintf("  PGEN payload bytes: %" PRIu64 "; .pgr bytes: %" PRIu64
             "; ratio: %.3f; elapsed: %.3f seconds.\n",
             stats.pgen_payload_bytes, stats.output_bytes,

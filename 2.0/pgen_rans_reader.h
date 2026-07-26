@@ -8,6 +8,8 @@
 #include <memory>
 #include <string>
 
+#include "pgen_rans_codec.h"
+
 namespace pgen_rans {
 
 struct PackedReadStats {
@@ -46,6 +48,11 @@ class PackedVariantReader {
   bool ReadVariant(uint32_t variant, uint8_t* output,
                    size_t output_byte_ct, PackedReadStats* stats,
                    std::string* error);
+  // Patch sample IDs always refer to the stored (raw) sample order, even
+  // when SetSampleSubset() is active.
+  bool ReadVariantPatches(uint32_t variant,
+                          MultiallelicPatches* patches,
+                          PackedReadStats* stats, std::string* error);
   bool ReadRange(uint32_t first_variant, uint32_t variant_ct,
                  uint8_t* output, size_t output_variant_stride,
                  PackedReadStats* stats, std::string* error);

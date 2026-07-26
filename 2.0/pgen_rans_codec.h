@@ -30,6 +30,18 @@ struct RecordMetadata {
   uint8_t reference1 = 0;
   uint8_t reference2 = 0;
   bool has_entropy_payload = false;
+  bool has_multiallelic_patches = false;
+};
+
+// PGEN's base 2-bit hardcall stream collapses all alternate alleles to ALT1.
+// These sparse patches restore exact multiallelic allele codes.  patch_01 has
+// one value per sample ID; patch_10 has two consecutive values per sample ID.
+struct MultiallelicPatches {
+  uint16_t allele_ct = 2;
+  std::vector<uint32_t> patch_01_sample_ids;
+  std::vector<uint8_t> patch_01_values;
+  std::vector<uint32_t> patch_10_sample_ids;
+  std::vector<uint8_t> patch_10_values;
 };
 
 uint32_t PackedWordCt(uint32_t sample_ct);
@@ -49,6 +61,21 @@ bool EstimateRecordBytes(const uint32_t* context_symbol_counts,
 
 bool ParseRecordMetadata(const uint8_t* record, size_t record_size,
                          RecordMetadata* metadata, std::string* error);
+
+bool AppendMultiallelicPatches(uint32_t sample_ct,
+                               const MultiallelicPatches& patches,
+                               std::vector<uint8_t>* record,
+                               std::string* error);
+
+bool DecodeMultiallelicPatches(const uint8_t* record, size_t record_size,
+                               uint32_t sample_ct,
+                               MultiallelicPatches* patches,
+                               std::string* error);
+
+// Returns the byte count of the ordinary 2-bit/rANS portion of a record.
+// This lets collapsed hardcall decoders ignore the sparse allele-code suffix.
+bool GetBaseRecordByteCt(const uint8_t* record, size_t record_size,
+                         size_t* base_record_size, std::string* error);
 
 bool DecodeRecordToBuffer(const uint8_t* record, size_t record_size,
                           const uint64_t* const* anchors,

@@ -12,6 +12,7 @@ namespace pgen_rans {
 
 struct VariantMetadata {
   uint32_t chrom_code = 0;
+  uint16_t allele_ct = 2;
   uint64_t bp = 0;
 };
 
@@ -31,7 +32,6 @@ struct EncodeInput {
   uint32_t sample_ct = 0;
   uint32_t raw_variant_ct = 0;
   uint32_t variant_ct = 0;
-  bool variants_are_biallelic = false;
   const uintptr_t* sample_include = nullptr;
   // Null denotes the first variant_ct records in their original order.
   const uint32_t* variant_uidxs = nullptr;
@@ -49,6 +49,10 @@ struct EncodeStats {
   uint64_t one_reference_ct = 0;
   uint64_t two_reference_ct = 0;
   uint64_t anchor_ct = 0;
+  uint64_t multiallelic_ct = 0;
+  uint64_t patch_01_ct = 0;
+  uint64_t patch_10_ct = 0;
+  uint64_t multiallelic_patch_bytes = 0;
   double elapsed_seconds = 0.0;
 };
 

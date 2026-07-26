@@ -26,10 +26,18 @@ namespace {
 constexpr uint32_t kRansLowerBound = 1U << 23;
 constexpr uint8_t kModeMask = 3;
 constexpr uint8_t kEntropyPayloadFlag = 1U << 2;
+constexpr uint8_t kMultiallelicPatchFlag = 1U << 3;
 constexpr uint8_t kKnownFlagMask =
-    kModeMask | kEntropyPayloadFlag;
+    kModeMask | kEntropyPayloadFlag | kMultiallelicPatchFlag;
 constexpr uint32_t kInterleavedPaddingByteCt = 15;
 constexpr uint32_t kDefaultScaleBits = 12;
+constexpr uint8_t kMultiallelicPatchVersion = 1;
+constexpr uint8_t kPatch01BitmapFlag = 1U << 0;
+constexpr uint8_t kPatch10BitmapFlag = 1U << 1;
+constexpr uint8_t kKnownPatchFlagMask =
+    kPatch01BitmapFlag | kPatch10BitmapFlag;
+constexpr size_t kMultiallelicPatchHeaderByteCt = 11;
+constexpr size_t kMultiallelicPatchFooterByteCt = 4;
 #if PGEN_RANS_X86_RUNTIME_DISPATCH
 constexpr uint32_t kDefaultSlotCt = 1U << kDefaultScaleBits;
 constexpr uint32_t kAvx512MinimumSampleCt = 32768;
@@ -99,6 +107,240 @@ bool ReadU32(const uint8_t* input, size_t input_size, size_t* offset,
            (static_cast<uint32_t>(input[*offset + 2]) << 16) |
            (static_cast<uint32_t>(input[*offset + 3]) << 24);
   *offset += 4;
+  return true;
+}
+
+uint32_t CeilLog2(uint32_t value_ct) {
+  uint32_t result = 0;
+  if (value_ct) {
+    --value_ct;
+  }
+  while (value_ct) {
+    ++result;
+    value_ct >>= 1;
+  }
+  return result;
+}
+
+void AppendVarint(uint32_t value, std::vector<uint8_t>* output) {
+  while (value >= 0x80U) {
+    output->push_back(static_cast<uint8_t>(value | 0x80U));
+    value >>= 7;
+  }
+  output->push_back(static_cast<uint8_t>(value));
+}
+
+size_t VarintByteCt(uint32_t value) {
+  size_t result = 1;
+  while (value >= 0x80U) {
+    ++result;
+    value >>= 7;
+  }
+  return result;
+}
+
+bool ReadVarint(const uint8_t* input, size_t input_size, size_t* offset,
+                uint32_t* value) {
+  uint32_t result = 0;
+  for (uint32_t byte_idx = 0; byte_idx != 5; ++byte_idx) {
+    if (*offset == input_size) {
+      return false;
+    }
+    const uint8_t cur_byte = input[(*offset)++];
+    if ((byte_idx == 4) && (cur_byte & 0xf0U)) {
+      return false;
+    }
+    result |= static_cast<uint32_t>(cur_byte & 0x7fU)
+              << (7 * byte_idx);
+    if (!(cur_byte & 0x80U)) {
+      *value = result;
+      return true;
+    }
+  }
+  return false;
+}
+
+void AppendPackedValue(uint32_t value, uint32_t bit_width,
+                       uint64_t* bit_buffer, uint32_t* bit_ct,
+                       std::vector<uint8_t>* output) {
+  if (!bit_width) {
+    return;
+  }
+  *bit_buffer |= static_cast<uint64_t>(value) << *bit_ct;
+  *bit_ct += bit_width;
+  while (*bit_ct >= 8) {
+    output->push_back(static_cast<uint8_t>(*bit_buffer));
+    *bit_buffer >>= 8;
+    *bit_ct -= 8;
+  }
+}
+
+void FlushPackedValues(uint64_t* bit_buffer, uint32_t* bit_ct,
+                       std::vector<uint8_t>* output) {
+  if (*bit_ct) {
+    output->push_back(static_cast<uint8_t>(*bit_buffer));
+    *bit_buffer = 0;
+    *bit_ct = 0;
+  }
+}
+
+bool ReadPackedValue(const uint8_t* input, size_t input_size,
+                     uint32_t bit_width, size_t* offset,
+                     uint64_t* bit_buffer, uint32_t* bit_ct,
+                     uint32_t* value) {
+  if (!bit_width) {
+    *value = 0;
+    return true;
+  }
+  while (*bit_ct < bit_width) {
+    if (*offset == input_size) {
+      return false;
+    }
+    *bit_buffer |=
+        static_cast<uint64_t>(input[(*offset)++]) << *bit_ct;
+    *bit_ct += 8;
+  }
+  *value = static_cast<uint32_t>(
+      *bit_buffer & ((1U << bit_width) - 1));
+  *bit_buffer >>= bit_width;
+  *bit_ct -= bit_width;
+  return true;
+}
+
+bool ValidatePatchIds(const std::vector<uint32_t>& sample_ids,
+                      uint32_t sample_ct, std::string* error) {
+  for (size_t idx = 0; idx != sample_ids.size(); ++idx) {
+    if (sample_ids[idx] >= sample_ct) {
+      SetError("Multiallelic patch sample index is out of range.", error);
+      return false;
+    }
+    if (idx && (sample_ids[idx] <= sample_ids[idx - 1])) {
+      SetError("Multiallelic patch sample indices are not increasing.",
+               error);
+      return false;
+    }
+  }
+  return true;
+}
+
+bool PatchIdSetsAreDisjoint(
+    const std::vector<uint32_t>& first,
+    const std::vector<uint32_t>& second) {
+  size_t first_idx = 0;
+  size_t second_idx = 0;
+  while ((first_idx != first.size()) &&
+         (second_idx != second.size())) {
+    if (first[first_idx] == second[second_idx]) {
+      return false;
+    }
+    if (first[first_idx] < second[second_idx]) {
+      ++first_idx;
+    } else {
+      ++second_idx;
+    }
+  }
+  return true;
+}
+
+size_t DeltaPatchIdByteCt(
+    const std::vector<uint32_t>& sample_ids) {
+  size_t result = 0;
+  uint32_t previous = 0;
+  for (size_t idx = 0; idx != sample_ids.size(); ++idx) {
+    const uint32_t delta =
+        idx ? sample_ids[idx] - previous : sample_ids[idx];
+    result += VarintByteCt(delta);
+    previous = sample_ids[idx];
+  }
+  return result;
+}
+
+bool PatchBitmapIsSmaller(
+    const std::vector<uint32_t>& sample_ids, uint32_t sample_ct) {
+  return (static_cast<size_t>(sample_ct) + 7) / 8 <
+         DeltaPatchIdByteCt(sample_ids);
+}
+
+void AppendPatchIds(const std::vector<uint32_t>& sample_ids,
+                    uint32_t sample_ct, bool use_bitmap,
+                    std::vector<uint8_t>* output) {
+  if (use_bitmap) {
+    const size_t bitmap_offset = output->size();
+    output->resize(
+        bitmap_offset + (static_cast<size_t>(sample_ct) + 7) / 8, 0);
+    for (const uint32_t sample_id : sample_ids) {
+      (*output)[bitmap_offset + sample_id / 8] |=
+          static_cast<uint8_t>(1U << (sample_id % 8));
+    }
+    return;
+  }
+  uint32_t previous = 0;
+  for (size_t idx = 0; idx != sample_ids.size(); ++idx) {
+    const uint32_t delta =
+        idx ? sample_ids[idx] - previous : sample_ids[idx];
+    AppendVarint(delta, output);
+    previous = sample_ids[idx];
+  }
+}
+
+bool ReadPatchIds(const uint8_t* input, size_t input_size,
+                  uint32_t sample_ct, uint32_t id_ct,
+                  bool use_bitmap, size_t* offset,
+                  std::vector<uint32_t>* sample_ids,
+                  std::string* error) {
+  if (use_bitmap) {
+    const size_t bitmap_byte_ct =
+        (static_cast<size_t>(sample_ct) + 7) / 8;
+    if ((*offset > input_size) ||
+        (bitmap_byte_ct > input_size - *offset)) {
+      SetError("Truncated multiallelic patch bitmap.", error);
+      return false;
+    }
+    const uint8_t* const bitmap = input + *offset;
+    if ((sample_ct % 8) &&
+        (bitmap[bitmap_byte_ct - 1] >>
+         (sample_ct % 8))) {
+      SetError("Nonzero multiallelic patch bitmap padding bits.", error);
+      return false;
+    }
+    sample_ids->clear();
+    sample_ids->reserve(id_ct);
+    for (uint32_t sample_idx = 0; sample_idx != sample_ct;
+         ++sample_idx) {
+      if (bitmap[sample_idx / 8] &
+          (1U << (sample_idx % 8))) {
+        sample_ids->push_back(sample_idx);
+      }
+    }
+    *offset += bitmap_byte_ct;
+    if (sample_ids->size() != id_ct) {
+      SetError("Multiallelic patch bitmap count mismatch.", error);
+      return false;
+    }
+    return true;
+  }
+  sample_ids->resize(id_ct);
+  uint32_t previous = 0;
+  for (uint32_t idx = 0; idx != id_ct; ++idx) {
+    uint32_t delta;
+    if (!ReadVarint(input, input_size, offset, &delta)) {
+      SetError("Invalid or truncated multiallelic patch sample index.",
+               error);
+      return false;
+    }
+    if (idx && (!delta)) {
+      SetError("Multiallelic patch sample indices are not increasing.",
+               error);
+      return false;
+    }
+    if ((delta > std::numeric_limits<uint32_t>::max() - previous) ||
+        (previous + delta >= sample_ct)) {
+      SetError("Multiallelic patch sample index is out of range.", error);
+      return false;
+    }
+    previous += delta;
+    (*sample_ids)[idx] = previous;
+  }
   return true;
 }
 
@@ -1018,6 +1260,8 @@ bool ParsePrefix(const uint8_t* record, size_t record_size,
   }
   metadata->mode = static_cast<RecordMode>(mode_code);
   metadata->has_entropy_payload = (flags & kEntropyPayloadFlag);
+  metadata->has_multiallelic_patches =
+      (flags & kMultiallelicPatchFlag);
   *offset = 1;
   if (metadata->mode != RecordMode::kMarginal) {
     if (*offset == record_size) {
@@ -1201,8 +1445,275 @@ bool EstimateRecordBytes(const uint32_t* context_symbol_counts,
 
 bool ParseRecordMetadata(const uint8_t* record, size_t record_size,
                          RecordMetadata* metadata, std::string* error) {
+  size_t base_record_size;
+  if (!GetBaseRecordByteCt(
+          record, record_size, &base_record_size, error)) {
+    return false;
+  }
   size_t offset;
-  return ParsePrefix(record, record_size, metadata, &offset, error);
+  return ParsePrefix(
+      record, base_record_size, metadata, &offset, error);
+}
+
+bool GetBaseRecordByteCt(const uint8_t* record, size_t record_size,
+                         size_t* base_record_size, std::string* error) {
+  if ((!record) || (!record_size) || (!base_record_size)) {
+    SetError("Invalid rANS record-size arguments.", error);
+    return false;
+  }
+  if (!(record[0] & kMultiallelicPatchFlag)) {
+    *base_record_size = record_size;
+    return true;
+  }
+  if (record_size <
+      1 + kMultiallelicPatchHeaderByteCt +
+          kMultiallelicPatchFooterByteCt) {
+    SetError("Truncated multiallelic patch record.", error);
+    return false;
+  }
+  size_t footer_offset =
+      record_size - kMultiallelicPatchFooterByteCt;
+  uint32_t patch_byte_ct;
+  if (!ReadU32(
+          record, record_size, &footer_offset, &patch_byte_ct) ||
+      (patch_byte_ct < kMultiallelicPatchHeaderByteCt) ||
+      (static_cast<size_t>(patch_byte_ct) >
+       record_size - 1 - kMultiallelicPatchFooterByteCt)) {
+    SetError("Invalid multiallelic patch length.", error);
+    return false;
+  }
+  *base_record_size =
+      record_size - kMultiallelicPatchFooterByteCt - patch_byte_ct;
+  return true;
+}
+
+bool AppendMultiallelicPatches(uint32_t sample_ct,
+                               const MultiallelicPatches& patches,
+                               std::vector<uint8_t>* record,
+                               std::string* error) {
+  if ((!record) || record->empty() || (!sample_ct)) {
+    SetError("Invalid multiallelic patch encoder arguments.", error);
+    return false;
+  }
+  if (record->front() & kMultiallelicPatchFlag) {
+    SetError("rANS record already has multiallelic patches.", error);
+    return false;
+  }
+  if ((patches.allele_ct < 3) || (patches.allele_ct > 255)) {
+    SetError("Multiallelic allele count is out of range.", error);
+    return false;
+  }
+  if ((patches.patch_01_values.size() !=
+       patches.patch_01_sample_ids.size()) ||
+      (patches.patch_10_values.size() !=
+       2 * patches.patch_10_sample_ids.size())) {
+    SetError("Multiallelic patch value count mismatch.", error);
+    return false;
+  }
+  if ((patches.patch_01_sample_ids.size() >
+       std::numeric_limits<uint32_t>::max()) ||
+      (patches.patch_10_sample_ids.size() >
+       std::numeric_limits<uint32_t>::max())) {
+    SetError("Multiallelic patch count exceeds format limits.", error);
+    return false;
+  }
+  if (!ValidatePatchIds(
+          patches.patch_01_sample_ids, sample_ct, error) ||
+      !ValidatePatchIds(
+          patches.patch_10_sample_ids, sample_ct, error)) {
+    return false;
+  }
+  if (!PatchIdSetsAreDisjoint(
+          patches.patch_01_sample_ids,
+          patches.patch_10_sample_ids)) {
+    SetError("Multiallelic patch classes overlap.", error);
+    return false;
+  }
+  for (const uint8_t allele_code : patches.patch_01_values) {
+    if ((allele_code < 2) || (allele_code >= patches.allele_ct)) {
+      SetError("Invalid ref/ALT multiallelic patch allele code.", error);
+      return false;
+    }
+  }
+  for (const uint8_t allele_code : patches.patch_10_values) {
+    if ((!allele_code) || (allele_code >= patches.allele_ct)) {
+      SetError("Invalid ALT/ALT multiallelic patch allele code.", error);
+      return false;
+    }
+  }
+
+  std::vector<uint8_t> payload;
+  payload.reserve(
+      kMultiallelicPatchHeaderByteCt +
+      2 * (patches.patch_01_sample_ids.size() +
+           patches.patch_10_sample_ids.size()) +
+      patches.patch_01_values.size() +
+      patches.patch_10_values.size());
+  payload.push_back(kMultiallelicPatchVersion);
+  payload.push_back(static_cast<uint8_t>(patches.allele_ct));
+  const bool patch_01_bitmap =
+      PatchBitmapIsSmaller(
+          patches.patch_01_sample_ids, sample_ct);
+  const bool patch_10_bitmap =
+      PatchBitmapIsSmaller(
+          patches.patch_10_sample_ids, sample_ct);
+  payload.push_back(
+      static_cast<uint8_t>(
+          (patch_01_bitmap ? kPatch01BitmapFlag : 0) |
+          (patch_10_bitmap ? kPatch10BitmapFlag : 0)));
+  AppendU32(
+      static_cast<uint32_t>(patches.patch_01_sample_ids.size()),
+      &payload);
+  AppendU32(
+      static_cast<uint32_t>(patches.patch_10_sample_ids.size()),
+      &payload);
+  AppendPatchIds(
+      patches.patch_01_sample_ids, sample_ct,
+      patch_01_bitmap, &payload);
+  AppendPatchIds(
+      patches.patch_10_sample_ids, sample_ct,
+      patch_10_bitmap, &payload);
+
+  uint64_t bit_buffer = 0;
+  uint32_t bit_ct = 0;
+  const uint32_t patch_01_bit_width =
+      CeilLog2(patches.allele_ct - 2);
+  for (const uint8_t allele_code : patches.patch_01_values) {
+    AppendPackedValue(
+        allele_code - 2, patch_01_bit_width,
+        &bit_buffer, &bit_ct, &payload);
+  }
+  FlushPackedValues(&bit_buffer, &bit_ct, &payload);
+  const uint32_t patch_10_bit_width =
+      CeilLog2(patches.allele_ct - 1);
+  for (const uint8_t allele_code : patches.patch_10_values) {
+    AppendPackedValue(
+        allele_code - 1, patch_10_bit_width,
+        &bit_buffer, &bit_ct, &payload);
+  }
+  FlushPackedValues(&bit_buffer, &bit_ct, &payload);
+  if (payload.size() > std::numeric_limits<uint32_t>::max()) {
+    SetError("Multiallelic patch payload is too large.", error);
+    return false;
+  }
+  record->front() |= kMultiallelicPatchFlag;
+  record->insert(record->end(), payload.begin(), payload.end());
+  AppendU32(static_cast<uint32_t>(payload.size()), record);
+  return true;
+}
+
+bool DecodeMultiallelicPatches(const uint8_t* record, size_t record_size,
+                               uint32_t sample_ct,
+                               MultiallelicPatches* patches,
+                               std::string* error) {
+  if ((!record) || (!record_size) || (!sample_ct) || (!patches)) {
+    SetError("Invalid multiallelic patch decoder arguments.", error);
+    return false;
+  }
+  *patches = MultiallelicPatches();
+  size_t base_record_size;
+  if (!GetBaseRecordByteCt(
+          record, record_size, &base_record_size, error)) {
+    return false;
+  }
+  if (!(record[0] & kMultiallelicPatchFlag)) {
+    return true;
+  }
+  const size_t payload_size =
+      record_size - base_record_size - kMultiallelicPatchFooterByteCt;
+  const uint8_t* const payload = record + base_record_size;
+  size_t offset = 0;
+  if ((payload_size < kMultiallelicPatchHeaderByteCt) ||
+      (payload[offset++] != kMultiallelicPatchVersion)) {
+    SetError("Unsupported multiallelic patch version.", error);
+    return false;
+  }
+  patches->allele_ct = payload[offset++];
+  if (patches->allele_ct < 3) {
+    SetError("Invalid multiallelic patch allele count.", error);
+    return false;
+  }
+  const uint8_t patch_flags = payload[offset++];
+  if (patch_flags & ~kKnownPatchFlagMask) {
+    SetError("Unknown multiallelic patch flags.", error);
+    return false;
+  }
+  uint32_t patch_01_ct;
+  uint32_t patch_10_ct;
+  if (!ReadU32(payload, payload_size, &offset, &patch_01_ct) ||
+      !ReadU32(payload, payload_size, &offset, &patch_10_ct)) {
+    SetError("Truncated multiallelic patch header.", error);
+    return false;
+  }
+  if ((patch_01_ct > sample_ct) || (patch_10_ct > sample_ct)) {
+    SetError("Multiallelic patch count exceeds the sample count.", error);
+    return false;
+  }
+  if (!ReadPatchIds(
+          payload, payload_size, sample_ct, patch_01_ct,
+          patch_flags & kPatch01BitmapFlag, &offset,
+          &patches->patch_01_sample_ids, error) ||
+      !ReadPatchIds(
+          payload, payload_size, sample_ct, patch_10_ct,
+          patch_flags & kPatch10BitmapFlag, &offset,
+          &patches->patch_10_sample_ids, error)) {
+    return false;
+  }
+  if (!PatchIdSetsAreDisjoint(
+          patches->patch_01_sample_ids,
+          patches->patch_10_sample_ids)) {
+    SetError("Multiallelic patch classes overlap.", error);
+    return false;
+  }
+
+  uint64_t bit_buffer = 0;
+  uint32_t bit_ct = 0;
+  const uint32_t patch_01_bit_width =
+      CeilLog2(patches->allele_ct - 2);
+  patches->patch_01_values.resize(patch_01_ct);
+  for (uint32_t idx = 0; idx != patch_01_ct; ++idx) {
+    uint32_t encoded_value;
+    if (!ReadPackedValue(
+            payload, payload_size, patch_01_bit_width, &offset,
+            &bit_buffer, &bit_ct, &encoded_value) ||
+        (encoded_value >= patches->allele_ct - 2)) {
+      SetError("Invalid or truncated ref/ALT multiallelic patch values.",
+               error);
+      return false;
+    }
+    patches->patch_01_values[idx] =
+        static_cast<uint8_t>(encoded_value + 2);
+  }
+  if (bit_buffer) {
+    SetError("Nonzero ref/ALT multiallelic patch padding bits.", error);
+    return false;
+  }
+  bit_buffer = 0;
+  bit_ct = 0;
+  const uint32_t patch_10_bit_width =
+      CeilLog2(patches->allele_ct - 1);
+  const size_t patch_10_value_ct =
+      static_cast<size_t>(2) * patch_10_ct;
+  patches->patch_10_values.resize(patch_10_value_ct);
+  for (size_t idx = 0; idx != patch_10_value_ct; ++idx) {
+    uint32_t encoded_value;
+    if (!ReadPackedValue(
+            payload, payload_size, patch_10_bit_width, &offset,
+            &bit_buffer, &bit_ct, &encoded_value) ||
+        (encoded_value >= patches->allele_ct - 1)) {
+      SetError("Invalid or truncated ALT/ALT multiallelic patch values.",
+               error);
+      return false;
+    }
+    patches->patch_10_values[idx] =
+        static_cast<uint8_t>(encoded_value + 1);
+  }
+  if (bit_buffer || (offset != payload_size)) {
+    SetError("Invalid multiallelic patch padding or trailing bytes.",
+             error);
+    return false;
+  }
+  return true;
 }
 
 bool DecodeRecordToBufferImpl(
@@ -1221,8 +1732,14 @@ bool DecodeRecordToBufferImpl(
     return false;
   }
   RecordMetadata parsed_metadata;
+  size_t base_record_size;
+  if (!GetBaseRecordByteCt(
+          record, record_size, &base_record_size, error)) {
+    return false;
+  }
   size_t offset;
-  if (!ParsePrefix(record, record_size, &parsed_metadata, &offset, error)) {
+  if (!ParsePrefix(
+          record, base_record_size, &parsed_metadata, &offset, error)) {
     return false;
   }
   if ((parsed_metadata.mode != RecordMode::kMarginal) &&
@@ -1253,7 +1770,7 @@ bool DecodeRecordToBufferImpl(
   }
 
   Model model;
-  if (!ParseModel(record, record_size, parsed_metadata.mode,
+  if (!ParseModel(record, base_record_size, parsed_metadata.mode,
                   params.scale_bits, &offset, &model, error)) {
     return false;
   }
@@ -1262,7 +1779,7 @@ bool DecodeRecordToBufferImpl(
     return false;
   }
   if (!model.has_entropy) {
-    if (offset != record_size) {
+    if (offset != base_record_size) {
       SetError("Deterministic record has trailing payload.", error);
       return false;
     }
@@ -1297,21 +1814,21 @@ bool DecodeRecordToBufferImpl(
   const uint32_t state_ct = std::min(params.state_ct, sample_ct);
   std::array<uint32_t, 256> states = {};
   for (uint32_t lane = 0; lane != state_ct; ++lane) {
-    if (!ReadU32(record, record_size, &offset, &(states[lane])) ||
+    if (!ReadU32(record, base_record_size, &offset, &(states[lane])) ||
         (states[lane] < kRansLowerBound)) {
       SetError("Invalid or truncated rANS initial state.", error);
       return false;
     }
   }
-  if (record_size - offset < kInterleavedPaddingByteCt) {
+  if (base_record_size - offset < kInterleavedPaddingByteCt) {
     SetError("Truncated interleaved rANS padding.", error);
     return false;
   }
   const uint8_t* const payload_begin = record + offset;
   const uint8_t* const payload_end =
-      record + record_size - kInterleavedPaddingByteCt;
+      record + base_record_size - kInterleavedPaddingByteCt;
   for (const uint8_t* padding_iter = payload_end;
-       padding_iter != record + record_size; ++padding_iter) {
+       padding_iter != record + base_record_size; ++padding_iter) {
     if (*padding_iter) {
       SetError("Interleaved rANS padding is nonzero.", error);
       return false;

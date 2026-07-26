@@ -188,7 +188,7 @@ __device__ void ParseDeviceModel(const uint8_t* record,
   const uint8_t flags = record[0];
   model->mode = flags & 3U;
   model->has_entropy = (flags >> 2) & 1U;
-  if ((flags & 0xf8U) || (model->mode > 2)) {
+  if ((flags & 0xf0U) || (model->mode > 2)) {
     model->error = kDeviceDecodeInvalidRecord;
     return;
   }
@@ -563,15 +563,18 @@ struct CudaBlockDecoder::Impl {
       for (uint32_t variant_offset = 0;
            variant_offset != block->variant_ct(); ++variant_offset) {
         const ByteSpan record = block->record(variant_offset);
+        size_t base_record_size;
         if ((!record.data) || (!record.size) ||
-            (record.size > UINT32_MAX) ||
+            !GetBaseRecordByteCt(
+                record.data, record.size, &base_record_size, error) ||
+            (base_record_size > UINT32_MAX) ||
             (host_record_byte_ct >
-             UINT32_MAX - record.size)) {
+             UINT32_MAX - base_record_size)) {
           SetError("CUDA batch record bytes exceed format limits.",
                    error);
           return false;
         }
-        host_record_byte_ct += record.size;
+        host_record_byte_ct += base_record_size;
       }
       host_anchor_descriptor_ct += block->anchor_ct();
       host_target_descriptor_ct +=
@@ -629,8 +632,7 @@ struct CudaBlockDecoder::Impl {
         const ByteSpan record = block->record(variant_offset);
         if ((!record.data) || (!record.size) ||
             (record.size > UINT32_MAX) ||
-            (record_byte_offset >
-             host_record_byte_ct - record.size)) {
+            (record_byte_offset > host_record_byte_ct)) {
           SetError("CUDA batch record bytes exceed format limits.", error);
           return false;
         }
@@ -646,16 +648,28 @@ struct CudaBlockDecoder::Impl {
           SetError("CUDA batch contains a conditional anchor.", error);
           return false;
         }
+        size_t base_record_size;
+        if (!GetBaseRecordByteCt(
+                record.data, record.size, &base_record_size,
+                &metadata_error)) {
+          SetError("CUDA batch metadata: " + metadata_error, error);
+          return false;
+        }
+        if (base_record_size >
+            host_record_byte_ct - record_byte_offset) {
+          SetError("CUDA batch record bytes exceed format limits.", error);
+          return false;
+        }
         const DeviceRecordDescriptor descriptor = {
             static_cast<uint32_t>(record_byte_offset),
-            static_cast<uint32_t>(record.size),
+            static_cast<uint32_t>(base_record_size),
             block_output_variant + variant_offset,
             block_output_variant,
             block->variant_ct(),
             block->anchor_ct()};
         memcpy(host_record_bytes + record_byte_offset, record.data,
-               record.size);
-        record_byte_offset += record.size;
+               base_record_size);
+        record_byte_offset += base_record_size;
         if (is_anchor[variant_offset]) {
           host_anchor_descriptors[anchor_descriptor_idx++] = descriptor;
         } else {

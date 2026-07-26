@@ -31,6 +31,7 @@ using pgen_rans::CodecParams;
 using pgen_rans::ContainerParams;
 using pgen_rans::ContainerReader;
 using pgen_rans::CpuBlockDecoder;
+using pgen_rans::DecodeMultiallelicPatches;
 using pgen_rans::DecodeRecord;
 using pgen_rans::EncodeInput;
 using pgen_rans::EncodeParams;
@@ -38,6 +39,8 @@ using pgen_rans::EncodePgr;
 using pgen_rans::EncodeStats;
 using pgen_rans::EncodedBlock;
 using pgen_rans::EncodedBlockView;
+using pgen_rans::GetBaseRecordByteCt;
+using pgen_rans::MultiallelicPatches;
 using pgen_rans::ParseRecordMetadata;
 using pgen_rans::RecordMetadata;
 using pgen_rans::RecordMode;
@@ -67,7 +70,6 @@ struct Options {
 
 struct PvarData {
   std::vector<VariantMetadata> variants;
-  uint32_t multiallelic_ct = 0;
 };
 
 void PrintUsage(FILE* out) {
@@ -79,7 +81,7 @@ void PrintUsage(FILE* out) {
       "  pgen_rans inspect <input.pgr>\n"
       "\n"
       "Encode options:\n"
-      "  --pvar <file>              Plain-text PVAR for chromosome/distance bounds.\n"
+      "  --pvar <file>              Required plain-text PVAR schema.\n"
       "  --block-variants <n>       Maximum variants per block (default 128).\n"
       "  --anchors <n>              Independent anchors per full block (default 32).\n"
       "  --two-ref-shortlist <n>    Pair the n best single anchors; 0 disables (default 4).\n"
@@ -91,9 +93,11 @@ void PrintUsage(FILE* out) {
       "  --variant-limit <n>        Encode only the first n variants.\n"
       "\n"
       "Verify options:\n"
+      "  --pvar <file>              Required plain-text PVAR schema.\n"
       "  --variant-limit <n>        Verify only the first n variants.\n"
       "\n"
       "Benchmark options:\n"
+      "  --pvar <file>              Optional plain-text PVAR schema.\n"
       "  --threads <n>              Persistent CPU decoder workers.\n"
       "  --blocks <n>               Deterministic block strata (default 80).\n"
       "  --iterations <n>           Decode passes per fetched block (default 1).\n",
@@ -242,30 +246,39 @@ bool ParseOptions(int argc, char** argv, Options* opts) {
     }
   }
   if (opts->command == "verify") {
-    if (!opts->pvar_fname.empty() ||
-        (opts->block_variant_ct != 128) || (opts->anchor_ct != 32) ||
+    if ((opts->block_variant_ct != 128) || (opts->anchor_ct != 32) ||
         (opts->two_ref_shortlist != 4) ||
         (opts->max_anchor_bp != 1000000) ||
         (opts->restart_variant_ct != 64) ||
         (opts->rans_state_ct != 32) || (opts->rans_scale_bits != 12) ||
         opts->thread_ct) {
-      fputs("Error: verify accepts only --variant-limit.\n", stderr);
+      fputs(
+          "Error: verify accepts only --pvar and --variant-limit.\n",
+          stderr);
       return false;
     }
   } else if (opts->command == "benchmark") {
-    if (!opts->pvar_fname.empty() ||
-        (opts->block_variant_ct != 128) || (opts->anchor_ct != 32) ||
+    if ((opts->block_variant_ct != 128) || (opts->anchor_ct != 32) ||
         (opts->two_ref_shortlist != 4) ||
         (opts->max_anchor_bp != 1000000) ||
         (opts->restart_variant_ct != 64) ||
         (opts->rans_state_ct != 32) || (opts->rans_scale_bits != 12) ||
         (opts->variant_limit != UINT32_MAX)) {
       fputs(
-          "Error: benchmark accepts only --threads, --blocks, and "
-          "--iterations.\n",
+          "Error: benchmark accepts only --pvar, --threads, --blocks, "
+          "and --iterations.\n",
           stderr);
       return false;
     }
+  }
+  if (((opts->command == "encode") || (opts->command == "verify")) &&
+      opts->pvar_fname.empty()) {
+    fprintf(
+        stderr,
+        "Error: %s requires --pvar so multiallelic allele counts are "
+        "known.\n",
+        opts->command.c_str());
+    return false;
   }
   opts->anchor_ct = std::min(opts->anchor_ct, opts->block_variant_ct);
   if (opts->two_ref_shortlist == 1) {
@@ -294,8 +307,8 @@ std::vector<std::string> SplitWhitespace(const std::string& line) {
   return fields;
 }
 
-bool LoadPvar(const std::string& fname, uint32_t expected_variant_ct,
-              PvarData* pvar, std::string* error) {
+bool LoadPvar(const std::string& fname, PvarData* pvar,
+              std::string* error) {
   if ((fname.size() >= 4) && (fname.substr(fname.size() - 4) == ".zst")) {
     *error = "The prototype requires a plain-text PVAR.";
     return false;
@@ -305,7 +318,7 @@ bool LoadPvar(const std::string& fname, uint32_t expected_variant_ct,
     *error = "Could not open PVAR '" + fname + "'.";
     return false;
   }
-  pvar->variants.reserve(expected_variant_ct);
+  pvar->variants.clear();
   std::unordered_map<std::string, uint32_t> chrom_codes;
   int32_t chrom_col = 0;
   int32_t pos_col = 1;
@@ -358,19 +371,18 @@ bool LoadPvar(const std::string& fname, uint32_t expected_variant_ct,
     VariantMetadata meta;
     meta.chrom_code = inserted.first->second;
     meta.bp = bp;
-    const bool multiallelic =
-        (alt_col >= 0) &&
-        (fields[alt_col].find(',') != std::string::npos);
-    pvar->multiallelic_ct += multiallelic;
-    pvar->variants.push_back(meta);
-    if (pvar->variants.size() > expected_variant_ct) {
-      *error = "PVAR has more variants than the PGEN header.";
+    uint32_t allele_ct = 2;
+    if ((alt_col >= 0) && (fields[alt_col] != ".")) {
+      allele_ct += static_cast<uint32_t>(
+          std::count(
+              fields[alt_col].begin(), fields[alt_col].end(), ','));
+    }
+    if (allele_ct > 255) {
+      *error = "PVAR variant has more than 255 alleles.";
       return false;
     }
-  }
-  if (pvar->variants.size() != expected_variant_ct) {
-    *error = "PVAR/PGEN variant-count mismatch.";
-    return false;
+    meta.allele_ct = static_cast<uint16_t>(allele_ct);
+    pvar->variants.push_back(meta);
   }
   return true;
 }
@@ -394,7 +406,8 @@ class PgenInput {
     Close();
   }
 
-  bool Open(const std::string& fname, std::string* error) {
+  bool Open(const std::string& fname, const PvarData* pvar,
+            std::string* error) {
     char errstr_buf[kPglErrstrBufBlen];
     PgenHeaderCtrl header_ctrl;
     uintptr_t pgfi_alloc_cacheline_ct;
@@ -405,6 +418,27 @@ class PgenInput {
       *error = errstr_buf;
       return false;
     }
+    if (pvar) {
+      if (pvar->variants.size() != pgfi_.raw_variant_ct) {
+        *error = "PVAR/PGEN variant-count mismatch.";
+        return false;
+      }
+      allele_idx_offsets_.resize(
+          static_cast<size_t>(pgfi_.raw_variant_ct) + 1);
+      uintptr_t allele_idx_offset = 0;
+      uint32_t max_allele_ct = 2;
+      for (uint32_t variant_idx = 0;
+           variant_idx != pgfi_.raw_variant_ct; ++variant_idx) {
+        allele_idx_offsets_[variant_idx] = allele_idx_offset;
+        const uint32_t cur_allele_ct =
+            pvar->variants[variant_idx].allele_ct;
+        allele_idx_offset += cur_allele_ct;
+        max_allele_ct = std::max(max_allele_ct, cur_allele_ct);
+      }
+      allele_idx_offsets_[pgfi_.raw_variant_ct] = allele_idx_offset;
+      pgfi_.allele_idx_offsets = allele_idx_offsets_.data();
+      pgfi_.max_allele_ct = max_allele_ct;
+    }
     if (cachealigned_malloc(pgfi_alloc_cacheline_ct * kCacheline,
                             &pgfi_alloc_)) {
       *error = "Out of memory allocating the PGEN index.";
@@ -413,7 +447,7 @@ class PgenInput {
     uint32_t maximum_record_width;
     uintptr_t pgr_alloc_cacheline_ct;
     pgl_error = PgfiInitPhase2(
-        header_ctrl, 0, 0, 0, 0, pgfi_.raw_variant_ct,
+        header_ctrl, pvar ? 1 : 0, 0, 0, 0, pgfi_.raw_variant_ct,
         &maximum_record_width, &pgfi_, pgfi_alloc_,
         &pgr_alloc_cacheline_ct, errstr_buf);
     if (pgl_error) {
@@ -439,8 +473,17 @@ class PgenInput {
           "Only unphased hardcall PGENs without dosage are supported.";
       return false;
     }
-    if (pgfi_.max_allele_ct > 2) {
-      *error = "Only biallelic PGENs are supported.";
+    if (pgfi_.max_allele_ct > 255) {
+      *error = "PGEN variants with more than 255 alleles are unsupported.";
+      return false;
+    }
+    if ((!pvar) && (pgfi_.max_allele_ct > 2)) {
+      *error =
+          "A plain-text PVAR is required for multiallelic PGEN input.";
+      return false;
+    }
+    if ((pgfi_.max_allele_ct > 2) &&
+        !AllocatePatchBuffers(error)) {
       return false;
     }
     PgrClearSampleSubsetIndex(&pgr_, &pssi_);
@@ -460,6 +503,15 @@ class PgenInput {
       aligned_free(pgfi_alloc_);
       pgfi_alloc_ = nullptr;
     }
+    aligned_free_cond(patch_10_vals_);
+    aligned_free_cond(patch_10_set_);
+    aligned_free_cond(patch_01_vals_);
+    aligned_free_cond(patch_01_set_);
+    patch_10_vals_ = nullptr;
+    patch_10_set_ = nullptr;
+    patch_01_vals_ = nullptr;
+    patch_01_set_ = nullptr;
+    allele_idx_offsets_.clear();
     open_ = false;
   }
 
@@ -482,8 +534,75 @@ class PgenInput {
     return true;
   }
 
+  bool ReadExact(uint32_t variant_idx, uintptr_t* genovec,
+                 MultiallelicPatches* patches, std::string* error) {
+    if ((!patches) || (!open_)) {
+      *error = "Invalid exact PGEN read request.";
+      return false;
+    }
+    *patches = MultiallelicPatches();
+    const uint16_t cur_allele_ct = allele_ct(variant_idx);
+    if (cur_allele_ct == 2) {
+      return Read(variant_idx, genovec, error);
+    }
+    PgenVariant pgv = {};
+    pgv.genovec = genovec;
+    pgv.patch_01_set = patch_01_set_;
+    pgv.patch_01_vals = patch_01_vals_;
+    pgv.patch_10_set = patch_10_set_;
+    pgv.patch_10_vals = patch_10_vals_;
+    const PglErr pgl_error =
+        PgrGetM(
+            nullptr, pssi_, pgfi_.raw_sample_ct, variant_idx,
+            &pgr_, &pgv);
+    if (pgl_error) {
+      *error = "PgrGetM failed at variant " +
+               std::to_string(variant_idx) + " with code " +
+               std::to_string(static_cast<uint32_t>(pgl_error)) + ".";
+      return false;
+    }
+    ZeroTrailingNyps(pgfi_.raw_sample_ct, genovec);
+    patches->allele_ct = cur_allele_ct;
+    patches->patch_01_sample_ids.resize(pgv.patch_01_ct);
+    patches->patch_01_values.assign(
+        pgv.patch_01_vals, pgv.patch_01_vals + pgv.patch_01_ct);
+    if (pgv.patch_01_ct) {
+      uintptr_t sample_idx_base = 0;
+      uintptr_t cur_bits = pgv.patch_01_set[0];
+      for (uint32_t patch_idx = 0; patch_idx != pgv.patch_01_ct;
+           ++patch_idx) {
+        patches->patch_01_sample_ids[patch_idx] =
+            static_cast<uint32_t>(
+                BitIter1(
+                    pgv.patch_01_set, &sample_idx_base, &cur_bits));
+      }
+    }
+    patches->patch_10_sample_ids.resize(pgv.patch_10_ct);
+    patches->patch_10_values.assign(
+        pgv.patch_10_vals, pgv.patch_10_vals + 2 * pgv.patch_10_ct);
+    if (pgv.patch_10_ct) {
+      uintptr_t sample_idx_base = 0;
+      uintptr_t cur_bits = pgv.patch_10_set[0];
+      for (uint32_t patch_idx = 0; patch_idx != pgv.patch_10_ct;
+           ++patch_idx) {
+        patches->patch_10_sample_ids[patch_idx] =
+            static_cast<uint32_t>(
+                BitIter1(
+                    pgv.patch_10_set, &sample_idx_base, &cur_bits));
+      }
+    }
+    return true;
+  }
+
   uint32_t sample_ct() const { return pgfi_.raw_sample_ct; }
   uint32_t variant_ct() const { return pgfi_.raw_variant_ct; }
+  uint16_t allele_ct(uint32_t variant_idx) const {
+    return pgfi_.allele_idx_offsets
+               ? static_cast<uint16_t>(
+                     pgfi_.allele_idx_offsets[variant_idx + 1] -
+                     pgfi_.allele_idx_offsets[variant_idx])
+               : 2;
+  }
   uint32_t record_byte_ct(uint32_t variant_idx) const {
     return GetPgfiVrecWidth(&pgfi_, variant_idx);
   }
@@ -491,50 +610,69 @@ class PgenInput {
   PgenReader* pgr() { return &pgr_; }
 
  private:
+  bool AllocatePatchBuffers(std::string* error) {
+    const uint32_t patch_set_word_ct =
+        BitCtToVecCt(pgfi_.raw_sample_ct) * kWordsPerVec;
+    if (cachealigned_malloc(
+            static_cast<uintptr_t>(patch_set_word_ct) *
+                sizeof(uintptr_t),
+            &patch_01_set_) ||
+        cachealigned_malloc(
+            static_cast<uintptr_t>(pgfi_.raw_sample_ct) *
+                sizeof(AlleleCode),
+            &patch_01_vals_) ||
+        cachealigned_malloc(
+            static_cast<uintptr_t>(patch_set_word_ct) *
+                sizeof(uintptr_t),
+            &patch_10_set_) ||
+        cachealigned_malloc(
+            static_cast<uintptr_t>(2) * pgfi_.raw_sample_ct *
+                sizeof(AlleleCode),
+            &patch_10_vals_)) {
+      *error = "Out of memory allocating PGEN multiallelic patches.";
+      return false;
+    }
+    return true;
+  }
+
   PgenFileInfo pgfi_;
   PgenReader pgr_;
   PgrSampleSubsetIndex pssi_;
   unsigned char* pgfi_alloc_ = nullptr;
   unsigned char* pgr_alloc_ = nullptr;
+  std::vector<uintptr_t> allele_idx_offsets_;
+  uintptr_t* patch_01_set_ = nullptr;
+  AlleleCode* patch_01_vals_ = nullptr;
+  uintptr_t* patch_10_set_ = nullptr;
+  AlleleCode* patch_10_vals_ = nullptr;
   bool open_ = false;
 };
 
 int Encode(const Options& opts) {
-  PgenInput pgen;
   std::string error;
-  if (!pgen.Open(opts.input_fname, &error)) {
+  PvarData pvar;
+  const PvarData* pvar_ptr = nullptr;
+  if (!opts.pvar_fname.empty()) {
+    if (!LoadPvar(opts.pvar_fname, &pvar, &error)) {
+      fprintf(stderr, "Error: %s\n", error.c_str());
+      return 1;
+    }
+    pvar_ptr = &pvar;
+  }
+  PgenInput pgen;
+  if (!pgen.Open(opts.input_fname, pvar_ptr, &error)) {
     fprintf(stderr, "Error: %s\n", error.c_str());
     return 1;
   }
   const uint32_t variant_ct =
       std::min(pgen.variant_ct(), opts.variant_limit);
-  PvarData pvar;
-  const VariantMetadata* metadata = nullptr;
-  if (!opts.pvar_fname.empty()) {
-    if (!LoadPvar(opts.pvar_fname, pgen.variant_ct(), &pvar, &error)) {
-      fprintf(stderr, "Error: %s\n", error.c_str());
-      return 1;
-    }
-    if (pvar.multiallelic_ct) {
-      fprintf(stderr, "Error: PVAR contains %u multiallelic variants.\n",
-              pvar.multiallelic_ct);
-      return 1;
-    }
-    metadata = pvar.variants.data();
-  } else {
-    fputs(
-        "Warning: No PVAR supplied; chromosome and distance bounds are "
-        "not enforced.\n",
-        stderr);
-  }
 
   EncodeInput input;
   input.raw_sample_ct = pgen.sample_ct();
   input.sample_ct = pgen.sample_ct();
   input.raw_variant_ct = pgen.variant_ct();
   input.variant_ct = variant_ct;
-  input.variants_are_biallelic = true;
-  input.variant_metadata = metadata;
+  input.variant_metadata = pvar.variants.data();
   input.pgfi = pgen.pgfi();
   input.pgr = pgen.pgr();
   EncodeParams params;
@@ -563,6 +701,15 @@ int Encode(const Options& opts) {
          static_cast<unsigned long long>(stats.one_reference_ct));
   printf("  two-reference records:   %llu\n",
          static_cast<unsigned long long>(stats.two_reference_ct));
+  printf("  multiallelic variants:   %llu\n",
+         static_cast<unsigned long long>(stats.multiallelic_ct));
+  printf("  ref/ALT patches:         %llu\n",
+         static_cast<unsigned long long>(stats.patch_01_ct));
+  printf("  ALT/ALT patches:         %llu\n",
+         static_cast<unsigned long long>(stats.patch_10_ct));
+  printf("  multiallelic bytes:      %llu\n",
+         static_cast<unsigned long long>(
+             stats.multiallelic_patch_bytes));
   printf("  PGEN payload bytes:      %llu\n",
          static_cast<unsigned long long>(stats.pgen_payload_bytes));
   printf("  output bytes:            %llu\n",
@@ -584,10 +731,30 @@ bool GenotypesEqual(const uintptr_t* expected,
                  static_cast<size_t>(word_ct) * sizeof(uintptr_t));
 }
 
+bool PatchesEqual(const MultiallelicPatches& expected,
+                  const MultiallelicPatches& observed) {
+  return (expected.allele_ct == observed.allele_ct) &&
+         (expected.patch_01_sample_ids ==
+          observed.patch_01_sample_ids) &&
+         (expected.patch_01_values == observed.patch_01_values) &&
+         (expected.patch_10_sample_ids ==
+          observed.patch_10_sample_ids) &&
+         (expected.patch_10_values == observed.patch_10_values);
+}
+
 int Verify(const Options& opts) {
-  PgenInput pgen;
   std::string error;
-  if (!pgen.Open(opts.input_fname, &error)) {
+  PvarData pvar;
+  const PvarData* pvar_ptr = nullptr;
+  if (!opts.pvar_fname.empty()) {
+    if (!LoadPvar(opts.pvar_fname, &pvar, &error)) {
+      fprintf(stderr, "Error: %s\n", error.c_str());
+      return 1;
+    }
+    pvar_ptr = &pvar;
+  }
+  PgenInput pgen;
+  if (!pgen.Open(opts.input_fname, pvar_ptr, &error)) {
     fprintf(stderr, "Error: %s\n", error.c_str());
     return 1;
   }
@@ -618,6 +785,7 @@ int Verify(const Options& opts) {
   uint64_t marginal_ct = 0;
   uint64_t one_reference_ct = 0;
   uint64_t two_reference_ct = 0;
+  uint64_t multiallelic_ct = 0;
   uint32_t verified_ct = 0;
   const auto start_time = std::chrono::steady_clock::now();
   int return_code = 1;
@@ -667,7 +835,10 @@ int Verify(const Options& opts) {
                 block.first_variant + offset, error.c_str());
         goto cleanup;
       }
-      if (!pgen.Read(block.first_variant + offset, expected, &error)) {
+      MultiallelicPatches expected_patches;
+      if (!pgen.ReadExact(
+              block.first_variant + offset, expected,
+              &expected_patches, &error)) {
         fprintf(stderr, "\nError: %s\n", error.c_str());
         goto cleanup;
       }
@@ -676,6 +847,25 @@ int Verify(const Options& opts) {
                 block.first_variant + offset);
         goto cleanup;
       }
+      MultiallelicPatches decoded_patches;
+      if (!DecodeMultiallelicPatches(
+              block.records[offset].data(),
+              block.records[offset].size(), params.sample_ct,
+              &decoded_patches, &error)) {
+        fprintf(
+            stderr,
+            "\nError decoding multiallelic patches at variant %u: %s\n",
+            block.first_variant + offset, error.c_str());
+        goto cleanup;
+      }
+      if (!PatchesEqual(expected_patches, decoded_patches)) {
+        fprintf(
+            stderr,
+            "\nError: Multiallelic patch mismatch at variant %u.\n",
+            block.first_variant + offset);
+        goto cleanup;
+      }
+      multiallelic_ct += decoded_patches.allele_ct > 2;
       if (metadata.mode == RecordMode::kMarginal) {
         ++marginal_ct;
       } else if (metadata.mode == RecordMode::kOneReference) {
@@ -704,6 +894,8 @@ int Verify(const Options& opts) {
            static_cast<unsigned long long>(one_reference_ct));
     printf("  two-reference records:   %llu\n",
            static_cast<unsigned long long>(two_reference_ct));
+    printf("  multiallelic variants:   %llu\n",
+           static_cast<unsigned long long>(multiallelic_ct));
     printf("  elapsed seconds:         %.3f\n", elapsed_seconds);
   }
   return_code = 0;
@@ -729,9 +921,18 @@ std::vector<uint32_t> SelectBenchmarkBlocks(uint32_t block_ct,
 }
 
 int Benchmark(const Options& opts) {
-  PgenInput pgen;
   std::string error;
-  if (!pgen.Open(opts.input_fname, &error)) {
+  PvarData pvar;
+  const PvarData* pvar_ptr = nullptr;
+  if (!opts.pvar_fname.empty()) {
+    if (!LoadPvar(opts.pvar_fname, &pvar, &error)) {
+      fprintf(stderr, "Error: %s\n", error.c_str());
+      return 1;
+    }
+    pvar_ptr = &pvar;
+  }
+  PgenInput pgen;
+  if (!pgen.Open(opts.input_fname, pvar_ptr, &error)) {
     fprintf(stderr, "Error: %s\n", error.c_str());
     return 1;
   }
@@ -912,6 +1113,10 @@ int Inspect(const Options& opts) {
   uint64_t marginal_ct = 0;
   uint64_t one_reference_ct = 0;
   uint64_t two_reference_ct = 0;
+  uint64_t multiallelic_ct = 0;
+  uint64_t patch_01_ct = 0;
+  uint64_t patch_10_ct = 0;
+  uint64_t multiallelic_patch_bytes = 0;
   uint64_t record_bytes = 0;
   for (uint32_t block_idx = 0; block_idx != params.block_ct; ++block_idx) {
     EncodedBlock block;
@@ -925,6 +1130,26 @@ int Inspect(const Options& opts) {
                                &error)) {
         fprintf(stderr, "Error: %s\n", error.c_str());
         return 1;
+      }
+      MultiallelicPatches patches;
+      if (!DecodeMultiallelicPatches(
+              record.data(), record.size(), params.sample_ct,
+              &patches, &error)) {
+        fprintf(stderr, "Error: %s\n", error.c_str());
+        return 1;
+      }
+      if (patches.allele_ct > 2) {
+        size_t base_record_size;
+        if (!GetBaseRecordByteCt(
+                record.data(), record.size(), &base_record_size,
+                &error)) {
+          fprintf(stderr, "Error: %s\n", error.c_str());
+          return 1;
+        }
+        ++multiallelic_ct;
+        patch_01_ct += patches.patch_01_sample_ids.size();
+        patch_10_ct += patches.patch_10_sample_ids.size();
+        multiallelic_patch_bytes += record.size() - base_record_size;
       }
       record_bytes += record.size();
       if (metadata.mode == RecordMode::kMarginal) {
@@ -951,6 +1176,14 @@ int Inspect(const Options& opts) {
          static_cast<unsigned long long>(one_reference_ct));
   printf("  two-reference records:   %llu\n",
          static_cast<unsigned long long>(two_reference_ct));
+  printf("  multiallelic variants:   %llu\n",
+         static_cast<unsigned long long>(multiallelic_ct));
+  printf("  ref/ALT patches:         %llu\n",
+         static_cast<unsigned long long>(patch_01_ct));
+  printf("  ALT/ALT patches:         %llu\n",
+         static_cast<unsigned long long>(patch_10_ct));
+  printf("  multiallelic bytes:      %llu\n",
+         static_cast<unsigned long long>(multiallelic_patch_bytes));
   printf("  record payload bytes:    %llu\n",
          static_cast<unsigned long long>(record_bytes));
   printf("  file bytes:              %llu\n",

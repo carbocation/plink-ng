@@ -11,12 +11,16 @@
 namespace {
 
 using pgen_rans::CodecParams;
+using pgen_rans::AppendMultiallelicPatches;
+using pgen_rans::DecodeMultiallelicPatches;
 using pgen_rans::DecodeRecord;
 using pgen_rans::DecodeRecordToBuffer;
 using pgen_rans::DecodeRecordToBufferFromValidatedBlock;
 using pgen_rans::EncodeRecord;
 using pgen_rans::EstimateRecordBytes;
 using pgen_rans::GetPackedGenotype;
+using pgen_rans::GetBaseRecordByteCt;
+using pgen_rans::MultiallelicPatches;
 using pgen_rans::PackedWordCt;
 using pgen_rans::RecordMetadata;
 using pgen_rans::RecordMode;
@@ -155,7 +159,7 @@ void RoundTrip(const std::vector<uint8_t>& target,
   invalid_flags[0] |= 0x08;
   Expect(!DecodeRecord(invalid_flags.data(), invalid_flags.size(), anchors, 8,
                        sample_ct, params, &decoded, nullptr, &error),
-         "obsolete payload-layout flag was accepted");
+         "multiallelic flag without a patch suffix was accepted");
   if (metadata.has_entropy_payload) {
     std::vector<uint8_t> invalid_padding = record;
     invalid_padding.back() = 1;
@@ -272,6 +276,147 @@ void TestInvalidArguments() {
          "invalid scale precision was accepted");
 }
 
+void TestMultiallelicPatches() {
+  constexpr uint32_t kSampleCt = 1003;
+  std::vector<uint8_t> target(kSampleCt);
+  for (uint32_t sample_idx = 0; sample_idx != kSampleCt; ++sample_idx) {
+    target[sample_idx] = static_cast<uint8_t>(sample_idx % 4);
+  }
+  const std::vector<uint64_t> packed_target = Pack(target);
+  const CodecParams params;
+  std::vector<uint8_t> record;
+  std::string error;
+  Expect(EncodeRecord(
+             packed_target.data(), nullptr, nullptr, kSampleCt,
+             RecordMode::kMarginal, 0, 0, params, &record, &error),
+         "multiallelic base encode failed: " + error);
+  const size_t original_size = record.size();
+  MultiallelicPatches expected;
+  expected.allele_ct = 5;
+  expected.patch_01_sample_ids = {0, 127, 1002};
+  expected.patch_01_values = {2, 3, 4};
+  expected.patch_10_sample_ids = {1, 128, 1001};
+  expected.patch_10_values = {1, 2, 4, 4, 2, 3};
+  Expect(AppendMultiallelicPatches(
+             kSampleCt, expected, &record, &error),
+         "multiallelic patch encode failed: " + error);
+  size_t base_size;
+  Expect(GetBaseRecordByteCt(
+             record.data(), record.size(), &base_size, &error),
+         "base-record length parse failed: " + error);
+  Expect(base_size == original_size, "base-record length mismatch");
+  RecordMetadata metadata;
+  std::vector<uint64_t> decoded;
+  Expect(DecodeRecord(
+             record.data(), record.size(), nullptr, 0, kSampleCt,
+             params, &decoded, &metadata, &error),
+         "patched base record decode failed: " + error);
+  Expect(metadata.has_multiallelic_patches,
+         "multiallelic metadata flag was not exposed");
+  ExpectEqual(decoded, target, "patched base round-trip");
+  MultiallelicPatches observed;
+  Expect(DecodeMultiallelicPatches(
+             record.data(), record.size(), kSampleCt, &observed,
+             &error),
+         "multiallelic patch decode failed: " + error);
+  Expect(
+      (observed.allele_ct == expected.allele_ct) &&
+          (observed.patch_01_sample_ids ==
+           expected.patch_01_sample_ids) &&
+          (observed.patch_01_values == expected.patch_01_values) &&
+          (observed.patch_10_sample_ids ==
+           expected.patch_10_sample_ids) &&
+          (observed.patch_10_values == expected.patch_10_values),
+      "multiallelic patch round-trip mismatch");
+
+  std::vector<uint8_t> corrupt_footer = record;
+  corrupt_footer.back() ^= 1;
+  Expect(!DecodeMultiallelicPatches(
+             corrupt_footer.data(), corrupt_footer.size(), kSampleCt,
+             &observed, &error),
+         "corrupt multiallelic footer was accepted");
+  std::vector<uint8_t> corrupt_version = record;
+  corrupt_version[base_size] = 2;
+  Expect(!DecodeMultiallelicPatches(
+             corrupt_version.data(), corrupt_version.size(), kSampleCt,
+             &observed, &error),
+         "unknown multiallelic patch version was accepted");
+  std::vector<uint8_t> truncated = record;
+  truncated.pop_back();
+  Expect(!DecodeRecord(
+             truncated.data(), truncated.size(), nullptr, 0, kSampleCt,
+             params, &decoded, nullptr, &error),
+         "truncated multiallelic record was accepted");
+
+  std::vector<uint8_t> invalid_record;
+  Expect(EncodeRecord(
+             packed_target.data(), nullptr, nullptr, kSampleCt,
+             RecordMode::kMarginal, 0, 0, params, &invalid_record,
+             &error),
+         "invalid-patch base encode failed: " + error);
+  MultiallelicPatches invalid = expected;
+  invalid.patch_01_sample_ids = {7, 7, 8};
+  Expect(!AppendMultiallelicPatches(
+             kSampleCt, invalid, &invalid_record, &error),
+         "duplicate multiallelic patch sample ID was accepted");
+  invalid = expected;
+  invalid.patch_10_sample_ids[0] =
+      invalid.patch_01_sample_ids[0];
+  Expect(!AppendMultiallelicPatches(
+             kSampleCt, invalid, &invalid_record, &error),
+         "overlapping multiallelic patch classes were accepted");
+
+  std::vector<uint8_t> empty_patch_record;
+  Expect(EncodeRecord(
+             packed_target.data(), nullptr, nullptr, kSampleCt,
+             RecordMode::kMarginal, 0, 0, params, &empty_patch_record,
+             &error),
+         "empty-patch base encode failed: " + error);
+  MultiallelicPatches empty_patches;
+  empty_patches.allele_ct = 3;
+  Expect(AppendMultiallelicPatches(
+             kSampleCt, empty_patches, &empty_patch_record, &error),
+         "empty multiallelic patch encode failed: " + error);
+  Expect(DecodeMultiallelicPatches(
+             empty_patch_record.data(), empty_patch_record.size(),
+             kSampleCt, &observed, &error),
+         "empty multiallelic patch decode failed: " + error);
+  Expect((observed.allele_ct == 3) &&
+             observed.patch_01_sample_ids.empty() &&
+             observed.patch_10_sample_ids.empty(),
+         "empty multiallelic patch schema was not retained");
+
+  std::vector<uint8_t> dense_patch_record;
+  Expect(EncodeRecord(
+             packed_target.data(), nullptr, nullptr, kSampleCt,
+             RecordMode::kMarginal, 0, 0, params,
+             &dense_patch_record, &error),
+         "dense-patch base encode failed: " + error);
+  MultiallelicPatches dense_patches;
+  dense_patches.allele_ct = 3;
+  for (uint32_t sample_idx = 0; sample_idx != kSampleCt;
+       ++sample_idx) {
+    if (sample_idx % 3) {
+      dense_patches.patch_10_sample_ids.push_back(sample_idx);
+      dense_patches.patch_10_values.push_back(1);
+      dense_patches.patch_10_values.push_back(2);
+    }
+  }
+  Expect(AppendMultiallelicPatches(
+             kSampleCt, dense_patches, &dense_patch_record, &error),
+         "dense multiallelic patch encode failed: " + error);
+  Expect(DecodeMultiallelicPatches(
+             dense_patch_record.data(), dense_patch_record.size(),
+             kSampleCt, &observed, &error),
+         "dense multiallelic patch decode failed: " + error);
+  Expect(
+      (observed.patch_10_sample_ids ==
+       dense_patches.patch_10_sample_ids) &&
+          (observed.patch_10_values ==
+           dense_patches.patch_10_values),
+      "dense multiallelic bitmap round-trip mismatch");
+}
+
 }  // namespace
 
 int main() {
@@ -279,6 +424,7 @@ int main() {
   TestDeterministicRecords();
   TestLargeDefaultRoundTrips();
   TestInvalidArguments();
+  TestMultiallelicPatches();
   puts("pgen_rans_codec_test: PASS");
   return 0;
 }
