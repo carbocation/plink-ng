@@ -9,6 +9,21 @@
 #include <cstring>
 #include <limits>
 
+#if defined(__x86_64__) && \
+    (defined(__GNUC__) || defined(__clang__))
+#include <nmmintrin.h>
+#define PGEN_RANS_X86_CRC32C_DISPATCH 1
+#else
+#define PGEN_RANS_X86_CRC32C_DISPATCH 0
+#endif
+
+#if defined(__aarch64__) && defined(__ARM_FEATURE_CRC32)
+#include <arm_acle.h>
+#define PGEN_RANS_ARM_CRC32C 1
+#else
+#define PGEN_RANS_ARM_CRC32C 0
+#endif
+
 namespace pgen_rans {
 namespace {
 
@@ -20,7 +35,9 @@ constexpr uint32_t kBlockIndexByteCt = 32;
 constexpr uint32_t kBlockHeaderByteCt = 16;
 constexpr uint32_t kBlockMagic = 0x314b4c42U;
 constexpr uint32_t kMaximumRecordByteCt = 0xffffffU;
+#if !PGEN_RANS_ARM_CRC32C
 constexpr uint32_t kCrc32cPolynomial = 0x82f63b78U;
+#endif
 
 void SetError(const std::string& message, std::string* error) {
   if (error) {
@@ -28,6 +45,7 @@ void SetError(const std::string& message, std::string* error) {
   }
 }
 
+#if !PGEN_RANS_ARM_CRC32C
 const std::array<uint32_t, 256>& Crc32cTable() {
   static const std::array<uint32_t, 256> table = []() {
     std::array<uint32_t, 256> result = {};
@@ -44,7 +62,7 @@ const std::array<uint32_t, 256>& Crc32cTable() {
   return table;
 }
 
-uint32_t Crc32c(const uint8_t* data, size_t byte_ct) {
+uint32_t Crc32cPortable(const uint8_t* data, size_t byte_ct) {
   const std::array<uint32_t, 256>& table = Crc32cTable();
   uint32_t checksum = UINT32_MAX;
   for (size_t byte_idx = 0; byte_idx != byte_ct; ++byte_idx) {
@@ -52,6 +70,62 @@ uint32_t Crc32c(const uint8_t* data, size_t byte_ct) {
         table[(checksum ^ data[byte_idx]) & 0xffU] ^ (checksum >> 8);
   }
   return ~checksum;
+}
+#endif
+
+#if PGEN_RANS_X86_CRC32C_DISPATCH
+__attribute__((target("sse4.2")))
+uint32_t Crc32cX86(const uint8_t* data, size_t byte_ct) {
+  uint64_t checksum = UINT32_MAX;
+  while (byte_ct >= sizeof(uint64_t)) {
+    uint64_t word;
+    memcpy(&word, data, sizeof(word));
+    checksum = _mm_crc32_u64(checksum, word);
+    data += sizeof(word);
+    byte_ct -= sizeof(word);
+  }
+  uint32_t tail_checksum = static_cast<uint32_t>(checksum);
+  while (byte_ct) {
+    tail_checksum = _mm_crc32_u8(tail_checksum, *data++);
+    --byte_ct;
+  }
+  return ~tail_checksum;
+}
+#endif
+
+#if PGEN_RANS_ARM_CRC32C
+uint32_t Crc32cArm(const uint8_t* data, size_t byte_ct) {
+  uint32_t checksum = UINT32_MAX;
+  while (byte_ct >= sizeof(uint64_t)) {
+    uint64_t word;
+    memcpy(&word, data, sizeof(word));
+    checksum = __crc32cd(checksum, word);
+    data += sizeof(word);
+    byte_ct -= sizeof(word);
+  }
+  while (byte_ct) {
+    checksum = __crc32cb(checksum, *data++);
+    --byte_ct;
+  }
+  return ~checksum;
+}
+#endif
+
+uint32_t Crc32c(const uint8_t* data, size_t byte_ct) {
+#if PGEN_RANS_X86_CRC32C_DISPATCH
+  static const bool has_sse42 = []() {
+    __builtin_cpu_init();
+    return __builtin_cpu_supports("sse4.2");
+  }();
+  if (has_sse42) {
+    return Crc32cX86(data, byte_ct);
+  }
+#endif
+#if PGEN_RANS_ARM_CRC32C
+  return Crc32cArm(data, byte_ct);
+#else
+  return Crc32cPortable(data, byte_ct);
+#endif
 }
 
 void AppendU16(uint16_t value, std::vector<uint8_t>* output) {
