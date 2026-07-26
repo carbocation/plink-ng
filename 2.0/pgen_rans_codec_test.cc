@@ -283,7 +283,11 @@ void TestLargeDefaultRoundTrips() {
 }
 
 void TestForcedDefaultEncodeKernels() {
-  if (!EncodeKernelSupported(EncodeKernel::kAvx512)) {
+  const bool has_avx2 =
+      EncodeKernelSupported(EncodeKernel::kAvx2);
+  const bool has_avx512 =
+      EncodeKernelSupported(EncodeKernel::kAvx512);
+  if ((!has_avx2) && (!has_avx512)) {
     return;
   }
   constexpr uint32_t kSampleCt = 65567;
@@ -297,14 +301,46 @@ void TestForcedDefaultEncodeKernels() {
     reference1[sample_idx] = rng() % 4;
     reference2[sample_idx] = rng() % 4;
     marginal[sample_idx] = rng() % 4;
-    one_reference[sample_idx] =
-        (reference1[sample_idx] < 2)
-            ? reference1[sample_idx]
-            : (rng() % 4);
+    switch (reference1[sample_idx]) {
+      case 0:
+        one_reference[sample_idx] = 2;
+        break;
+      case 1:
+        one_reference[sample_idx] = rng() & 1U;
+        break;
+      case 2: {
+        constexpr uint8_t kThreeSymbolAlphabet[] = {0, 2, 3};
+        one_reference[sample_idx] =
+            kThreeSymbolAlphabet[rng() % 3];
+        break;
+      }
+      default:
+        // Exercise a skewed entropy row with one absent symbol.
+        one_reference[sample_idx] =
+            ((rng() & 15U) == 0) ? 3 : 1;
+        break;
+    }
     const uint32_t context =
         4 * reference1[sample_idx] + reference2[sample_idx];
-    two_reference[sample_idx] =
-        (context & 1) ? (context % 4) : (rng() % 4);
+    switch (context & 3U) {
+      case 0:
+        two_reference[sample_idx] =
+            static_cast<uint8_t>(context >> 2);
+        break;
+      case 1:
+        two_reference[sample_idx] =
+            (rng() & 1U) ? 0 : 3;
+        break;
+      case 2: {
+        constexpr uint8_t kThreeSymbolAlphabet[] = {0, 1, 3};
+        two_reference[sample_idx] =
+            kThreeSymbolAlphabet[rng() % 3];
+        break;
+      }
+      default:
+        two_reference[sample_idx] = rng() % 4;
+        break;
+    }
   }
   const std::vector<uint8_t>* const targets[] = {
       &marginal, &one_reference, &two_reference};
@@ -338,18 +374,182 @@ void TestForcedDefaultEncodeKernels() {
              "forced scalar encode failed: " + error);
       Expect(LastEncodeKernelForTesting() == EncodeKernel::kScalar,
              "forced scalar encoder kernel was not selected");
-      SetEncodeKernelForTesting(EncodeKernel::kAvx512);
+      for (const EncodeKernel kernel :
+           {EncodeKernel::kAvx2, EncodeKernel::kAvx512}) {
+        if (!EncodeKernelSupported(kernel)) {
+          continue;
+        }
+        const char* const kernel_name =
+            (kernel == EncodeKernel::kAvx2) ? "AVX2" : "AVX-512";
+        SetEncodeKernelForTesting(kernel);
+        Expect(EncodeRecord(
+                   packed_target.data(), reference1_ptr,
+                   reference2_ptr, kSampleCt, mode, 3, 7, params,
+                   &vector_record, &error),
+               std::string("forced ") + kernel_name +
+                   " encode failed: " + error);
+        Expect(LastEncodeKernelForTesting() == kernel,
+               std::string("forced ") + kernel_name +
+                   " encoder kernel was not selected");
+        Expect(vector_record == scalar_record,
+               std::string(kernel_name) +
+                   " encoder changed serialized record bytes");
+      }
+
+      SetEncodeKernelForTesting(EncodeKernel::kAuto);
       Expect(EncodeRecord(
                  packed_target.data(), reference1_ptr,
                  reference2_ptr, kSampleCt, mode, 3, 7, params,
                  &vector_record, &error),
-             "forced AVX-512 encode failed: " + error);
-      Expect(LastEncodeKernelForTesting() == EncodeKernel::kAvx512,
-             "forced AVX-512 encoder kernel was not selected");
+             "automatic SIMD encode failed: " + error);
+      const EncodeKernel expected_auto_kernel =
+          has_avx512 ? EncodeKernel::kAvx512 : EncodeKernel::kAvx2;
+      Expect(LastEncodeKernelForTesting() == expected_auto_kernel,
+             "automatic encoder did not select the best SIMD kernel");
       Expect(vector_record == scalar_record,
-             "AVX-512 encoder changed serialized record bytes");
+             "automatic SIMD encoder changed serialized record bytes");
     }
   }
+  SetEncodeKernelForTesting(EncodeKernel::kAuto);
+}
+
+void TestAvx2EncodeTailsAndFallbacks() {
+  if (!EncodeKernelSupported(EncodeKernel::kAvx2)) {
+    return;
+  }
+  std::string error;
+  for (const uint32_t state_ct : {16U, 32U}) {
+    for (const uint32_t tail_ct : {8U, 9U, 16U, 17U}) {
+      if (tail_ct > state_ct) {
+        continue;
+      }
+      const uint32_t sample_ct = 2 * state_ct + tail_ct;
+      std::vector<uint8_t> target(sample_ct);
+      for (uint32_t sample_idx = 0; sample_idx != sample_ct;
+           ++sample_idx) {
+        target[sample_idx] =
+            static_cast<uint8_t>((5 * sample_idx + sample_idx / 7) & 3U);
+      }
+      const std::vector<uint64_t> packed_target = Pack(target);
+      const CodecParams params(state_ct, 12);
+      std::vector<uint8_t> scalar_record;
+      std::vector<uint8_t> avx2_record;
+      SetEncodeKernelForTesting(EncodeKernel::kScalar);
+      Expect(EncodeRecord(
+                 packed_target.data(), nullptr, nullptr, sample_ct,
+                 RecordMode::kMarginal, 0, 0, params,
+                 &scalar_record, &error),
+             "tail scalar encode failed: " + error);
+      SetEncodeKernelForTesting(EncodeKernel::kAvx2);
+      Expect(EncodeRecord(
+                 packed_target.data(), nullptr, nullptr, sample_ct,
+                 RecordMode::kMarginal, 0, 0, params,
+                 &avx2_record, &error),
+             "tail AVX2 encode failed: " + error);
+      Expect(LastEncodeKernelForTesting() == EncodeKernel::kAvx2,
+             "tail test did not reach the AVX2 encoder");
+      Expect(avx2_record == scalar_record,
+             "AVX2 encoder changed bytes for a partial tail");
+    }
+  }
+
+  constexpr uint32_t kFallbackSampleCt = 97;
+  std::vector<uint8_t> fallback_target(kFallbackSampleCt);
+  for (uint32_t sample_idx = 0; sample_idx != kFallbackSampleCt;
+       ++sample_idx) {
+    fallback_target[sample_idx] =
+        static_cast<uint8_t>((sample_idx + sample_idx / 3) & 3U);
+  }
+  const std::vector<uint64_t> packed_fallback_target =
+      Pack(fallback_target);
+  for (const CodecParams params :
+       {CodecParams(16, 11), CodecParams(24, 12)}) {
+    std::vector<uint8_t> record;
+    SetEncodeKernelForTesting(EncodeKernel::kAvx2);
+    Expect(EncodeRecord(
+               packed_fallback_target.data(), nullptr, nullptr,
+               kFallbackSampleCt, RecordMode::kMarginal, 0, 0, params,
+               &record, &error),
+           "ineligible AVX2 fallback encode failed: " + error);
+    Expect(LastEncodeKernelForTesting() == EncodeKernel::kScalar,
+           "ineligible AVX2 parameters did not fall back to scalar");
+  }
+
+  std::vector<uint64_t> deterministic(
+      PackedWordCt(kFallbackSampleCt), 0);
+  std::vector<uint8_t> deterministic_record;
+  SetEncodeKernelForTesting(EncodeKernel::kAvx2);
+  Expect(EncodeRecord(
+             deterministic.data(), nullptr, nullptr, kFallbackSampleCt,
+             RecordMode::kMarginal, 0, 0, CodecParams(),
+             &deterministic_record, &error),
+         "deterministic fallback encode failed: " + error);
+  Expect(LastEncodeKernelForTesting() == EncodeKernel::kScalar,
+         "deterministic encode retained a stale SIMD kernel");
+
+  constexpr uint32_t kMismatchSampleCt = 96;
+  uint32_t marginal_counts[4] = {48, 48, 0, 0};
+  std::vector<uint8_t> mismatch_target(kMismatchSampleCt);
+  for (uint32_t sample_idx = 0; sample_idx != kMismatchSampleCt;
+       ++sample_idx) {
+    mismatch_target[sample_idx] =
+        static_cast<uint8_t>(sample_idx & 1U);
+  }
+  mismatch_target[9] = 2;
+  std::vector<uint64_t> packed_mismatch_target =
+      Pack(mismatch_target);
+  for (const uint32_t state_ct : {16U, 32U}) {
+    std::vector<uint8_t> record;
+    SetEncodeKernelForTesting(EncodeKernel::kAvx2);
+    Expect(!EncodeRecordFromCounts(
+               packed_mismatch_target.data(), nullptr, nullptr,
+               kMismatchSampleCt, RecordMode::kMarginal, 0, 0,
+               marginal_counts, CodecParams(state_ct, 12),
+               &record, &error),
+           "AVX2 encoder accepted a zero-frequency symbol");
+    Expect(LastEncodeKernelForTesting() == EncodeKernel::kAvx2,
+           "zero-frequency mismatch did not reach the AVX2 encoder");
+  }
+
+  uint32_t conditional_counts[16] = {};
+  conditional_counts[0] = 48;
+  conditional_counts[4] = 24;
+  conditional_counts[5] = 24;
+  std::vector<uint8_t> reference(kMismatchSampleCt);
+  mismatch_target.assign(kMismatchSampleCt, 0);
+  for (uint32_t sample_idx = 48; sample_idx != kMismatchSampleCt;
+       ++sample_idx) {
+    reference[sample_idx] = 1;
+    mismatch_target[sample_idx] =
+        static_cast<uint8_t>(sample_idx & 1U);
+  }
+  mismatch_target[3] = 1;
+  std::vector<uint64_t> packed_reference = Pack(reference);
+  packed_mismatch_target = Pack(mismatch_target);
+  std::vector<uint8_t> mismatch_record;
+  SetEncodeKernelForTesting(EncodeKernel::kAvx2);
+  Expect(!EncodeRecordFromCounts(
+             packed_mismatch_target.data(), packed_reference.data(),
+             nullptr, kMismatchSampleCt, RecordMode::kOneReference,
+             1, 0, conditional_counts, CodecParams(16, 12),
+             &mismatch_record, &error),
+         "AVX2 encoder accepted a wrong deterministic symbol");
+  Expect(LastEncodeKernelForTesting() == EncodeKernel::kAvx2,
+         "deterministic mismatch did not reach the AVX2 encoder");
+
+  mismatch_target[3] = 0;
+  reference[3] = 2;
+  packed_reference = Pack(reference);
+  packed_mismatch_target = Pack(mismatch_target);
+  SetEncodeKernelForTesting(EncodeKernel::kAvx2);
+  Expect(!EncodeRecordFromCounts(
+             packed_mismatch_target.data(), packed_reference.data(),
+             nullptr, kMismatchSampleCt, RecordMode::kOneReference,
+             1, 0, conditional_counts, CodecParams(32, 12),
+             &mismatch_record, &error),
+         "AVX2 encoder accepted an absent context");
+  Expect(LastEncodeKernelForTesting() == EncodeKernel::kAvx2,
+         "absent-context mismatch did not reach the AVX2 encoder");
   SetEncodeKernelForTesting(EncodeKernel::kAuto);
 }
 
@@ -607,19 +807,28 @@ void TestRuntimeDivisionFrequencies() {
                &error),
            "runtime-division encode failed at frequency " +
                std::to_string(frequency) + ": " + error);
-    if (EncodeKernelSupported(EncodeKernel::kAvx512)) {
-      scalar_record = record;
-      SetEncodeKernelForTesting(EncodeKernel::kAvx512);
+    scalar_record = record;
+    for (const EncodeKernel kernel :
+         {EncodeKernel::kAvx2, EncodeKernel::kAvx512}) {
+      if (!EncodeKernelSupported(kernel)) {
+        continue;
+      }
+      const char* const kernel_name =
+          (kernel == EncodeKernel::kAvx2) ? "AVX2" : "AVX-512";
+      SetEncodeKernelForTesting(kernel);
       Expect(EncodeRecordFromCounts(
                  packed.data(), nullptr, nullptr, kSampleCt,
                  RecordMode::kMarginal, 0, 0, counts, params,
                  &record, &error),
-             "AVX-512 runtime-division encode failed at frequency " +
+             std::string(kernel_name) +
+                 " runtime-division encode failed at frequency " +
                  std::to_string(frequency) + ": " + error);
-      Expect(LastEncodeKernelForTesting() == EncodeKernel::kAvx512,
-             "forced AVX-512 runtime-division kernel was not selected");
+      Expect(LastEncodeKernelForTesting() == kernel,
+             std::string("forced ") + kernel_name +
+                 " runtime-division kernel was not selected");
       Expect(record == scalar_record,
-             "AVX-512 runtime division changed bytes at frequency " +
+             std::string(kernel_name) +
+                 " runtime division changed bytes at frequency " +
                  std::to_string(frequency));
     }
     Expect(DecodeRecord(
@@ -814,6 +1023,7 @@ int main() {
   TestDeterministicRecords();
   TestLargeDefaultRoundTrips();
   TestForcedDefaultEncodeKernels();
+  TestAvx2EncodeTailsAndFallbacks();
   TestForcedDefaultDecodeKernels();
   TestAvx2HighStateRejection();
   TestRuntimeDivisionFrequencies();

@@ -31,13 +31,14 @@ bool DecodeKernelSupported(DecodeKernel kernel);
 void SetDecodeKernelForTesting(DecodeKernel kernel);
 DecodeKernel LastDecodeKernelForTesting();
 
-// Encoder selection is likewise automatic.  AVX-512 intentionally retains
-// the scalar encoder's byte layout, so these hooks can verify exact record
-// identity as well as round-trip correctness.
+// Encoder selection is likewise automatic.  The SIMD encoders intentionally
+// retain the scalar encoder's byte layout, so these hooks can verify exact
+// record identity as well as round-trip correctness.
 enum class EncodeKernel : uint8_t {
   kAuto = 0,
   kScalar = 1,
   kAvx512 = 2,
+  kAvx2 = 3,
 };
 
 bool EncodeKernelSupported(EncodeKernel kernel);

@@ -1031,16 +1031,17 @@ bool BuildInterleavedPayloadDirectScalar(
 }
 
 #if PGEN_RANS_X86_RUNTIME_DISPATCH
-// AVX-512 encoder
+// SIMD encoders
 //
-// This is deliberately a byte-layout-preserving implementation.  The rANS
-// recurrence runs in 16 lanes, but emitted bytes are copied to
+// These are deliberately byte-layout-preserving implementations.  The rANS
+// recurrence runs in SIMD lanes, but emitted bytes are copied to
 // reverse_payload in precisely the scalar encoder's layer/lane order.
 // Consequently runtime dispatch cannot change serialized records.
-struct alignas(64) Avx512EncodeModel12 {
-  std::array<uint32_t, 64> maximum_states = {};
+struct alignas(64) VectorEncodeModel12 {
+  // maximum_state is a multiple of 2^19 at scale 12, while cumulative is
+  // below 2^12.  Packing them saves one indexed lookup in the sample loop.
+  std::array<uint32_t, 64> maximum_state_cumulatives = {};
   std::array<uint32_t, 64> division_multipliers = {};
-  std::array<uint32_t, 64> cumulatives = {};
   std::array<uint32_t, 64> packed_division = {};
   std::array<uint32_t, 16> active_symbol_cts = {};
   std::array<uint32_t, 16> deterministic_symbols = {};
@@ -1058,10 +1059,19 @@ bool HasAvx512Encoder() {
   return result;
 }
 
-void BuildAvx512EncodeModel12(
+bool HasAvx2Encoder() {
+  static const bool result = []() {
+    __builtin_cpu_init();
+    return __builtin_cpu_supports("avx2") &&
+           __builtin_cpu_supports("bmi2");
+  }();
+  return result;
+}
+
+void BuildVectorEncodeModel12(
     const Model& model,
     const std::array<std::array<RansEncoderSymbol, 4>, 16>& encoders,
-    Avx512EncodeModel12* encode_model) {
+    VectorEncodeModel12* encode_model) {
   for (uint32_t context = 0; context != 16; ++context) {
     encode_model->active_symbol_cts[context] =
         model.active_symbol_cts[context];
@@ -1076,10 +1086,10 @@ void BuildAvx512EncodeModel12(
         continue;
       }
       const uint32_t idx = 4 * context + symbol;
-      encode_model->maximum_states[idx] = encoder.maximum_state;
+      encode_model->maximum_state_cumulatives[idx] =
+          encoder.maximum_state | encoder.cumulative;
       encode_model->division_multipliers[idx] =
           encoder.division_multiplier;
-      encode_model->cumulatives[idx] = encoder.cumulative;
       encode_model->packed_division[idx] =
           encoder.division_pre_shift |
           (static_cast<uint32_t>(encoder.division_post_shift) << 8) |
@@ -1139,7 +1149,7 @@ PGEN_RANS_TARGET_AVX512
 bool BuildInterleavedPayloadDirectModeAvx51212(
     const uint64_t* target, const uint64_t* reference1,
     const uint64_t* reference2, uint32_t sample_ct,
-    const Avx512EncodeModel12& encode_model,
+    const VectorEncodeModel12& encode_model,
     std::vector<uint32_t>* states,
     std::vector<uint8_t>* reverse_payload, std::string* error) {
   static_assert((kStateCt == 16) || (kStateCt == 32));
@@ -1222,13 +1232,18 @@ bool BuildInterleavedPayloadDirectModeAvx51212(
       }
       const __m512i encoder_indices = _mm512_add_epi32(
           _mm512_slli_epi32(contexts, 2), symbols);
-      const __m512i maximum_states = _mm512_i32gather_epi32(
-          encoder_indices, encode_model.maximum_states.data(), 4);
+      const __m512i maximum_state_cumulatives =
+          _mm512_i32gather_epi32(
+              encoder_indices,
+              encode_model.maximum_state_cumulatives.data(), 4);
+      const __m512i maximum_states = _mm512_and_si512(
+          maximum_state_cumulatives,
+          _mm512_set1_epi32(0xfff80000U));
       const __m512i multipliers = _mm512_i32gather_epi32(
           encoder_indices,
           encode_model.division_multipliers.data(), 4);
-      const __m512i cumulatives = _mm512_i32gather_epi32(
-          encoder_indices, encode_model.cumulatives.data(), 4);
+      const __m512i cumulatives = _mm512_and_si512(
+          maximum_state_cumulatives, _mm512_set1_epi32(0xfff));
       const __m512i packed_division = _mm512_i32gather_epi32(
           encoder_indices, encode_model.packed_division.data(), 4);
 
@@ -1370,7 +1385,7 @@ PGEN_RANS_TARGET_AVX512
 bool BuildInterleavedPayloadDirectForModeAvx51212(
     const uint64_t* target, const uint64_t* reference1,
     const uint64_t* reference2, uint32_t sample_ct,
-    const Avx512EncodeModel12& encode_model,
+    const VectorEncodeModel12& encode_model,
     std::vector<uint32_t>* states,
     std::vector<uint8_t>* reverse_payload, std::string* error) {
   if (states->size() == 32) {
@@ -1391,8 +1406,8 @@ bool BuildInterleavedPayloadDirectAvx51212(
     const std::array<std::array<RansEncoderSymbol, 4>, 16>& encoders,
     std::vector<uint32_t>* states,
     std::vector<uint8_t>* reverse_payload, std::string* error) {
-  Avx512EncodeModel12 encode_model;
-  BuildAvx512EncodeModel12(model, encoders, &encode_model);
+  VectorEncodeModel12 encode_model;
+  BuildVectorEncodeModel12(model, encoders, &encode_model);
   switch (mode) {
     case RecordMode::kMarginal:
       return BuildInterleavedPayloadDirectForModeAvx51212<
@@ -1413,6 +1428,419 @@ bool BuildInterleavedPayloadDirectAvx51212(
   SetError("Invalid conditional-rANS record mode.", error);
   return false;
 }
+
+PGEN_RANS_TARGET_AVX2 PGEN_RANS_ALWAYS_INLINE
+__m256i CompareGreaterEqualEpu32Avx2(
+    const __m256i& left, const __m256i& right) {
+  const __m256i sign_bit =
+      _mm256_set1_epi32(std::numeric_limits<int32_t>::min());
+  const __m256i signed_left = _mm256_xor_si256(left, sign_bit);
+  const __m256i signed_right = _mm256_xor_si256(right, sign_bit);
+  return _mm256_or_si256(
+      _mm256_cmpgt_epi32(signed_left, signed_right),
+      _mm256_cmpeq_epi32(left, right));
+}
+
+PGEN_RANS_TARGET_AVX2 PGEN_RANS_ALWAYS_INLINE
+__m256i RansDivide8Avx2(
+    const __m256i& states, const __m256i& multipliers,
+    const __m256i& packed_division) {
+  const __m256i byte_mask = _mm256_set1_epi32(0xff);
+  const __m256i pre_shifts =
+      _mm256_and_si256(packed_division, byte_mask);
+  const __m256i post_shifts = _mm256_and_si256(
+      _mm256_srli_epi32(packed_division, 8), byte_mask);
+  const __m256i increments = _mm256_and_si256(
+      _mm256_srli_epi32(packed_division, 16),
+      _mm256_set1_epi32(1));
+  const __m256i numerators = _mm256_add_epi32(
+      _mm256_srlv_epi32(states, pre_shifts), increments);
+
+  // Power-of-two divisors have multiplier 1 and a post-shift below 32.
+  // Every other divisor has a post-shift of 32 or more, so its quotient is
+  // the high dword of the 32x32 product shifted by (post_shift - 32).
+  // AVX2 multiplies only even dwords; compute the odd products separately
+  // and weave their high dwords back into lane order.
+  const __m256i product_even =
+      _mm256_mul_epu32(numerators, multipliers);
+  const __m256i product_odd = _mm256_mul_epu32(
+      _mm256_srli_epi64(numerators, 32),
+      _mm256_srli_epi64(multipliers, 32));
+  const __m256i high_even = _mm256_shuffle_epi32(
+      product_even, _MM_SHUFFLE(3, 1, 3, 1));
+  const __m256i high_odd = _mm256_shuffle_epi32(
+      product_odd, _MM_SHUFFLE(3, 1, 3, 1));
+  const __m256i high_products =
+      _mm256_unpacklo_epi32(high_even, high_odd);
+  const __m256i multiplied_quotients = _mm256_srlv_epi32(
+      high_products,
+      _mm256_sub_epi32(post_shifts, _mm256_set1_epi32(32)));
+  const __m256i power_of_two_quotients =
+      _mm256_srlv_epi32(numerators, post_shifts);
+  const __m256i multiplied_lanes = _mm256_cmpgt_epi32(
+      post_shifts, _mm256_set1_epi32(31));
+  return _mm256_blendv_epi8(
+      power_of_two_quotients, multiplied_quotients,
+      multiplied_lanes);
+}
+
+template <RecordMode kMode>
+PGEN_RANS_TARGET_AVX2 PGEN_RANS_ALWAYS_INLINE
+__m256i Avx2LookupEncodeContextRow(
+    const uint32_t* row, const __m256i& contexts) {
+  const __m256i indices = _mm256_and_si256(
+      contexts, _mm256_set1_epi32(7));
+  const __m256i low_values = _mm256_permutevar8x32_epi32(
+      _mm256_load_si256(
+          reinterpret_cast<const __m256i*>(row)),
+      indices);
+  if constexpr (kMode == RecordMode::kOneReference) {
+    return low_values;
+  }
+  const __m256i high_values = _mm256_permutevar8x32_epi32(
+      _mm256_load_si256(
+          reinterpret_cast<const __m256i*>(row + 8)),
+      indices);
+  const __m256i high_context_mask = _mm256_cmpgt_epi32(
+      contexts, _mm256_set1_epi32(7));
+  return _mm256_blendv_epi8(
+      low_values, high_values, high_context_mask);
+}
+
+template <RecordMode kMode, uint32_t kStateCt>
+PGEN_RANS_TARGET_AVX2
+bool BuildInterleavedPayloadDirectModeAvx212(
+    const uint64_t* target, const uint64_t* reference1,
+    const uint64_t* reference2, uint32_t sample_ct,
+    const VectorEncodeModel12& encode_model,
+    std::vector<uint32_t>* states,
+    std::vector<uint8_t>* reverse_payload, std::string* error) {
+  static_assert((kStateCt == 16) || (kStateCt == 32));
+  const __m256i genotype_shifts = _mm256_setr_epi32(
+      0, 2, 4, 6, 8, 10, 12, 14);
+  const __m256i genotype_mask = _mm256_set1_epi32(3);
+  const __m256i lane_indices = _mm256_setr_epi32(
+      0, 1, 2, 3, 4, 5, 6, 7);
+  const __m256i zero = _mm256_setzero_si256();
+  const __m256i one = _mm256_set1_epi32(1);
+  const __m256i total_frequency =
+      _mm256_set1_epi32(kDefaultSlotCt);
+  __m256i marginal_maximum_state_cumulatives = zero;
+  __m256i marginal_multipliers = zero;
+  __m256i marginal_packed_division = zero;
+  if constexpr (kMode == RecordMode::kMarginal) {
+    // A marginal record only uses context 0, so all lookup indices are in
+    // the first four lanes.  Keep those properties in registers and use
+    // vpermd instead of issuing three gathers per subgroup.
+    marginal_maximum_state_cumulatives = _mm256_load_si256(
+        reinterpret_cast<const __m256i*>(
+            encode_model.maximum_state_cumulatives.data()));
+    marginal_multipliers = _mm256_load_si256(
+        reinterpret_cast<const __m256i*>(
+            encode_model.division_multipliers.data()));
+    marginal_packed_division = _mm256_load_si256(
+        reinterpret_cast<const __m256i*>(
+            encode_model.packed_division.data()));
+  }
+
+  reverse_payload->clear();
+  reverse_payload->reserve(sample_ct / 8);
+  uint32_t first_sample =
+      ((sample_ct - 1) / kStateCt) * kStateCt;
+  while (true) {
+    const uint32_t round_sample_ct =
+        std::min(kStateCt, sample_ct - first_sample);
+    const uint32_t word_idx = first_sample / 32;
+    const uint64_t target_word = target[word_idx];
+    uint64_t reference1_word = 0;
+    uint64_t reference2_word = 0;
+    if constexpr (kMode != RecordMode::kMarginal) {
+      reference1_word = reference1[word_idx];
+    }
+    if constexpr (kMode == RecordMode::kTwoReference) {
+      reference2_word = reference2[word_idx];
+    }
+    const uint32_t word_sample_offset =
+        (kStateCt == 16) ? (first_sample % 32) : 0;
+
+    uint32_t group_start =
+        ((round_sample_ct - 1) / 16) * 16;
+    while (true) {
+      const uint32_t group_end =
+          std::min(group_start + 16, round_sample_ct);
+      const uint32_t group_lane_ct = group_end - group_start;
+      std::array<std::array<uint8_t, 16>, 4> emitted_layers = {};
+      std::array<uint32_t, 16> emitted_byte_ct_array = {};
+      uint32_t maximum_emitted_byte_ct = 0;
+
+      for (uint32_t subgroup_start = 0;
+           subgroup_start < group_lane_ct; subgroup_start += 8) {
+        const uint32_t valid_lane_ct =
+            std::min(8U, group_lane_ct - subgroup_start);
+        const __m256i valid_lanes = _mm256_cmpgt_epi32(
+            _mm256_set1_epi32(valid_lane_ct), lane_indices);
+        const uint32_t group_shift =
+            2 * (word_sample_offset + group_start + subgroup_start);
+        const uint32_t target_chunk =
+            static_cast<uint32_t>(target_word >> group_shift);
+        const __m256i symbols = _mm256_and_si256(
+            _mm256_srlv_epi32(
+                _mm256_set1_epi32(static_cast<int>(target_chunk)),
+                genotype_shifts),
+            genotype_mask);
+
+        __m256i contexts = zero;
+        if constexpr (kMode != RecordMode::kMarginal) {
+          const uint32_t reference1_chunk =
+              static_cast<uint32_t>(
+                  reference1_word >> group_shift);
+          contexts = _mm256_and_si256(
+              _mm256_srlv_epi32(
+                  _mm256_set1_epi32(
+                      static_cast<int>(reference1_chunk)),
+                  genotype_shifts),
+              genotype_mask);
+        }
+        if constexpr (kMode == RecordMode::kTwoReference) {
+          const uint32_t reference2_chunk =
+              static_cast<uint32_t>(
+                  reference2_word >> group_shift);
+          const __m256i second_contexts = _mm256_and_si256(
+              _mm256_srlv_epi32(
+                  _mm256_set1_epi32(
+                      static_cast<int>(reference2_chunk)),
+                  genotype_shifts),
+              genotype_mask);
+          contexts = _mm256_add_epi32(
+              _mm256_slli_epi32(contexts, 2), second_contexts);
+        }
+        const __m256i encoder_indices = _mm256_add_epi32(
+            _mm256_slli_epi32(contexts, 2), symbols);
+        __m256i maximum_state_cumulatives;
+        __m256i multipliers;
+        __m256i packed_division;
+        if constexpr (kMode == RecordMode::kMarginal) {
+          maximum_state_cumulatives =
+              _mm256_permutevar8x32_epi32(
+                  marginal_maximum_state_cumulatives, symbols);
+          multipliers = _mm256_permutevar8x32_epi32(
+              marginal_multipliers, symbols);
+          packed_division = _mm256_permutevar8x32_epi32(
+              marginal_packed_division, symbols);
+        } else {
+          maximum_state_cumulatives = _mm256_i32gather_epi32(
+              reinterpret_cast<const int*>(
+                  encode_model.maximum_state_cumulatives.data()),
+              encoder_indices, 4);
+          multipliers = _mm256_i32gather_epi32(
+              reinterpret_cast<const int*>(
+                  encode_model.division_multipliers.data()),
+              encoder_indices, 4);
+          packed_division = _mm256_i32gather_epi32(
+              reinterpret_cast<const int*>(
+                  encode_model.packed_division.data()),
+              encoder_indices, 4);
+        }
+        const __m256i maximum_states = _mm256_and_si256(
+            maximum_state_cumulatives,
+            _mm256_set1_epi32(0xfff80000U));
+        const __m256i cumulatives = _mm256_and_si256(
+            maximum_state_cumulatives,
+            _mm256_set1_epi32(0xfff));
+
+        __m256i lane_active_symbol_cts;
+        __m256i lane_deterministic_symbols;
+        if constexpr (kMode == RecordMode::kMarginal) {
+          lane_active_symbol_cts = _mm256_set1_epi32(
+              static_cast<int>(
+                  encode_model.active_symbol_cts[0]));
+          lane_deterministic_symbols = _mm256_set1_epi32(
+              static_cast<int>(
+                  encode_model.deterministic_symbols[0]));
+        } else {
+          lane_active_symbol_cts =
+              Avx2LookupEncodeContextRow<kMode>(
+                  encode_model.active_symbol_cts.data(), contexts);
+          lane_deterministic_symbols =
+              Avx2LookupEncodeContextRow<kMode>(
+                  encode_model.deterministic_symbols.data(), contexts);
+        }
+        const __m256i entropy_lanes = _mm256_and_si256(
+            valid_lanes,
+            _mm256_cmpgt_epi32(lane_active_symbol_cts, one));
+        const __m256i deterministic_lanes =
+            _mm256_andnot_si256(entropy_lanes, valid_lanes);
+        const __m256i invalid_entropy_lanes = _mm256_and_si256(
+            entropy_lanes, _mm256_cmpeq_epi32(maximum_states, zero));
+        const __m256i invalid_deterministic_lanes = _mm256_and_si256(
+            deterministic_lanes,
+            _mm256_or_si256(
+                _mm256_cmpeq_epi32(lane_active_symbol_cts, zero),
+                _mm256_xor_si256(
+                    _mm256_cmpeq_epi32(
+                        symbols, lane_deterministic_symbols),
+                    _mm256_set1_epi32(-1))));
+        if (_mm256_movemask_epi8(_mm256_or_si256(
+                invalid_entropy_lanes,
+                invalid_deterministic_lanes))) {
+          SetError("Supplied rANS model counts do not match genotypes.",
+                   error);
+          return false;
+        }
+
+        __m256i lane_states = _mm256_loadu_si256(
+            reinterpret_cast<const __m256i*>(
+                states->data() + group_start + subgroup_start));
+        __m256i emitted_byte_cts = zero;
+        for (uint32_t emission_idx = 0; emission_idx != 4;
+             ++emission_idx) {
+          const __m256i renormalize_lanes = _mm256_and_si256(
+              entropy_lanes,
+              CompareGreaterEqualEpu32Avx2(
+                  lane_states, maximum_states));
+          if (!_mm256_movemask_epi8(renormalize_lanes)) {
+            break;
+          }
+          maximum_emitted_byte_ct = std::max(
+              maximum_emitted_byte_ct, emission_idx + 1);
+          const __m256i byte_values = _mm256_and_si256(
+              lane_states, _mm256_set1_epi32(0xff));
+          const __m128i word_values = _mm_packus_epi32(
+              _mm256_castsi256_si128(byte_values),
+              _mm256_extracti128_si256(byte_values, 1));
+          const __m128i packed_byte_values = _mm_packus_epi16(
+              word_values, _mm_setzero_si128());
+          _mm_storel_epi64(
+              reinterpret_cast<__m128i*>(
+                  emitted_layers[emission_idx].data() +
+                  subgroup_start),
+              packed_byte_values);
+          lane_states = _mm256_blendv_epi8(
+              lane_states, _mm256_srli_epi32(lane_states, 8),
+              renormalize_lanes);
+          emitted_byte_cts = _mm256_sub_epi32(
+              emitted_byte_cts, renormalize_lanes);
+        }
+        if (_mm256_movemask_epi8(_mm256_and_si256(
+                entropy_lanes,
+                CompareGreaterEqualEpu32Avx2(
+                    lane_states, maximum_states)))) {
+          SetError("Internal rANS encoder renormalization overflow.",
+                   error);
+          return false;
+        }
+
+        const __m256i quotients = RansDivide8Avx2(
+            lane_states, multipliers, packed_division);
+        // At scale 12, maximum_state is frequency * 2^19.  Deriving the
+        // frequency from it saves a fifth indexed gather.
+        const __m256i frequencies =
+            _mm256_srli_epi32(maximum_states, 19);
+        const __m256i updated_states = _mm256_add_epi32(
+            _mm256_add_epi32(
+                lane_states,
+                _mm256_mullo_epi32(
+                    quotients,
+                    _mm256_sub_epi32(
+                        total_frequency, frequencies))),
+            cumulatives);
+        lane_states = _mm256_blendv_epi8(
+            lane_states, updated_states, entropy_lanes);
+        _mm256_storeu_si256(
+            reinterpret_cast<__m256i*>(
+                states->data() + group_start + subgroup_start),
+            lane_states);
+        alignas(32) std::array<uint32_t, 8> subgroup_byte_cts;
+        _mm256_store_si256(
+            reinterpret_cast<__m256i*>(
+                subgroup_byte_cts.data()),
+            emitted_byte_cts);
+        for (uint32_t lane = 0; lane != valid_lane_ct; ++lane) {
+          emitted_byte_ct_array[subgroup_start + lane] =
+              subgroup_byte_cts[lane];
+        }
+      }
+
+      // Match BuildInterleavedPayloadDirectMode() exactly: reverse decoder
+      // refill layers, then reverse lane order.  The complete reverse_payload
+      // is reversed once when serialized.
+      for (uint32_t layer_plus_one = maximum_emitted_byte_ct;
+           layer_plus_one; --layer_plus_one) {
+        const uint32_t decoder_layer = layer_plus_one - 1;
+        for (uint32_t lane = group_lane_ct; lane;) {
+          --lane;
+          const uint32_t emitted_byte_ct =
+              emitted_byte_ct_array[lane];
+          if (emitted_byte_ct <= decoder_layer) {
+            continue;
+          }
+          reverse_payload->push_back(
+              emitted_layers[
+                  emitted_byte_ct - 1 - decoder_layer][lane]);
+        }
+      }
+
+      if (!group_start) {
+        break;
+      }
+      group_start -= 16;
+    }
+    if (!first_sample) {
+      break;
+    }
+    first_sample -= kStateCt;
+  }
+  return true;
+}
+
+template <RecordMode kMode>
+PGEN_RANS_TARGET_AVX2
+bool BuildInterleavedPayloadDirectForModeAvx212(
+    const uint64_t* target, const uint64_t* reference1,
+    const uint64_t* reference2, uint32_t sample_ct,
+    const VectorEncodeModel12& encode_model,
+    std::vector<uint32_t>* states,
+    std::vector<uint8_t>* reverse_payload, std::string* error) {
+  if (states->size() == 32) {
+    return BuildInterleavedPayloadDirectModeAvx212<kMode, 32>(
+        target, reference1, reference2, sample_ct, encode_model,
+        states, reverse_payload, error);
+  }
+  return BuildInterleavedPayloadDirectModeAvx212<kMode, 16>(
+      target, reference1, reference2, sample_ct, encode_model,
+      states, reverse_payload, error);
+}
+
+PGEN_RANS_TARGET_AVX2
+bool BuildInterleavedPayloadDirectAvx212(
+    const uint64_t* target, const uint64_t* reference1,
+    const uint64_t* reference2, uint32_t sample_ct,
+    RecordMode mode, const Model& model,
+    const std::array<std::array<RansEncoderSymbol, 4>, 16>& encoders,
+    std::vector<uint32_t>* states,
+    std::vector<uint8_t>* reverse_payload, std::string* error) {
+  VectorEncodeModel12 encode_model;
+  BuildVectorEncodeModel12(model, encoders, &encode_model);
+  switch (mode) {
+    case RecordMode::kMarginal:
+      return BuildInterleavedPayloadDirectForModeAvx212<
+          RecordMode::kMarginal>(
+          target, reference1, reference2, sample_ct, encode_model,
+          states, reverse_payload, error);
+    case RecordMode::kOneReference:
+      return BuildInterleavedPayloadDirectForModeAvx212<
+          RecordMode::kOneReference>(
+          target, reference1, reference2, sample_ct, encode_model,
+          states, reverse_payload, error);
+    case RecordMode::kTwoReference:
+      return BuildInterleavedPayloadDirectForModeAvx212<
+          RecordMode::kTwoReference>(
+          target, reference1, reference2, sample_ct, encode_model,
+          states, reverse_payload, error);
+  }
+  SetError("Invalid conditional-rANS record mode.", error);
+  return false;
+}
 #endif
 
 bool BuildInterleavedPayloadDirect(
@@ -1424,17 +1852,28 @@ bool BuildInterleavedPayloadDirect(
     std::string* error) {
   g_last_encode_kernel = EncodeKernel::kScalar;
 #if PGEN_RANS_X86_RUNTIME_DISPATCH
-  const bool eligible_for_avx512 =
+  const bool eligible_for_vector_encoder =
       (scale_bits == kDefaultScaleBits) &&
       ((states->size() == 16) || (states->size() == 32));
   const bool force_avx512 =
       g_encode_kernel_override == EncodeKernel::kAvx512;
-  if (eligible_for_avx512 && HasAvx512Encoder() &&
+  if (eligible_for_vector_encoder && HasAvx512Encoder() &&
       (force_avx512 ||
        ((g_encode_kernel_override == EncodeKernel::kAuto) &&
         (sample_ct >= kAvx512MinimumSampleCt)))) {
     g_last_encode_kernel = EncodeKernel::kAvx512;
     return BuildInterleavedPayloadDirectAvx51212(
+        target, reference1, reference2, sample_ct, mode, model,
+        encoders, states, reverse_payload, error);
+  }
+  const bool force_avx2 =
+      g_encode_kernel_override == EncodeKernel::kAvx2;
+  if (eligible_for_vector_encoder && HasAvx2Encoder() &&
+      (force_avx2 ||
+       ((g_encode_kernel_override == EncodeKernel::kAuto) &&
+        (sample_ct >= kAvx2MinimumSampleCt)))) {
+    g_last_encode_kernel = EncodeKernel::kAvx2;
+    return BuildInterleavedPayloadDirectAvx212(
         target, reference1, reference2, sample_ct, mode, model,
         encoders, states, reverse_payload, error);
   }
@@ -3194,6 +3633,12 @@ bool EncodeKernelSupported(EncodeKernel kernel) {
     case EncodeKernel::kAuto:
     case EncodeKernel::kScalar:
       return true;
+    case EncodeKernel::kAvx2:
+#if PGEN_RANS_X86_RUNTIME_DISPATCH
+      return HasAvx2Encoder();
+#else
+      return false;
+#endif
     case EncodeKernel::kAvx512:
 #if PGEN_RANS_X86_RUNTIME_DISPATCH
       return HasAvx512Encoder();
@@ -3236,6 +3681,7 @@ static bool EncodeRecordImpl(
     uint8_t reference1_idx, uint8_t reference2_idx,
     const uint32_t* context_symbol_counts, const CodecParams& params,
     std::vector<uint8_t>* record, std::string* error) {
+  g_last_encode_kernel = EncodeKernel::kScalar;
   record->clear();
   if ((!target) || (!sample_ct)) {
     SetError("A target and at least one sample are required.", error);
