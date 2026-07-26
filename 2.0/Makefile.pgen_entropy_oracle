@@ -2,14 +2,23 @@
 
 include Makefile
 
+PGENRANS_BUILD_DIR ?= build_pgen_rans
+PGENORACLE_OBJ_DIR := $(PGENRANS_BUILD_DIR)/oracle_obj
+PGENRANS_BIN_DIR := $(PGENRANS_BUILD_DIR)/bin
 PGENORACLESRC = $(PGENLIB_CCSRC) pgen_entropy_oracle.cc
-PGENORACLEOBJ = $(PGENORACLESRC:.cc=.o)
+PGENORACLEOBJ = $(addprefix $(PGENORACLE_OBJ_DIR)/,\
+	$(PGENORACLESRC:.cc=.o))
 
 .PHONY: pgen_entropy_oracle
 
-pgen_entropy_oracle: $(PGENORACLEOBJ)
-	$(MKDIR) -p bin
-	$(CXX) $(PGENORACLEOBJ) \
-		-o bin/pgen_entropy_oracle $(LDFLAGS)
+$(PGENORACLE_OBJ_DIR)/%.o: %.cc
+	$(MKDIR) -p $(dir $@)
+	$(CXX) -c $(CXXFLAGS) $(ARCH32) -o $@ $<
 
-CLEAN += bin/pgen_entropy_oracle
+pgen_entropy_oracle: $(PGENORACLEOBJ)
+	$(MKDIR) -p $(PGENRANS_BIN_DIR)
+	$(CXX) $(PGENORACLEOBJ) \
+		-o $(PGENRANS_BIN_DIR)/pgen_entropy_oracle $(LDFLAGS)
+
+CLEAN += $(PGENORACLEOBJ) \
+	$(PGENRANS_BIN_DIR)/pgen_entropy_oracle

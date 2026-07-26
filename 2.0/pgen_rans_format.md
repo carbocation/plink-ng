@@ -220,7 +220,7 @@ Build from `2.0/`:
 make -f Makefile.pgen_rans pgen_rans
 ```
 
-CPU consumers can instead build `bin/libpgen_rans.a`:
+CPU consumers can instead build `build_pgen_rans/lib/libpgen_rans.a`:
 
 ```sh
 make -f Makefile.pgen_rans libpgen_rans
@@ -271,7 +271,7 @@ general-purpose PGEN storage mode as their working format.
 Encode an unphased hardcall PGEN, including exact multiallelic calls:
 
 ```sh
-bin/pgen_rans encode cohort.pgen cohort-rans.pgen \
+build_pgen_rans/bin/pgen_rans encode cohort.pgen cohort-rans.pgen \
   --pvar cohort.pvar \
   --block-variants 128 \
   --anchors 32 \
@@ -285,14 +285,15 @@ PVAR so allele counts are available before PGEN reader initialization.
 Then perform a byte-for-byte packed-hardcall and exact sparse-patch round trip:
 
 ```sh
-bin/pgen_rans verify cohort.pgen cohort-rans.pgen --pvar cohort.pvar
+build_pgen_rans/bin/pgen_rans verify \
+  cohort.pgen cohort-rans.pgen --pvar cohort.pvar
 ```
 
 `inspect` validates the PGEN and summarizes its record modes without
 decoding genotypes:
 
 ```sh
-bin/pgen_rans inspect cohort-rans.pgen
+build_pgen_rans/bin/pgen_rans inspect cohort-rans.pgen
 ```
 
 `benchmark` deterministically samples block strata, decodes each block with a
@@ -300,7 +301,7 @@ persistent CPU worker pool, and compares every packed output word with
 `PgrGet()` from the source PGEN:
 
 ```sh
-bin/pgen_rans benchmark cohort.pgen cohort-rans.pgen \
+build_pgen_rans/bin/pgen_rans benchmark cohort.pgen cohort-rans.pgen \
   --threads 16 \
   --blocks 80 \
   --iterations 3
@@ -322,7 +323,7 @@ On a CUDA machine, build and run the exact CPU/GPU comparison with:
 
 ```sh
 make -f Makefile.pgen_rans_cuda CUDA_ARCH=80
-bin/pgen_rans_cuda_benchmark cohort-rans.pgen \
+build_pgen_rans/bin/pgen_rans_cuda_benchmark cohort-rans.pgen \
   --blocks 80 \
   --batch-blocks 8 \
   --iterations 3 \

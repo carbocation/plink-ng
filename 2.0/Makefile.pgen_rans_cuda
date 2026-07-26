@@ -8,23 +8,35 @@ CUDA_ARCH ?= 80
 CUDA_ARCHS ?= $(CUDA_ARCH)
 CUDA_GENCODE ?= $(foreach arch,$(CUDA_ARCHS),\
 	-gencode arch=compute_$(arch),code=sm_$(arch))
-PGENRANSCUDAOBJ = pgen_rans_codec.o pgen_rans_container.o \
-	pgen_rans_cpu.o pgen_rans_cuda.o pgen_rans_cuda_benchmark.o
+PGENRANS_BUILD_DIR ?= build_pgen_rans
+PGENRANS_CUDA_OBJ_DIR := $(PGENRANS_BUILD_DIR)/cuda_obj
+PGENRANS_BIN_DIR := $(PGENRANS_BUILD_DIR)/bin
+PGENRANSCUDAOBJ = $(addprefix $(PGENRANS_CUDA_OBJ_DIR)/,\
+	pgen_rans_codec.o pgen_rans_container.o pgen_rans_cpu.o \
+	pgen_rans_cuda.o pgen_rans_cuda_benchmark.o)
 
 .PHONY: pgen_rans_cuda_benchmark
 
-pgen_rans_cuda.o: pgen_rans_cuda.cu pgen_rans_cuda.h
+$(PGENRANS_CUDA_OBJ_DIR)/%.o: %.cc
+	$(MKDIR) -p $(dir $@)
+	$(CXX) -c $(CXXFLAGS) $(ARCH32) -o $@ $<
+
+$(PGENRANS_CUDA_OBJ_DIR)/pgen_rans_cuda.o: pgen_rans_cuda.cu pgen_rans_cuda.h
+	$(MKDIR) -p $(dir $@)
 	$(NVCC) -O3 -std=c++17 -lineinfo $(CUDA_GENCODE) \
 		-Xcompiler -Wall,-Wextra,-Wshadow \
 		-I. -c $< -o $@
 
-pgen_rans_cuda_benchmark.o: pgen_rans_cuda_benchmark.cc
+$(PGENRANS_CUDA_OBJ_DIR)/pgen_rans_cuda_benchmark.o: \
+		pgen_rans_cuda_benchmark.cc
+	$(MKDIR) -p $(dir $@)
 	$(CXX) -O3 -std=c++17 -Wall -Wextra -Wshadow \
 		-I$(CUDAROOT)/include -I. -c $< -o $@
 
 pgen_rans_cuda_benchmark: $(PGENRANSCUDAOBJ)
-	$(MKDIR) -p bin
+	$(MKDIR) -p $(PGENRANS_BIN_DIR)
 	$(NVCC) -std=c++17 $(CUDA_GENCODE) $(PGENRANSCUDAOBJ) \
-		-o bin/pgen_rans_cuda_benchmark -lpthread
+		-o $(PGENRANS_BIN_DIR)/pgen_rans_cuda_benchmark -lpthread
 
-CLEAN += bin/pgen_rans_cuda_benchmark
+CLEAN += $(PGENRANSCUDAOBJ) \
+	$(PGENRANS_BIN_DIR)/pgen_rans_cuda_benchmark

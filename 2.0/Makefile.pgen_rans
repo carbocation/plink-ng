@@ -2,49 +2,66 @@
 
 include Makefile
 
-PGENRANSCODECOBJ = pgen_rans_codec.o
-PGENRANSTESTOBJ = $(PGENRANSCODECOBJ) pgen_rans_codec_test.o
-PGENRANSCONTAINEROBJ = pgen_rans_container.o pgen_rans_cpu.o
+PGENRANS_BUILD_DIR ?= build_pgen_rans
+PGENRANS_OBJ_DIR := $(PGENRANS_BUILD_DIR)/obj
+PGENRANS_BIN_DIR := $(PGENRANS_BUILD_DIR)/bin
+PGENRANS_LIB_DIR := $(PGENRANS_BUILD_DIR)/lib
+
+PGENRANSCODECOBJ = $(PGENRANS_OBJ_DIR)/pgen_rans_codec.o
+PGENRANSTESTOBJ = $(PGENRANSCODECOBJ) \
+	$(PGENRANS_OBJ_DIR)/pgen_rans_codec_test.o
+PGENRANSCONTAINEROBJ = $(addprefix $(PGENRANS_OBJ_DIR)/,\
+	pgen_rans_container.o pgen_rans_cpu.o)
 PGENRANSLIBOBJ = $(PGENRANSCODECOBJ) $(PGENRANSCONTAINEROBJ) \
-	pgen_rans_encode.o \
-	pgen_rans_reader.o
+	$(addprefix $(PGENRANS_OBJ_DIR)/,\
+	pgen_rans_encode.o pgen_rans_reader.o)
 PGENRANSCONTAINERTESTOBJ = $(PGENRANSCODECOBJ) \
-	$(PGENRANSCONTAINEROBJ) pgen_rans_reader.o \
-	pgen_rans_container_test.o
+	$(PGENRANSCONTAINEROBJ) \
+	$(addprefix $(PGENRANS_OBJ_DIR)/,\
+	pgen_rans_reader.o pgen_rans_container_test.o)
 PGENRANSTOOLSRC = $(PGENLIB_CCSRC) pgen_rans_codec.cc \
 	pgen_rans_container.cc pgen_rans_cpu.cc pgen_rans_encode.cc \
 	pgen_rans_tool.cc
-PGENRANSTOOLOBJ = $(PGENRANSTOOLSRC:.cc=.o)
+PGENRANSTOOLOBJ = $(addprefix $(PGENRANS_OBJ_DIR)/,\
+	$(PGENRANSTOOLSRC:.cc=.o))
 
 # The rANS hot loop benefits measurably from O3 scheduling on
 # latency-bound AVX-512 targets.  Keep the rest of PLINK's flags unchanged.
-pgen_rans_codec.o: CXXFLAGS += -O3
+$(PGENRANS_OBJ_DIR)/pgen_rans_codec.o: CXXFLAGS += -O3
+
+$(PGENRANS_OBJ_DIR)/%.o: %.cc
+	$(MKDIR) -p $(dir $@)
+	$(CXX) -c $(CXXFLAGS) $(ARCH32) -o $@ $<
 
 .PHONY: libpgen_rans pgen_rans pgen_rans_codec_test \
 	pgen_rans_container_test test
 
 libpgen_rans: $(PGENRANSLIBOBJ)
-	$(MKDIR) -p bin
-	$(AR) rcs bin/libpgen_rans.a $(PGENRANSLIBOBJ)
+	$(MKDIR) -p $(PGENRANS_LIB_DIR)
+	$(AR) rcs $(PGENRANS_LIB_DIR)/libpgen_rans.a $(PGENRANSLIBOBJ)
 
 pgen_rans: $(PGENRANSTOOLOBJ)
-	$(MKDIR) -p bin
+	$(MKDIR) -p $(PGENRANS_BIN_DIR)
 	$(CXX) $(PGENRANSTOOLOBJ) \
-		-o bin/pgen_rans $(LDFLAGS)
+		-o $(PGENRANS_BIN_DIR)/pgen_rans $(LDFLAGS)
 
 pgen_rans_codec_test: $(PGENRANSTESTOBJ)
-	$(MKDIR) -p bin
+	$(MKDIR) -p $(PGENRANS_BIN_DIR)
 	$(CXX) $(PGENRANSTESTOBJ) \
-		-o bin/pgen_rans_codec_test $(LDFLAGS)
+		-o $(PGENRANS_BIN_DIR)/pgen_rans_codec_test $(LDFLAGS)
 
 pgen_rans_container_test: $(PGENRANSCONTAINERTESTOBJ)
-	$(MKDIR) -p bin
+	$(MKDIR) -p $(PGENRANS_BIN_DIR)
 	$(CXX) $(PGENRANSCONTAINERTESTOBJ) \
-		-o bin/pgen_rans_container_test $(LDFLAGS)
+		-o $(PGENRANS_BIN_DIR)/pgen_rans_container_test $(LDFLAGS)
 
 test: pgen_rans_codec_test pgen_rans_container_test
-	bin/pgen_rans_codec_test
-	bin/pgen_rans_container_test
+	$(PGENRANS_BIN_DIR)/pgen_rans_codec_test
+	$(PGENRANS_BIN_DIR)/pgen_rans_container_test
 
-CLEAN += bin/libpgen_rans.a bin/pgen_rans bin/pgen_rans_codec_test \
-	bin/pgen_rans_container_test
+CLEAN += $(PGENRANSLIBOBJ) $(PGENRANSTOOLOBJ) $(PGENRANSTESTOBJ) \
+	$(PGENRANSCONTAINERTESTOBJ) \
+	$(PGENRANS_LIB_DIR)/libpgen_rans.a \
+	$(PGENRANS_BIN_DIR)/pgen_rans \
+	$(PGENRANS_BIN_DIR)/pgen_rans_codec_test \
+	$(PGENRANS_BIN_DIR)/pgen_rans_container_test

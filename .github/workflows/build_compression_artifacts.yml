@@ -81,7 +81,7 @@ jobs:
           grep -q AVX2 /tmp/plink2-version.txt
           grep -q Intel /tmp/plink2-version.txt
           2.0/build_dynamic/plink2 --help make-pgen | grep -q 'rans:'
-          2.0/bin/pgen_rans --help
+          2.0/build_pgen_rans/bin/pgen_rans --help
           smoke_prefix="$RUNNER_TEMP/rans-pgen-smoke"
           2.0/build_dynamic/plink2 \
             --pfile 2.0/pgenlibr/inst/extdata/chr21_phase3_start vzs \
@@ -108,7 +108,7 @@ jobs:
             --make-pgen format=rans \
             --threads 2 \
             --out "$smoke_prefix"
-          2.0/bin/pgen_rans verify \
+          2.0/build_pgen_rans/bin/pgen_rans verify \
             "$smoke_prefix-input.pgen" "$smoke_prefix.pgen" \
             --pvar "$smoke_prefix.pvar"
           test "$(od -An -tu1 -j2 -N1 "$smoke_prefix.pgen" |
@@ -208,9 +208,9 @@ jobs:
             "$artifact_dir/bin/plink2"
           install -m 755 2.0/build_dynamic/pgen_compress \
             "$artifact_dir/bin/pgen_compress"
-          install -m 755 2.0/bin/pgen_rans \
+          install -m 755 2.0/build_pgen_rans/bin/pgen_rans \
             "$artifact_dir/bin/pgen_rans"
-          install -m 644 2.0/bin/libpgen_rans.a \
+          install -m 644 2.0/build_pgen_rans/lib/libpgen_rans.a \
             "$artifact_dir/lib/libpgen_rans.a"
           install -m 644 \
             2.0/pgen_rans_codec.h \
@@ -308,7 +308,7 @@ jobs:
           fi
           otool -L 2.0/build_dynamic/plink2 | grep -q Accelerate
           2.0/build_dynamic/plink2 --help make-pgen | grep -q 'rans:'
-          2.0/bin/pgen_rans --help
+          2.0/build_pgen_rans/bin/pgen_rans --help
           smoke_prefix="$RUNNER_TEMP/rans-pgen-smoke"
           2.0/build_dynamic/plink2 \
             --pfile 2.0/pgenlibr/inst/extdata/chr21_phase3_start vzs \
@@ -335,7 +335,7 @@ jobs:
             --make-pgen format=rans \
             --threads 2 \
             --out "$smoke_prefix"
-          2.0/bin/pgen_rans verify \
+          2.0/build_pgen_rans/bin/pgen_rans verify \
             "$smoke_prefix-input.pgen" "$smoke_prefix.pgen" \
             --pvar "$smoke_prefix.pvar"
           test "$(od -An -tu1 -j2 -N1 "$smoke_prefix.pgen" |
@@ -431,9 +431,9 @@ jobs:
             "$artifact_dir/bin/plink2"
           install -m 755 2.0/build_dynamic/pgen_compress \
             "$artifact_dir/bin/pgen_compress"
-          install -m 755 2.0/bin/pgen_rans \
+          install -m 755 2.0/build_pgen_rans/bin/pgen_rans \
             "$artifact_dir/bin/pgen_rans"
-          install -m 644 2.0/bin/libpgen_rans.a \
+          install -m 644 2.0/build_pgen_rans/lib/libpgen_rans.a \
             "$artifact_dir/lib/libpgen_rans.a"
           install -m 644 \
             2.0/pgen_rans_codec.h \
@@ -493,9 +493,9 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          2.0/bin/pgen_rans_cuda_benchmark --help
+          2.0/build_pgen_rans/bin/pgen_rans_cuda_benchmark --help
           /usr/local/cuda/bin/cuobjdump --list-elf \
-            2.0/bin/pgen_rans_cuda_benchmark \
+            2.0/build_pgen_rans/bin/pgen_rans_cuda_benchmark \
             | tee /tmp/cuda-images.txt
           grep -q sm_75 /tmp/cuda-images.txt
           grep -q sm_80 /tmp/cuda-images.txt
@@ -506,7 +506,8 @@ jobs:
           set -euo pipefail
           artifact_dir="$RUNNER_TEMP/pgen-rans-cuda-sm75-sm80"
           mkdir -p "$artifact_dir/bin"
-          install -m 755 2.0/bin/pgen_rans_cuda_benchmark \
+          install -m 755 \
+            2.0/build_pgen_rans/bin/pgen_rans_cuda_benchmark \
             "$artifact_dir/bin/pgen_rans_cuda_benchmark"
           install -m 644 1.9/LICENSE "$artifact_dir/LICENSE"
           {

@@ -57,7 +57,7 @@ modifying the upstream makefiles or adding the oracle to `make all`.
 ## Example
 
 ```sh
-bin/pgen_entropy_oracle cohort.pgen \
+build_pgen_rans/bin/pgen_entropy_oracle cohort.pgen \
   --pvar cohort.pvar \
   --block-variants 128 \
   --anchors 8 \
@@ -84,7 +84,7 @@ spaced strata across the file, so block-local LD is retained while most
 genotype records are never read:
 
 ```sh
-bin/pgen_entropy_oracle cohort.pgen \
+build_pgen_rans/bin/pgen_entropy_oracle cohort.pgen \
   --pvar cohort.pvar \
   --block-variants 128 \
   --anchors 32 \
@@ -105,7 +105,7 @@ local scratch:
 ```sh
 make -C 2.0 -f Makefile.pgen_entropy_oracle
 
-2.0/bin/pgen_entropy_oracle /local/1kg-unphased.pgen \
+2.0/build_pgen_rans/bin/pgen_entropy_oracle /local/1kg-unphased.pgen \
   --pvar /local/1kg-unphased.pvar \
   --block-variants 128 \
   --anchors 8 \
