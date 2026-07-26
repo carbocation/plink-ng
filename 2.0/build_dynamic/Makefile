@@ -197,7 +197,8 @@ all: plink2$(SFX) pgen_compress$(SFX)
 plink2$(SFX): $(CSRC2) $(ZCSRC2) $(ZSSRC2) $(CCSRC2) ../plink2_cpu.cc
 	$(CC) $(CFLAGS) $(CSRC2) -c
 	$(SKIP_STATIC_ZSTD) $(CC) $(ZCFLAGS) $(ZCSRC2) $(ZSSRC2) -c
-	$(CXX) $(CXXFLAGS) $(CCSRC2) -c
+	$(CXX) $(CXXFLAGS) $(CCSRC2_COLD) -c
+	$(CXX) $(CXXFLAGS) -O3 $(PGEN_RANS_HOT_CCSRC2) -c
 	$(CXX) $(CPUCHECK_FLAGS) ../plink2_cpu.cc -c
 	$(CXX) $(OBJL) plink2_cpu.o $(ARCH32) -o $@ $(BLASFLAGS) $(LINKFLAGS)
 

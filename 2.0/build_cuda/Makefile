@@ -157,7 +157,8 @@ plink2: $(CSRC2) $(ZCSRC2) $(ZSSRC2) $(CCSRC2) ../plink2_cpu.cc ../cuda/plink2_m
 	$(CC) $(CFLAGS) $(CSRC2) -c
 	$(SKIP_STATIC_ZSTD) gcc $(ZCFLAGS) $(ZCSRC2) $(ZSSRC2) -c
 	nvcc -cudart shared ../cuda/plink2_matrix_cuda.cu -c
-	$(CXX) $(CXXFLAGS) $(CCSRC2) -c
+	$(CXX) $(CXXFLAGS) $(CCSRC2_COLD) -c
+	$(CXX) $(CXXFLAGS) -O3 $(PGEN_RANS_HOT_CCSRC2) -c
 	$(CXX) $(CPUCHECK_FLAGS) ../plink2_cpu.cc -c
 	$(CXX) $(OBJL) plink2_cpu.o plink2_matrix_cuda.o $(ARCH32) -o plink2 $(BLASFLAGS) $(LINKFLAGS)
 

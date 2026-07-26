@@ -78,7 +78,8 @@ all: plink2 pgen_compress
 plink2: $(CSRC2) $(ZCSRC2) $(ZSSRC2) $(CCSRC2) ../plink2_cpu.cc
 	$(CC) $(CFLAGS) $(CSRC2) -c
 	$(CC) $(ZCFLAGS) $(ZCSRC2) $(ZSSRC2) -c
-	$(CXX) $(CXXFLAGS) $(CCSRC2) -c
+	$(CXX) $(CXXFLAGS) $(CCSRC2_COLD) -c
+	$(CXX) $(CXXFLAGS) -O3 $(PGEN_RANS_HOT_CCSRC2) -c
 	$(CXX) $(CPUCHECK_FLAGS) ../plink2_cpu.cc -c
 	$(FC) $(OBJL) plink2_cpu.o -o plink2 $(BLASFLAGS) $(LINKFLAGS)
 

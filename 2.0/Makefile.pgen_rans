@@ -32,6 +32,7 @@ PGENRANSTOOLOBJ = $(addprefix $(PGENRANS_OBJ_DIR)/,\
 # Keep the rest of PLINK's flags unchanged.
 $(PGENRANS_OBJ_DIR)/pgen_rans_codec.o: CXXFLAGS += -O3
 $(PGENRANS_OBJ_DIR)/pgen_rans_hybrid.o: CXXFLAGS += -O3
+$(PGENRANS_OBJ_DIR)/pgen_rans_encode.o: CXXFLAGS += -O3
 
 $(PGENRANS_OBJ_DIR)/%.o: %.cc
 	$(MKDIR) -p $(dir $@)

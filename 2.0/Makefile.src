@@ -133,6 +133,10 @@ CSRC2 = $(foreach fname,$(CSRC),../$(fname))
 ZCSRC2 = $(foreach fname,$(ZCSRC),../$(fname))
 ZSSRC2 = $(foreach fname,$(ZSSRC),../$(fname))
 CCSRC2 = $(foreach fname,$(CCSRC),../$(fname))
+PGEN_RANS_HOT_CCSRC2 = ../pgen_rans_codec.cc \
+                       ../pgen_rans_hybrid.cc \
+                       ../pgen_rans_encode.cc
+CCSRC2_COLD = $(filter-out $(PGEN_RANS_HOT_CCSRC2),$(CCSRC2))
 PGENLIB_CCSRC2 = $(foreach fname,$(PGENLIB_CCSRC),../$(fname))
 PLINK2LIB_CCSRC2 = $(foreach fname,$(PLINK2LIB_CCSRC),../$(fname))
 TEXTLIB_CCSRC2 = $(foreach fname,$(TEXTLIB_CCSRC),../$(fname))
