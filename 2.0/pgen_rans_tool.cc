@@ -731,11 +731,13 @@ int Encode(const Options& opts) {
   params.thread_ct = opts.thread_ct;
   params.enable_alternate_records = opts.enable_alternate_records;
   EncodeStats stats;
+  printf("Encoding %s ... ", opts.output_fname.c_str());
+  fflush(stdout);
   if (EncodePgenRans(opts.output_fname, input, params, &stats, &error)) {
     fprintf(stderr, "\nError: %s\n", error.c_str());
     return 1;
   }
-  printf("\nConditional-rANS encode complete\n");
+  printf("done.\n\nConditional-rANS encode complete\n");
   printf("  samples:                 %u\n", pgen.sample_ct());
   printf("  variants:                %u\n", stats.variant_ct);
   printf("  blocks:                  %u\n", stats.block_ct);

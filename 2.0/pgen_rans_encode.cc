@@ -727,6 +727,11 @@ PglErr EncodePgenRans(const std::string& output_path,
     return kPglRetNomem;
   }
 
+  fputs("0%", stdout);
+  fflush(stdout);
+  uint32_t progress_char_ct = 2;
+  uint32_t next_progress_variant_ct = static_cast<uint32_t>(
+      (static_cast<uint64_t>(input.variant_ct) + 99) / 100);
   uint32_t processed_variant_ct = 0;
   const auto start_time = std::chrono::steady_clock::now();
   PglErr reterr = kPglRetSuccess;
@@ -877,12 +882,23 @@ PglErr EncodePgenRans(const std::string& output_path,
       goto cleanup;
     }
     processed_variant_ct += block_range.len;
-    if (!(processed_variant_ct % 10000) ||
-        (processed_variant_ct == input.variant_ct)) {
-      fprintf(stderr, "\rEncoded %u/%u variants (%.1f%%).",
-              processed_variant_ct, input.variant_ct,
-              100.0 * processed_variant_ct / input.variant_ct);
-      fflush(stderr);
+    if ((processed_variant_ct != input.variant_ct) &&
+        (processed_variant_ct >= next_progress_variant_ct)) {
+      const uint32_t progress_pct = static_cast<uint32_t>(
+          (static_cast<uint64_t>(processed_variant_ct) * 100) /
+          input.variant_ct);
+      for (uint32_t char_idx = 0; char_idx != progress_char_ct;
+           ++char_idx) {
+        fputc('\b', stdout);
+      }
+      progress_char_ct =
+          static_cast<uint32_t>(printf("%u%%", progress_pct));
+      fflush(stdout);
+      next_progress_variant_ct = static_cast<uint32_t>(
+          (static_cast<uint64_t>(progress_pct + 1) *
+               input.variant_ct +
+           99) /
+          100);
     }
   }
   if (!writer.Close(error)) {
@@ -894,6 +910,11 @@ PglErr EncodePgenRans(const std::string& output_path,
           std::chrono::steady_clock::now() - start_time)
           .count();
   stats->output_bytes = FileSize(output_path);
+  for (uint32_t char_idx = 0; char_idx != progress_char_ct;
+       ++char_idx) {
+    fputc('\b', stdout);
+  }
+  fflush(stdout);
 
 cleanup:
   aligned_free(patch_10_vals);

@@ -116,16 +116,17 @@ PglErr MakePgen(
   EncodeStats stats;
   std::string error;
   snprintf(outname_end, kMaxOutfnameExtBlen, ".pgen");
-  logprintfww5("--make-pgen format=rans to %s ...\n", outname);
+  logprintfww5("--make-pgen format=rans to %s ... ", outname);
   const PglErr reterr =
       EncodePgenRans(outname, input, params, &stats, &error);
   *outname_end = '\0';
   if (unlikely(reterr)) {
+    logputs("\n");
     logerrprintfww(
         "Error: --make-pgen format=rans failed: %s\n", error.c_str());
     return reterr;
   }
-  logputs("\n");
+  logputs("done.\n");
   logprintf(
       "Conditional-rANS encode complete: %u sample%s, %u variant%s, "
       "%u block%s.\n",
