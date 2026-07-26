@@ -179,8 +179,20 @@ bool EncodeRawRecord(const uint64_t* target, uint32_t sample_ct,
     return false;
   }
   record->clear();
-  record->reserve(1 + (static_cast<size_t>(sample_ct) + 3) / 4);
+  const size_t payload_byte_ct =
+      (static_cast<size_t>(sample_ct) + 3) / 4;
   record->push_back(kRawPackedRecordFlag);
+#if defined(_WIN32) || \
+    (defined(__BYTE_ORDER__) && defined(__ORDER_LITTLE_ENDIAN__) && \
+     (__BYTE_ORDER__ == __ORDER_LITTLE_ENDIAN__))
+  record->resize(1 + payload_byte_ct);
+  memcpy(record->data() + 1, target, payload_byte_ct);
+  if (sample_ct % 4) {
+    record->back() &= static_cast<uint8_t>(
+        (1U << (2 * (sample_ct % 4))) - 1);
+  }
+#else
+  record->reserve(1 + payload_byte_ct);
   uint8_t packed_byte = 0;
   for (uint32_t sample_idx = 0; sample_idx != sample_ct; ++sample_idx) {
     packed_byte |= static_cast<uint8_t>(
@@ -191,13 +203,15 @@ bool EncodeRawRecord(const uint64_t* target, uint32_t sample_ct,
       packed_byte = 0;
     }
   }
+#endif
   return true;
 }
 
-bool EncodeSparsePredictorRecord(
+static bool EncodeSparsePredictorRecordImpl(
     const uint64_t* target, const uint64_t* reference1,
     const uint64_t* reference2, uint32_t sample_ct, RecordMode mode,
     uint8_t reference1_idx, uint8_t reference2_idx,
+    const uint32_t* context_symbol_counts,
     std::vector<uint8_t>* record, std::string* error) {
   if ((!target) || (!sample_ct) || (!record) ||
       ((mode != RecordMode::kMarginal) && (!reference1)) ||
@@ -208,24 +222,47 @@ bool EncodeSparsePredictorRecord(
   }
   const uint32_t row_ct = RowCt(mode);
   std::array<std::array<uint32_t, 4>, 16> counts = {};
-  for (uint32_t sample_idx = 0; sample_idx != sample_ct; ++sample_idx) {
-    const uint32_t context =
-        ContextIndex(mode, reference1, reference2, sample_idx);
-    ++counts[context][GetPackedGenotype(target, sample_idx)];
+  if (context_symbol_counts) {
+    uint64_t counted_sample_ct = 0;
+    for (uint32_t context = 0; context != row_ct; ++context) {
+      for (uint32_t symbol = 0; symbol != 4; ++symbol) {
+        const uint32_t count =
+            context_symbol_counts[4 * context + symbol];
+        counts[context][symbol] = count;
+        counted_sample_ct += count;
+      }
+    }
+    if (counted_sample_ct != sample_ct) {
+      SetError("Supplied sparse model counts do not match sample count.",
+               error);
+      return false;
+    }
+  } else {
+    for (uint32_t sample_idx = 0; sample_idx != sample_ct; ++sample_idx) {
+      const uint32_t context =
+          ContextIndex(mode, reference1, reference2, sample_idx);
+      ++counts[context][GetPackedGenotype(target, sample_idx)];
+    }
   }
   std::array<uint8_t, 16> predictions = {};
+  uint32_t expected_exception_ct = 0;
   for (uint32_t context = 0; context != row_ct; ++context) {
+    uint32_t row_total = counts[context][0];
     uint32_t best_count = counts[context][0];
     for (uint32_t symbol = 1; symbol != 4; ++symbol) {
+      row_total += counts[context][symbol];
       if (counts[context][symbol] > best_count) {
         predictions[context] = static_cast<uint8_t>(symbol);
         best_count = counts[context][symbol];
       }
     }
+    expected_exception_ct += row_total - best_count;
   }
 
   std::vector<uint32_t> exception_ids;
   std::vector<uint8_t> exception_values;
+  exception_ids.reserve(expected_exception_ct);
+  exception_values.reserve(expected_exception_ct);
   for (uint32_t sample_idx = 0; sample_idx != sample_ct; ++sample_idx) {
     const uint32_t context =
         ContextIndex(mode, reference1, reference2, sample_idx);
@@ -280,6 +317,31 @@ bool EncodeSparsePredictorRecord(
             exception_values[idx] << (2 * (idx % 4)));
   }
   return true;
+}
+
+bool EncodeSparsePredictorRecord(
+    const uint64_t* target, const uint64_t* reference1,
+    const uint64_t* reference2, uint32_t sample_ct, RecordMode mode,
+    uint8_t reference1_idx, uint8_t reference2_idx,
+    std::vector<uint8_t>* record, std::string* error) {
+  return EncodeSparsePredictorRecordImpl(
+      target, reference1, reference2, sample_ct, mode, reference1_idx,
+      reference2_idx, nullptr, record, error);
+}
+
+bool EncodeSparsePredictorRecordFromCounts(
+    const uint64_t* target, const uint64_t* reference1,
+    const uint64_t* reference2, uint32_t sample_ct, RecordMode mode,
+    uint8_t reference1_idx, uint8_t reference2_idx,
+    const uint32_t* context_symbol_counts, std::vector<uint8_t>* record,
+    std::string* error) {
+  if (!context_symbol_counts) {
+    SetError("Missing supplied sparse model counts.", error);
+    return false;
+  }
+  return EncodeSparsePredictorRecordImpl(
+      target, reference1, reference2, sample_ct, mode, reference1_idx,
+      reference2_idx, context_symbol_counts, record, error);
 }
 
 bool DecodeAlternateRecordToBuffer(

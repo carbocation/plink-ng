@@ -39,6 +39,15 @@ bool EncodeSparsePredictorRecord(
     uint8_t reference1_idx, uint8_t reference2_idx,
     std::vector<uint8_t>* record, std::string* error);
 
+// Reuses an exact row-major context-by-symbol contingency table when it is
+// already available from reference selection.
+bool EncodeSparsePredictorRecordFromCounts(
+    const uint64_t* target, const uint64_t* reference1,
+    const uint64_t* reference2, uint32_t sample_ct, RecordMode mode,
+    uint8_t reference1_idx, uint8_t reference2_idx,
+    const uint32_t* context_symbol_counts, std::vector<uint8_t>* record,
+    std::string* error);
+
 // Decodes and canonically validates a raw or sparse record.  record_size is
 // the base-record size, excluding any multiallelic patch suffix.
 bool DecodeAlternateRecordToBuffer(

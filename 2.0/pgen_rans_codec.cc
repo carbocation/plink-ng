@@ -619,18 +619,116 @@ bool ParseModel(const uint8_t* input, size_t input_size, RecordMode mode,
   return true;
 }
 
-void RansEncodeSymbol(uint32_t cumulative, uint32_t frequency,
-                      uint32_t scale_bits, uint32_t* state,
-                      std::vector<uint8_t>* output) {
-  const uint64_t maximum_state =
+struct RansEncoderSymbol {
+  uint64_t division_multiplier = 0;
+  uint64_t maximum_state = 0;
+  uint32_t frequency = 0;
+  uint32_t cumulative = 0;
+  uint32_t division_pre_shift = 0;
+  uint32_t division_post_shift = 0;
+  uint32_t division_increment = 0;
+};
+
+// Runtime-constant unsigned division from "Labor of Division (Episode III)".
+// Model construction pays the hardware divides once; the sample loop then
+// uses one multiply and shift for both quotient and remainder.
+void BuildDivisionMagic(uint32_t divisor, uint64_t* multiplier,
+                        uint32_t* pre_shift, uint32_t* post_shift,
+                        uint32_t* increment) {
+  if (!(divisor & (divisor - 1))) {
+    uint32_t shift = 0;
+    while (divisor > 1) {
+      divisor >>= 1;
+      ++shift;
+    }
+    *multiplier = 1;
+    *pre_shift = 0;
+    *post_shift = shift;
+    *increment = 0;
+    return;
+  }
+  uint32_t quotient = 0x80000000U / divisor;
+  uint32_t remainder = 0x80000000U - quotient * divisor;
+  uint32_t ceil_log_2_d = 0;
+  for (uint32_t value = divisor - 1; value; value >>= 1) {
+    ++ceil_log_2_d;
+  }
+  uint32_t down_multiplier = 0;
+  uint32_t down_exponent = 0;
+  bool has_magic_down = false;
+  for (uint32_t exponent = 0;; ++exponent) {
+    if (remainder >= divisor - remainder) {
+      quotient = quotient * 2 + 1;
+      remainder = remainder * 2 - divisor;
+    } else {
+      quotient *= 2;
+      remainder *= 2;
+    }
+    if ((exponent >= ceil_log_2_d) ||
+        (divisor - remainder <= (1U << exponent))) {
+      if (exponent < ceil_log_2_d) {
+        *multiplier = quotient + 1;
+        *pre_shift = 0;
+        *post_shift = 32 + exponent;
+        *increment = 0;
+        return;
+      }
+      break;
+    }
+    if ((!has_magic_down) && (remainder <= (1U << exponent))) {
+      has_magic_down = true;
+      down_multiplier = quotient;
+      down_exponent = exponent;
+    }
+  }
+  if (divisor & 1) {
+    *multiplier = down_multiplier;
+    *pre_shift = 0;
+    *post_shift = 32 + down_exponent;
+    *increment = 1;
+    return;
+  }
+  uint32_t shift = 0;
+  uint32_t odd_divisor = divisor;
+  while (!(odd_divisor & 1)) {
+    odd_divisor >>= 1;
+    ++shift;
+  }
+  uint32_t ignored_pre_shift;
+  BuildDivisionMagic(
+      odd_divisor, multiplier, &ignored_pre_shift, post_shift, increment);
+  *pre_shift = shift;
+}
+
+RansEncoderSymbol BuildRansEncoderSymbol(
+    uint32_t cumulative, uint32_t frequency, uint32_t scale_bits) {
+  RansEncoderSymbol result;
+  result.maximum_state =
       ((static_cast<uint64_t>(kRansLowerBound) >> scale_bits) << 8) *
       frequency;
-  while (*state >= maximum_state) {
+  result.frequency = frequency;
+  result.cumulative = cumulative;
+  BuildDivisionMagic(
+      frequency, &result.division_multiplier,
+      &result.division_pre_shift, &result.division_post_shift,
+      &result.division_increment);
+  return result;
+}
+
+PGEN_RANS_ALWAYS_INLINE void RansEncodeSymbol(
+    const RansEncoderSymbol& encoder, uint32_t scale_bits,
+    uint32_t* state, std::vector<uint8_t>* output) {
+  while (*state >= encoder.maximum_state) {
     output->push_back(static_cast<uint8_t>(*state));
     *state >>= 8;
   }
-  *state = ((*state / frequency) << scale_bits) +
-           (*state % frequency) + cumulative;
+  const uint32_t quotient = static_cast<uint32_t>(
+      (encoder.division_multiplier *
+       ((*state >> encoder.division_pre_shift) +
+        encoder.division_increment)) >>
+      encoder.division_post_shift);
+  const uint32_t remainder = *state - quotient * encoder.frequency;
+  *state = (quotient << scale_bits) + remainder + encoder.cumulative;
 }
 
 bool BuildInterleavedPayload(
@@ -1517,11 +1615,12 @@ void SetPackedGenotype(uint64_t* genotypes, uint32_t sample_idx,
          (static_cast<uint64_t>(genotype & 3U) << shift);
 }
 
-bool EncodeRecord(const uint64_t* target, const uint64_t* reference1,
-                  const uint64_t* reference2, uint32_t sample_ct,
-                  RecordMode mode, uint8_t reference1_idx,
-                  uint8_t reference2_idx, const CodecParams& params,
-                  std::vector<uint8_t>* record, std::string* error) {
+static bool EncodeRecordImpl(
+    const uint64_t* target, const uint64_t* reference1,
+    const uint64_t* reference2, uint32_t sample_ct, RecordMode mode,
+    uint8_t reference1_idx, uint8_t reference2_idx,
+    const uint32_t* context_symbol_counts, const CodecParams& params,
+    std::vector<uint8_t>* record, std::string* error) {
   record->clear();
   if ((!target) || (!sample_ct)) {
     SetError("A target and at least one sample are required.", error);
@@ -1543,8 +1642,25 @@ bool EncodeRecord(const uint64_t* target, const uint64_t* reference1,
   }
 
   Model model;
-  if (!BuildModel(target, reference1, reference2, sample_ct, mode,
-                  params.scale_bits, &model, error)) {
+  if (context_symbol_counts) {
+    uint64_t counted_sample_ct = 0;
+    const uint32_t count_ct = 4 * RowCt(mode);
+    for (uint32_t count_idx = 0; count_idx != count_ct; ++count_idx) {
+      counted_sample_ct += context_symbol_counts[count_idx];
+    }
+    if (counted_sample_ct != sample_ct) {
+      SetError("Supplied rANS model counts do not match sample count.",
+               error);
+      return false;
+    }
+  }
+  if (context_symbol_counts
+          ? !BuildModelFromCounts(
+                context_symbol_counts, mode, params.scale_bits, &model,
+                error)
+          : !BuildModel(
+                target, reference1, reference2, sample_ct, mode,
+                params.scale_bits, &model, error)) {
     return false;
   }
   uint8_t flags = static_cast<uint8_t>(mode);
@@ -1560,24 +1676,68 @@ bool EncodeRecord(const uint64_t* target, const uint64_t* reference1,
   }
   SerializeModel(model, mode, record);
   if (!model.has_entropy) {
+    if (context_symbol_counts) {
+      for (uint32_t sample_idx = 0; sample_idx != sample_ct;
+           ++sample_idx) {
+        const uint32_t context = ContextIndex(
+            mode, reference1, reference2, sample_idx);
+        if ((!model.active_symbol_cts[context]) ||
+            (GetPackedGenotype(target, sample_idx) !=
+             model.deterministic_symbols[context])) {
+          SetError("Supplied rANS model counts do not match genotypes.",
+                   error);
+          record->clear();
+          return false;
+        }
+      }
+    }
     return true;
   }
 
   const uint32_t state_ct = std::min(params.state_ct, sample_ct);
   std::vector<uint32_t> states(state_ct, kRansLowerBound);
   std::vector<std::vector<uint8_t>> lane_payloads(state_ct);
+  std::array<std::array<RansEncoderSymbol, 4>, 16> encoders;
+  for (uint32_t context = 0; context != model.row_ct; ++context) {
+    if (model.active_symbol_cts[context] <= 1) {
+      continue;
+    }
+    const ModelRow& row = model.rows[context];
+    for (uint32_t symbol = 0; symbol != 4; ++symbol) {
+      if (row.frequencies[symbol]) {
+        encoders[context][symbol] = BuildRansEncoderSymbol(
+            row.cumulative[symbol], row.frequencies[symbol],
+            params.scale_bits);
+      }
+    }
+  }
   for (uint32_t lane = 0; lane != state_ct; ++lane) {
     uint32_t sample_idx =
         lane + ((sample_ct - 1 - lane) / state_ct) * state_ct;
     while (true) {
       const uint32_t context =
           ContextIndex(mode, reference1, reference2, sample_idx);
-      const ModelRow& row = model.rows[context];
-      if (model.active_symbol_cts[context] > 1) {
+      const uint32_t active_symbol_ct =
+          model.active_symbol_cts[context];
+      if (active_symbol_ct > 1) {
         const uint32_t symbol = GetPackedGenotype(target, sample_idx);
-        RansEncodeSymbol(row.cumulative[symbol], row.frequencies[symbol],
-                         params.scale_bits, &(states[lane]),
+        if (!encoders[context][symbol].frequency) {
+          SetError("Supplied rANS model counts do not match genotypes.",
+                   error);
+          record->clear();
+          return false;
+        }
+        RansEncodeSymbol(encoders[context][symbol], params.scale_bits,
+                         &(states[lane]),
                          &(lane_payloads[lane]));
+      } else if (context_symbol_counts &&
+                 ((!active_symbol_ct) ||
+                  (GetPackedGenotype(target, sample_idx) !=
+                   model.deterministic_symbols[context]))) {
+        SetError("Supplied rANS model counts do not match genotypes.",
+                 error);
+        record->clear();
+        return false;
       }
       if (sample_idx < state_ct) {
         break;
@@ -1600,6 +1760,31 @@ bool EncodeRecord(const uint64_t* target, const uint64_t* reference1,
       record->end(), interleaved_payload.begin(),
       interleaved_payload.end());
   return true;
+}
+
+bool EncodeRecord(const uint64_t* target, const uint64_t* reference1,
+                  const uint64_t* reference2, uint32_t sample_ct,
+                  RecordMode mode, uint8_t reference1_idx,
+                  uint8_t reference2_idx, const CodecParams& params,
+                  std::vector<uint8_t>* record, std::string* error) {
+  return EncodeRecordImpl(
+      target, reference1, reference2, sample_ct, mode, reference1_idx,
+      reference2_idx, nullptr, params, record, error);
+}
+
+bool EncodeRecordFromCounts(
+    const uint64_t* target, const uint64_t* reference1,
+    const uint64_t* reference2, uint32_t sample_ct, RecordMode mode,
+    uint8_t reference1_idx, uint8_t reference2_idx,
+    const uint32_t* context_symbol_counts, const CodecParams& params,
+    std::vector<uint8_t>* record, std::string* error) {
+  if (!context_symbol_counts) {
+    SetError("Missing supplied rANS model counts.", error);
+    return false;
+  }
+  return EncodeRecordImpl(
+      target, reference1, reference2, sample_ct, mode, reference1_idx,
+      reference2_idx, context_symbol_counts, params, record, error);
 }
 
 bool EstimateRecordBytes(const uint32_t* context_symbol_counts,

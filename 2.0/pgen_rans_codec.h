@@ -57,6 +57,16 @@ bool EncodeRecord(const uint64_t* target, const uint64_t* reference1,
                   uint8_t reference2_idx, const CodecParams& params,
                   std::vector<uint8_t>* record, std::string* error);
 
+// Identical to EncodeRecord(), but reuses an exact row-major
+// context-by-symbol contingency table instead of rescanning the genotypes to
+// rebuild the entropy model.  The table must sum to sample_ct.
+bool EncodeRecordFromCounts(
+    const uint64_t* target, const uint64_t* reference1,
+    const uint64_t* reference2, uint32_t sample_ct, RecordMode mode,
+    uint8_t reference1_idx, uint8_t reference2_idx,
+    const uint32_t* context_symbol_counts, const CodecParams& params,
+    std::vector<uint8_t>* record, std::string* error);
+
 bool EstimateRecordBytes(const uint32_t* context_symbol_counts,
                          RecordMode mode, const CodecParams& params,
                          uint64_t* record_bytes, std::string* error);

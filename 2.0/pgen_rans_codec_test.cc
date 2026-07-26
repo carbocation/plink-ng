@@ -17,6 +17,7 @@ using pgen_rans::DecodeRecord;
 using pgen_rans::DecodeRecordToBuffer;
 using pgen_rans::DecodeRecordToBufferFromValidatedBlock;
 using pgen_rans::EncodeRecord;
+using pgen_rans::EncodeRecordFromCounts;
 using pgen_rans::EstimateRecordBytes;
 using pgen_rans::GetPackedGenotype;
 using pgen_rans::GetBaseRecordByteCt;
@@ -100,6 +101,14 @@ void RoundTrip(const std::vector<uint8_t>& target,
     }
     ++counts[4 * context + target[sample_idx]];
   }
+  std::vector<uint8_t> count_reused_record;
+  Expect(EncodeRecordFromCounts(
+             packed_target.data(), reference1_ptr, reference2_ptr,
+             sample_ct, mode, 3, 7, counts.data(), params,
+             &count_reused_record, &error),
+         "count-reusing encode failed: " + error);
+  Expect(record == count_reused_record,
+         "count-reusing encode changed the record");
   uint64_t estimated_bytes;
   Expect(EstimateRecordBytes(counts.data(), mode, params, &estimated_bytes,
                              &error),
@@ -265,6 +274,37 @@ void TestLargeDefaultRoundTrips() {
             RecordMode::kTwoReference, params);
 }
 
+void TestRuntimeDivisionFrequencies() {
+  constexpr uint32_t kSampleCt = 1U << 12;
+  std::vector<uint64_t> packed(
+      PackedWordCt(kSampleCt), 0x5555555555555555ULL);
+  const CodecParams params(16, 12);
+  const uint64_t* no_anchors[1] = {};
+  std::vector<uint8_t> record;
+  std::vector<uint64_t> decoded;
+  std::string error;
+  uint32_t counts[4] = {};
+  for (uint32_t frequency = 1; frequency != kSampleCt; ++frequency) {
+    SetPackedGenotype(packed.data(), frequency - 1, 0);
+    counts[0] = frequency;
+    counts[1] = kSampleCt - frequency;
+    Expect(EncodeRecordFromCounts(
+               packed.data(), nullptr, nullptr, kSampleCt,
+               RecordMode::kMarginal, 0, 0, counts, params, &record,
+               &error),
+           "runtime-division encode failed at frequency " +
+               std::to_string(frequency) + ": " + error);
+    Expect(DecodeRecord(
+               record.data(), record.size(), no_anchors, 0, kSampleCt,
+               params, &decoded, nullptr, &error),
+           "runtime-division decode failed at frequency " +
+               std::to_string(frequency) + ": " + error);
+    Expect(decoded == packed,
+           "runtime-division round-trip mismatch at frequency " +
+               std::to_string(frequency));
+  }
+}
+
 void TestInvalidArguments() {
   const std::vector<uint64_t> genotypes = Pack({0, 1, 2, 3});
   std::vector<uint8_t> record;
@@ -282,6 +322,19 @@ void TestInvalidArguments() {
   Expect(!EncodeRecord(genotypes.data(), nullptr, nullptr, 4,
                        RecordMode::kMarginal, 0, 0, params, &record, &error),
          "invalid scale precision was accepted");
+  params.scale_bits = 12;
+  const uint32_t wrong_counts[4] = {1, 1, 1, 0};
+  Expect(!EncodeRecordFromCounts(
+             genotypes.data(), nullptr, nullptr, 4,
+             RecordMode::kMarginal, 0, 0, wrong_counts, params,
+             &record, &error),
+         "model counts with the wrong sample total were accepted");
+  const uint32_t wrong_support[4] = {4, 0, 0, 0};
+  Expect(!EncodeRecordFromCounts(
+             genotypes.data(), nullptr, nullptr, 4,
+             RecordMode::kMarginal, 0, 0, wrong_support, params,
+             &record, &error),
+         "model counts with the wrong symbol support were accepted");
 }
 
 void TestMultiallelicPatches() {
@@ -431,6 +484,7 @@ int main() {
   TestRandomRoundTrips();
   TestDeterministicRecords();
   TestLargeDefaultRoundTrips();
+  TestRuntimeDivisionFrequencies();
   TestInvalidArguments();
   TestMultiallelicPatches();
   puts("pgen_rans_codec_test: PASS");

@@ -13,6 +13,7 @@ namespace {
 using pgen_rans::DecodeAlternateRecordToBuffer;
 using pgen_rans::EncodeRawRecord;
 using pgen_rans::EncodeSparsePredictorRecord;
+using pgen_rans::EncodeSparsePredictorRecordFromCounts;
 using pgen_rans::GetPackedGenotype;
 using pgen_rans::PackedWordCt;
 using pgen_rans::RecordMetadata;
@@ -69,6 +70,30 @@ void RoundTrip(const std::vector<uint8_t>& target,
              packed_target.data(), reference1_ptr, reference2_ptr,
              target.size(), mode, 2, 5, &record, &error),
          "sparse encode failed: " + error);
+  const uint32_t row_ct =
+      (mode == RecordMode::kMarginal)
+          ? 1
+          : ((mode == RecordMode::kOneReference) ? 4 : 16);
+  std::vector<uint32_t> counts(4 * row_ct, 0);
+  for (uint32_t sample_idx = 0; sample_idx != target.size();
+       ++sample_idx) {
+    uint32_t context = 0;
+    if (mode != RecordMode::kMarginal) {
+      context = reference1[sample_idx];
+    }
+    if (mode == RecordMode::kTwoReference) {
+      context = 4 * context + reference2[sample_idx];
+    }
+    ++counts[4 * context + target[sample_idx]];
+  }
+  std::vector<uint8_t> count_reused_record;
+  Expect(EncodeSparsePredictorRecordFromCounts(
+             packed_target.data(), reference1_ptr, reference2_ptr,
+             target.size(), mode, 2, 5, counts.data(),
+             &count_reused_record, &error),
+         "count-reusing sparse encode failed: " + error);
+  Expect(record == count_reused_record,
+         "count-reusing sparse encode changed the record");
   const uint64_t* anchors[6] = {};
   anchors[2] = packed_reference1.data();
   anchors[5] = packed_reference2.data();

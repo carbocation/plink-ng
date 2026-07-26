@@ -4,6 +4,9 @@
 
 #include <algorithm>
 #include <array>
+#ifdef PGEN_RANS_VERIFY_FAST_COUNTS
+#include <cassert>
+#endif
 #include <atomic>
 #include <chrono>
 #include <cstdio>
@@ -39,6 +42,7 @@ struct AnchorCandidate {
   uint64_t sparse_exception_ct = 0;
   uint32_t ordinal = 0;
   uint32_t offset = 0;
+  std::array<uint32_t, 16> joint_counts = {};
 };
 
 std::vector<VariantBlock> BuildBlocks(
@@ -125,10 +129,44 @@ void CopyPgenPatches(const PgenVariant& pgv, uint16_t allele_ct,
   }
 }
 
-void CountJointGenotypes(const uintptr_t* anchor, const uintptr_t* target,
-                         uint32_t sample_ct, const uint32_t* anchor_counts,
-                         const uint32_t* target_counts,
-                         uint32_t* joint_counts) {
+void BuildGenotypeMasks(uintptr_t genotype_word, uintptr_t valid_mask,
+                        uintptr_t* masks) {
+  const uintptr_t low = genotype_word & valid_mask;
+  const uintptr_t high = (genotype_word >> 1) & valid_mask;
+  masks[0] = (~(low | high)) & valid_mask;
+  masks[1] = low & (~high) & valid_mask;
+  masks[2] = (~low) & high & valid_mask;
+  masks[3] = low & high;
+}
+
+uint32_t MostFrequentGenotype(const uint32_t* counts) {
+  uint32_t result = 0;
+  for (uint32_t genotype = 1; genotype != 4; ++genotype) {
+    if (counts[genotype] > counts[result]) {
+      result = genotype;
+    }
+  }
+  return result;
+}
+
+uint32_t IndependentGenotypes(const uint32_t* counts,
+                              uint32_t baseline,
+                              uint8_t* independent) {
+  uint32_t independent_ct = 0;
+  for (uint32_t genotype = 0; genotype != 4; ++genotype) {
+    if ((genotype != baseline) && counts[genotype]) {
+      independent[independent_ct++] =
+          static_cast<uint8_t>(genotype);
+    }
+  }
+  return independent_ct;
+}
+
+#ifdef PGEN_RANS_VERIFY_FAST_COUNTS
+void CountJointGenotypesReference(
+    const uintptr_t* anchor, const uintptr_t* target,
+    uint32_t sample_ct, const uint32_t* anchor_counts,
+    const uint32_t* target_counts, uint32_t* joint_counts) {
   std::fill(joint_counts, &(joint_counts[16]), 0U);
   const uint32_t word_ct = NypCtToWordCt(sample_ct);
   const uint32_t trailing_sample_ct = sample_ct % kBitsPerWordD2;
@@ -186,10 +224,10 @@ void CountJointGenotypes(const uintptr_t* anchor, const uintptr_t* target,
       joint_counts[14];
 }
 
-void CountTripleGenotypes(const uintptr_t* anchor1,
-                          const uintptr_t* anchor2,
-                          const uintptr_t* target, uint32_t sample_ct,
-                          uint32_t* triple_counts) {
+void CountTripleGenotypesReference(
+    const uintptr_t* anchor1, const uintptr_t* anchor2,
+    const uintptr_t* target, uint32_t sample_ct,
+    uint32_t* triple_counts) {
   std::fill(triple_counts, &(triple_counts[64]), 0U);
   const uint32_t word_ct = NypCtToWordCt(sample_ct);
   const uint32_t trailing_sample_ct = sample_ct % kBitsPerWordD2;
@@ -221,6 +259,330 @@ void CountTripleGenotypes(const uintptr_t* anchor1,
       }
     }
   }
+}
+#endif
+
+void CountJointGenotypes(const uintptr_t* anchor, const uintptr_t* target,
+                         uint32_t sample_ct, const uint32_t* anchor_counts,
+                         const uint32_t* target_counts,
+                         uint32_t* joint_counts) {
+  std::fill(joint_counts, &(joint_counts[16]), 0U);
+  const uint32_t anchor_baseline =
+      MostFrequentGenotype(anchor_counts);
+  const uint32_t target_baseline =
+      MostFrequentGenotype(target_counts);
+  uint8_t independent_anchors[3];
+  uint8_t independent_targets[3];
+  const uint32_t independent_anchor_ct =
+      IndependentGenotypes(anchor_counts, anchor_baseline,
+                           independent_anchors);
+  const uint32_t independent_target_ct =
+      IndependentGenotypes(target_counts, target_baseline,
+                           independent_targets);
+  const uint32_t word_ct = NypCtToWordCt(sample_ct);
+  const uint32_t trailing_sample_ct = sample_ct % kBitsPerWordD2;
+  for (uint32_t word_idx = 0; word_idx != word_ct; ++word_idx) {
+    uintptr_t valid_mask = kMask5555;
+    if (trailing_sample_ct && (word_idx + 1 == word_ct)) {
+      valid_mask = bzhi(kMask5555, 2 * trailing_sample_ct);
+    }
+    uintptr_t anchor_masks[4];
+    uintptr_t target_masks[4];
+    BuildGenotypeMasks(anchor[word_idx], valid_mask, anchor_masks);
+    BuildGenotypeMasks(target[word_idx], valid_mask, target_masks);
+    for (uint32_t anchor_idx = 0;
+         anchor_idx != independent_anchor_ct; ++anchor_idx) {
+      const uint32_t anchor_genotype =
+          independent_anchors[anchor_idx];
+      for (uint32_t target_idx = 0;
+           target_idx != independent_target_ct; ++target_idx) {
+        const uint32_t target_genotype =
+            independent_targets[target_idx];
+        joint_counts[4 * anchor_genotype + target_genotype] +=
+            PopcountWord(anchor_masks[anchor_genotype] &
+                         target_masks[target_genotype]);
+      }
+    }
+  }
+  for (uint32_t anchor_genotype = 0; anchor_genotype != 4;
+       ++anchor_genotype) {
+    if (anchor_genotype == anchor_baseline) {
+      continue;
+    }
+    uint32_t known = 0;
+    for (uint32_t target_genotype = 0; target_genotype != 4;
+         ++target_genotype) {
+      if (target_genotype != target_baseline) {
+        known +=
+            joint_counts[4 * anchor_genotype + target_genotype];
+      }
+    }
+    joint_counts[4 * anchor_genotype + target_baseline] =
+        anchor_counts[anchor_genotype] - known;
+  }
+  for (uint32_t target_genotype = 0; target_genotype != 4;
+       ++target_genotype) {
+    if (target_genotype == target_baseline) {
+      continue;
+    }
+    uint32_t known = 0;
+    for (uint32_t anchor_genotype = 0; anchor_genotype != 4;
+         ++anchor_genotype) {
+      if (anchor_genotype != anchor_baseline) {
+        known +=
+            joint_counts[4 * anchor_genotype + target_genotype];
+      }
+    }
+    joint_counts[4 * anchor_baseline + target_genotype] =
+        target_counts[target_genotype] - known;
+  }
+  uint32_t known = 0;
+  for (uint32_t target_genotype = 0; target_genotype != 4;
+       ++target_genotype) {
+    if (target_genotype != target_baseline) {
+      known +=
+          joint_counts[4 * anchor_baseline + target_genotype];
+    }
+  }
+  joint_counts[4 * anchor_baseline + target_baseline] =
+      anchor_counts[anchor_baseline] - known;
+#ifdef PGEN_RANS_VERIFY_FAST_COUNTS
+  uint32_t reference_counts[16];
+  CountJointGenotypesReference(
+      anchor, target, sample_ct, anchor_counts, target_counts,
+      reference_counts);
+  assert(std::equal(
+      joint_counts, &(joint_counts[16]), reference_counts));
+#endif
+}
+
+void CountTripleGenotypes(
+    const uintptr_t* anchor1, const uintptr_t* anchor2,
+    const uintptr_t* target, uint32_t sample_ct,
+    const uint32_t* anchor1_counts, const uint32_t* anchor2_counts,
+    const uint32_t* target_counts, const uint32_t* anchor_pair_counts,
+    const uint32_t* anchor1_target_counts,
+    const uint32_t* anchor2_target_counts, uint32_t* triple_counts) {
+  std::fill(triple_counts, &(triple_counts[64]), 0U);
+  const uint32_t anchor1_baseline =
+      MostFrequentGenotype(anchor1_counts);
+  const uint32_t anchor2_baseline =
+      MostFrequentGenotype(anchor2_counts);
+  const uint32_t target_baseline =
+      MostFrequentGenotype(target_counts);
+  uint8_t independent_anchor1[3];
+  uint8_t independent_anchor2[3];
+  uint8_t independent_targets[3];
+  const uint32_t independent_anchor1_ct =
+      IndependentGenotypes(anchor1_counts, anchor1_baseline,
+                           independent_anchor1);
+  const uint32_t independent_anchor2_ct =
+      IndependentGenotypes(anchor2_counts, anchor2_baseline,
+                           independent_anchor2);
+  const uint32_t independent_target_ct =
+      IndependentGenotypes(target_counts, target_baseline,
+                           independent_targets);
+  const uint32_t word_ct = NypCtToWordCt(sample_ct);
+  const uint32_t trailing_sample_ct = sample_ct % kBitsPerWordD2;
+  for (uint32_t word_idx = 0; word_idx != word_ct; ++word_idx) {
+    uintptr_t valid_mask = kMask5555;
+    if (trailing_sample_ct && (word_idx + 1 == word_ct)) {
+      valid_mask = bzhi(kMask5555, 2 * trailing_sample_ct);
+    }
+    uintptr_t masks[3][4];
+    BuildGenotypeMasks(anchor1[word_idx], valid_mask, masks[0]);
+    BuildGenotypeMasks(anchor2[word_idx], valid_mask, masks[1]);
+    BuildGenotypeMasks(target[word_idx], valid_mask, masks[2]);
+    for (uint32_t anchor1_idx = 0;
+         anchor1_idx != independent_anchor1_ct; ++anchor1_idx) {
+      const uint32_t anchor1_genotype =
+          independent_anchor1[anchor1_idx];
+      for (uint32_t anchor2_idx = 0;
+           anchor2_idx != independent_anchor2_ct; ++anchor2_idx) {
+        const uint32_t anchor2_genotype =
+            independent_anchor2[anchor2_idx];
+        const uintptr_t references =
+            masks[0][anchor1_genotype] &
+            masks[1][anchor2_genotype];
+        for (uint32_t target_idx = 0;
+             target_idx != independent_target_ct; ++target_idx) {
+          const uint32_t target_genotype =
+              independent_targets[target_idx];
+          triple_counts[
+              16 * anchor1_genotype + 4 * anchor2_genotype +
+              target_genotype] +=
+              PopcountWord(references & masks[2][target_genotype]);
+        }
+      }
+    }
+  }
+
+  for (uint32_t anchor1_genotype = 0; anchor1_genotype != 4;
+       ++anchor1_genotype) {
+    if (anchor1_genotype == anchor1_baseline) {
+      continue;
+    }
+    for (uint32_t anchor2_genotype = 0; anchor2_genotype != 4;
+         ++anchor2_genotype) {
+      if (anchor2_genotype == anchor2_baseline) {
+        continue;
+      }
+      uint32_t known = 0;
+      for (uint32_t target_genotype = 0; target_genotype != 4;
+           ++target_genotype) {
+        if (target_genotype != target_baseline) {
+          known += triple_counts[
+              16 * anchor1_genotype + 4 * anchor2_genotype +
+              target_genotype];
+        }
+      }
+      triple_counts[
+          16 * anchor1_genotype + 4 * anchor2_genotype +
+          target_baseline] =
+          anchor_pair_counts[
+              4 * anchor1_genotype + anchor2_genotype] -
+          known;
+    }
+  }
+  for (uint32_t anchor1_genotype = 0; anchor1_genotype != 4;
+       ++anchor1_genotype) {
+    if (anchor1_genotype == anchor1_baseline) {
+      continue;
+    }
+    for (uint32_t target_genotype = 0; target_genotype != 4;
+         ++target_genotype) {
+      if (target_genotype == target_baseline) {
+        continue;
+      }
+      uint32_t known = 0;
+      for (uint32_t anchor2_genotype = 0; anchor2_genotype != 4;
+           ++anchor2_genotype) {
+        if (anchor2_genotype != anchor2_baseline) {
+          known += triple_counts[
+              16 * anchor1_genotype + 4 * anchor2_genotype +
+              target_genotype];
+        }
+      }
+      triple_counts[
+          16 * anchor1_genotype + 4 * anchor2_baseline +
+          target_genotype] =
+          anchor1_target_counts[
+              4 * anchor1_genotype + target_genotype] -
+          known;
+    }
+  }
+  for (uint32_t anchor2_genotype = 0; anchor2_genotype != 4;
+       ++anchor2_genotype) {
+    if (anchor2_genotype == anchor2_baseline) {
+      continue;
+    }
+    for (uint32_t target_genotype = 0; target_genotype != 4;
+         ++target_genotype) {
+      if (target_genotype == target_baseline) {
+        continue;
+      }
+      uint32_t known = 0;
+      for (uint32_t anchor1_genotype = 0; anchor1_genotype != 4;
+           ++anchor1_genotype) {
+        if (anchor1_genotype != anchor1_baseline) {
+          known += triple_counts[
+              16 * anchor1_genotype + 4 * anchor2_genotype +
+              target_genotype];
+        }
+      }
+      triple_counts[
+          16 * anchor1_baseline + 4 * anchor2_genotype +
+          target_genotype] =
+          anchor2_target_counts[
+              4 * anchor2_genotype + target_genotype] -
+          known;
+    }
+  }
+  for (uint32_t anchor1_genotype = 0; anchor1_genotype != 4;
+       ++anchor1_genotype) {
+    if (anchor1_genotype == anchor1_baseline) {
+      continue;
+    }
+    uint32_t known = 0;
+    for (uint32_t target_genotype = 0; target_genotype != 4;
+         ++target_genotype) {
+      if (target_genotype != target_baseline) {
+        known += triple_counts[
+            16 * anchor1_genotype + 4 * anchor2_baseline +
+            target_genotype];
+      }
+    }
+    triple_counts[
+        16 * anchor1_genotype + 4 * anchor2_baseline +
+        target_baseline] =
+        anchor_pair_counts[
+            4 * anchor1_genotype + anchor2_baseline] -
+        known;
+  }
+  for (uint32_t anchor2_genotype = 0; anchor2_genotype != 4;
+       ++anchor2_genotype) {
+    if (anchor2_genotype == anchor2_baseline) {
+      continue;
+    }
+    uint32_t known = 0;
+    for (uint32_t target_genotype = 0; target_genotype != 4;
+         ++target_genotype) {
+      if (target_genotype != target_baseline) {
+        known += triple_counts[
+            16 * anchor1_baseline + 4 * anchor2_genotype +
+            target_genotype];
+      }
+    }
+    triple_counts[
+        16 * anchor1_baseline + 4 * anchor2_genotype +
+        target_baseline] =
+        anchor_pair_counts[
+            4 * anchor1_baseline + anchor2_genotype] -
+        known;
+  }
+  for (uint32_t target_genotype = 0; target_genotype != 4;
+       ++target_genotype) {
+    if (target_genotype == target_baseline) {
+      continue;
+    }
+    uint32_t known = 0;
+    for (uint32_t anchor2_genotype = 0; anchor2_genotype != 4;
+         ++anchor2_genotype) {
+      if (anchor2_genotype != anchor2_baseline) {
+        known += triple_counts[
+            16 * anchor1_baseline + 4 * anchor2_genotype +
+            target_genotype];
+      }
+    }
+    triple_counts[
+        16 * anchor1_baseline + 4 * anchor2_baseline +
+        target_genotype] =
+        anchor1_target_counts[
+            4 * anchor1_baseline + target_genotype] -
+        known;
+  }
+  uint32_t known = 0;
+  for (uint32_t target_genotype = 0; target_genotype != 4;
+       ++target_genotype) {
+    if (target_genotype != target_baseline) {
+      known += triple_counts[
+          16 * anchor1_baseline + 4 * anchor2_baseline +
+          target_genotype];
+    }
+  }
+  triple_counts[
+      16 * anchor1_baseline + 4 * anchor2_baseline +
+      target_baseline] =
+      anchor_pair_counts[
+          4 * anchor1_baseline + anchor2_baseline] -
+      known;
+#ifdef PGEN_RANS_VERIFY_FAST_COUNTS
+  uint32_t reference_counts[64];
+  CountTripleGenotypesReference(
+      anchor1, anchor2, target, sample_ct, reference_counts);
+  assert(std::equal(
+      triple_counts, &(triple_counts[64]), reference_counts));
+#endif
 }
 
 uint64_t SparseExceptionCt(const uint32_t* counts, RecordMode mode) {
@@ -287,13 +649,239 @@ bool EncodeVariant(const uintptr_t* target,
                    const CodecParams& codec_params, bool is_anchor,
                    std::vector<uint8_t>* output, std::string* error) {
   const auto* target64 = reinterpret_cast<const uint64_t*>(target);
-  if (!EncodeRecord(target64, nullptr, nullptr, sample_ct,
-                    RecordMode::kMarginal, 0, 0, codec_params, output,
-                    error)) {
+  uint64_t marginal_estimate;
+  if (!EstimateRecordBytes(
+          target_counts.data(), RecordMode::kMarginal, codec_params,
+          &marginal_estimate, error)) {
     return false;
   }
-  std::vector<uint8_t> alternate_record;
+
+  std::vector<AnchorCandidate> candidates;
+  if (!is_anchor) {
+    candidates.reserve(anchor_offsets.size());
+    for (uint32_t anchor_ordinal = 0;
+         anchor_ordinal != anchor_offsets.size(); ++anchor_ordinal) {
+      const uint32_t anchor_offset = anchor_offsets[anchor_ordinal];
+      const uint32_t anchor_vidx = block_start + anchor_offset;
+      if (!AnchorEligible(target_vidx, anchor_vidx, metadata,
+                          params.max_anchor_bp)) {
+        continue;
+      }
+      const uintptr_t* anchor =
+          &(block_genovecs[static_cast<uintptr_t>(anchor_offset) *
+                            genovec_word_stride]);
+      uint32_t joint_counts[16];
+      CountJointGenotypes(
+          anchor, target, sample_ct, counts[anchor_offset].data(),
+          target_counts.data(), joint_counts);
+      uint64_t estimated_bytes;
+      if (!EstimateRecordBytes(
+              joint_counts, RecordMode::kOneReference, codec_params,
+              &estimated_bytes, error)) {
+        return false;
+      }
+      AnchorCandidate candidate;
+      candidate.estimated_bytes = estimated_bytes;
+      candidate.sparse_exception_ct =
+          SparseExceptionCt(joint_counts, RecordMode::kOneReference);
+      candidate.ordinal = anchor_ordinal;
+      candidate.offset = anchor_offset;
+      std::copy(joint_counts, &(joint_counts[16]),
+                candidate.joint_counts.begin());
+      candidates.push_back(std::move(candidate));
+    }
+    std::sort(
+        candidates.begin(), candidates.end(),
+        [](const AnchorCandidate& lhs, const AnchorCandidate& rhs) {
+          if (lhs.estimated_bytes != rhs.estimated_bytes) {
+            return lhs.estimated_bytes < rhs.estimated_bytes;
+          }
+          return lhs.ordinal < rhs.ordinal;
+        });
+  }
+
+  std::vector<AnchorCandidate> sparse_candidates;
+  if (params.enable_alternate_records && (!candidates.empty())) {
+    sparse_candidates = candidates;
+    std::sort(
+        sparse_candidates.begin(), sparse_candidates.end(),
+        [](const AnchorCandidate& lhs, const AnchorCandidate& rhs) {
+          if (lhs.sparse_exception_ct != rhs.sparse_exception_ct) {
+            return lhs.sparse_exception_ct < rhs.sparse_exception_ct;
+          }
+          return lhs.ordinal < rhs.ordinal;
+        });
+  }
+
+  const bool has_single = !candidates.empty();
+  AnchorCandidate best_single;
+  if (has_single) {
+    best_single = candidates[0];
+  }
+  bool has_pair = false;
+  uint64_t best_pair_estimate = std::numeric_limits<uint64_t>::max();
+  uint64_t best_sparse_exception_ct =
+      std::numeric_limits<uint64_t>::max();
+  uint32_t best_first_idx = 0;
+  uint32_t best_second_idx = 0;
+  uint32_t best_sparse_first_idx = 0;
+  uint32_t best_sparse_second_idx = 0;
+  std::array<uint32_t, 64> best_pair_counts = {};
+  std::array<uint32_t, 64> best_sparse_pair_counts = {};
+  if (params.two_ref_shortlist && (candidates.size() >= 2)) {
+    if (candidates.size() > params.two_ref_shortlist) {
+      candidates.resize(params.two_ref_shortlist);
+    }
+    for (uint32_t first_idx = 0; first_idx + 1 != candidates.size();
+         ++first_idx) {
+      const uintptr_t* anchor1 =
+          &(block_genovecs[static_cast<uintptr_t>(
+                                candidates[first_idx].offset) *
+                            genovec_word_stride]);
+      for (uint32_t second_idx = first_idx + 1;
+           second_idx != candidates.size(); ++second_idx) {
+        const uintptr_t* anchor2 =
+            &(block_genovecs[static_cast<uintptr_t>(
+                                  candidates[second_idx].offset) *
+                              genovec_word_stride]);
+        uint32_t anchor_pair_counts[16];
+        CountJointGenotypes(
+            anchor1, anchor2, sample_ct,
+            counts[candidates[first_idx].offset].data(),
+            counts[candidates[second_idx].offset].data(),
+            anchor_pair_counts);
+        uint32_t triple_counts[64];
+        CountTripleGenotypes(
+            anchor1, anchor2, target, sample_ct,
+            counts[candidates[first_idx].offset].data(),
+            counts[candidates[second_idx].offset].data(),
+            target_counts.data(), anchor_pair_counts,
+            candidates[first_idx].joint_counts.data(),
+            candidates[second_idx].joint_counts.data(), triple_counts);
+        uint64_t estimated_bytes;
+        if (!EstimateRecordBytes(
+                triple_counts, RecordMode::kTwoReference, codec_params,
+                &estimated_bytes, error)) {
+          return false;
+        }
+        if (estimated_bytes < best_pair_estimate) {
+          best_pair_estimate = estimated_bytes;
+          best_first_idx = first_idx;
+          best_second_idx = second_idx;
+          std::copy(
+              triple_counts, &(triple_counts[64]),
+              best_pair_counts.begin());
+        }
+        if (params.enable_alternate_records) {
+          const uint64_t sparse_exception_ct =
+              SparseExceptionCt(triple_counts, RecordMode::kTwoReference);
+          if (sparse_exception_ct < best_sparse_exception_ct) {
+            best_sparse_exception_ct = sparse_exception_ct;
+            best_sparse_first_idx = first_idx;
+            best_sparse_second_idx = second_idx;
+            std::copy(
+                triple_counts, &(triple_counts[64]),
+                best_sparse_pair_counts.begin());
+          }
+        }
+      }
+    }
+    has_pair = true;
+  }
+
+  uint64_t best_rans_estimate = marginal_estimate;
+  if (has_single) {
+    best_rans_estimate =
+        std::min(best_rans_estimate, best_single.estimated_bytes);
+  }
+  if (has_pair) {
+    best_rans_estimate =
+        std::min(best_rans_estimate, best_pair_estimate);
+  }
+
+  // For large cohorts the count-based byte estimate is accurate to much
+  // less than a percent, while building every losing rANS payload costs a
+  // complete reverse encode and forward interleave.  Materialize the
+  // predicted winner and only genuinely close alternatives.  Retain the
+  // exhaustive behavior for small cohorts, where fixed-size coder effects
+  // are a larger fraction of each record and throughput is less important.
+  // The estimator's finite-state error is bounded by one byte per lane, so
+  // two estimates farther apart than twice the lane count cannot reverse
+  // order after materialization.
+  constexpr uint32_t kEstimateGatedSampleCt = 32768;
+  const uint64_t estimate_slack = 2 * codec_params.state_ct;
+  const auto should_materialize =
+      [&](uint64_t estimate) {
+        return (sample_ct < kEstimateGatedSampleCt) ||
+               (estimate - best_rans_estimate <= estimate_slack);
+      };
+  output->clear();
+  std::vector<uint8_t> candidate_record;
+  const auto materialize =
+      [&](const uint64_t* reference1, const uint64_t* reference2,
+          RecordMode mode, uint8_t reference1_idx,
+          uint8_t reference2_idx, uint64_t estimate,
+          const uint32_t* context_symbol_counts) {
+        if (!should_materialize(estimate)) {
+          return true;
+        }
+        if (!EncodeRecordFromCounts(
+                target64, reference1, reference2, sample_ct, mode,
+                reference1_idx, reference2_idx, context_symbol_counts,
+                codec_params,
+                &candidate_record, error)) {
+          return false;
+        }
+        if (output->empty() ||
+            (candidate_record.size() < output->size())) {
+          *output = std::move(candidate_record);
+        }
+        return true;
+      };
+  if (!materialize(
+          nullptr, nullptr, RecordMode::kMarginal, 0, 0,
+          marginal_estimate, target_counts.data())) {
+    return false;
+  }
+  if (has_single) {
+    const uintptr_t* single_anchor =
+        &(block_genovecs[static_cast<uintptr_t>(best_single.offset) *
+                          genovec_word_stride]);
+    if (!materialize(
+            reinterpret_cast<const uint64_t*>(single_anchor), nullptr,
+            RecordMode::kOneReference,
+            static_cast<uint8_t>(best_single.ordinal), 0,
+            best_single.estimated_bytes,
+            best_single.joint_counts.data())) {
+      return false;
+    }
+  }
+  if (has_pair) {
+    const AnchorCandidate& first = candidates[best_first_idx];
+    const AnchorCandidate& second = candidates[best_second_idx];
+    const uintptr_t* anchor1 =
+        &(block_genovecs[static_cast<uintptr_t>(first.offset) *
+                          genovec_word_stride]);
+    const uintptr_t* anchor2 =
+        &(block_genovecs[static_cast<uintptr_t>(second.offset) *
+                          genovec_word_stride]);
+    if (!materialize(
+            reinterpret_cast<const uint64_t*>(anchor1),
+            reinterpret_cast<const uint64_t*>(anchor2),
+            RecordMode::kTwoReference,
+            static_cast<uint8_t>(first.ordinal),
+            static_cast<uint8_t>(second.ordinal), best_pair_estimate,
+            best_pair_counts.data())) {
+      return false;
+    }
+  }
+  if (output->empty()) {
+    *error = "Internal rANS record selection produced no candidate.";
+    return false;
+  }
+
   if (params.enable_alternate_records) {
+    std::vector<uint8_t> alternate_record;
     const uint64_t raw_record_byte_ct =
         1 + (static_cast<uint64_t>(sample_ct) + 3) / 4;
     if (raw_record_byte_ct < output->size()) {
@@ -309,197 +897,63 @@ bool EncodeVariant(const uintptr_t* target,
     if (SparseRecordLowerBoundByteCt(
             RecordMode::kMarginal, marginal_sparse_exception_ct,
             sample_ct) < output->size()) {
-      if (!EncodeSparsePredictorRecord(
+      if (!EncodeSparsePredictorRecordFromCounts(
               target64, nullptr, nullptr, sample_ct,
-              RecordMode::kMarginal, 0, 0, &alternate_record, error)) {
+              RecordMode::kMarginal, 0, 0, target_counts.data(),
+              &alternate_record, error)) {
         return false;
       }
       KeepSmallerRecord(&alternate_record, output);
     }
-  }
-  if (is_anchor) {
-    return true;
-  }
-  std::vector<AnchorCandidate> candidates;
-  candidates.reserve(anchor_offsets.size());
-  for (uint32_t anchor_ordinal = 0;
-       anchor_ordinal != anchor_offsets.size(); ++anchor_ordinal) {
-    const uint32_t anchor_offset = anchor_offsets[anchor_ordinal];
-    const uint32_t anchor_vidx = block_start + anchor_offset;
-    if (!AnchorEligible(target_vidx, anchor_vidx, metadata,
-                        params.max_anchor_bp)) {
-      continue;
-    }
-    const uintptr_t* anchor =
-        &(block_genovecs[static_cast<uintptr_t>(anchor_offset) *
-                          genovec_word_stride]);
-    uint32_t joint_counts[16];
-    CountJointGenotypes(anchor, target, sample_ct,
-                        counts[anchor_offset].data(), target_counts.data(),
-                        joint_counts);
-    uint64_t estimated_bytes;
-    if (!EstimateRecordBytes(joint_counts, RecordMode::kOneReference,
-                             codec_params, &estimated_bytes, error)) {
-      return false;
-    }
-    candidates.push_back(
-        {estimated_bytes,
-         SparseExceptionCt(joint_counts, RecordMode::kOneReference),
-         anchor_ordinal, anchor_offset});
-  }
-  if (candidates.empty()) {
-    return true;
-  }
-  std::sort(candidates.begin(), candidates.end(),
-            [](const AnchorCandidate& lhs, const AnchorCandidate& rhs) {
-              if (lhs.estimated_bytes != rhs.estimated_bytes) {
-                return lhs.estimated_bytes < rhs.estimated_bytes;
-              }
-              return lhs.ordinal < rhs.ordinal;
-            });
-  const AnchorCandidate& best_single = candidates[0];
-  const uintptr_t* single_anchor =
-      &(block_genovecs[static_cast<uintptr_t>(best_single.offset) *
-                        genovec_word_stride]);
-  std::vector<uint8_t> single_record;
-  if (!EncodeRecord(
-          target64, reinterpret_cast<const uint64_t*>(single_anchor), nullptr,
-          sample_ct, RecordMode::kOneReference,
-          static_cast<uint8_t>(best_single.ordinal), 0, codec_params,
-          &single_record, error)) {
-    return false;
-  }
-  if (single_record.size() < output->size()) {
-    *output = std::move(single_record);
-  }
-  if (params.enable_alternate_records) {
-    std::vector<AnchorCandidate> sparse_candidates = candidates;
-    std::sort(
-        sparse_candidates.begin(), sparse_candidates.end(),
-        [](const AnchorCandidate& lhs, const AnchorCandidate& rhs) {
-          if (lhs.sparse_exception_ct != rhs.sparse_exception_ct) {
-            return lhs.sparse_exception_ct < rhs.sparse_exception_ct;
-          }
-          return lhs.ordinal < rhs.ordinal;
-        });
     const size_t sparse_candidate_ct =
         std::min<size_t>(4, sparse_candidates.size());
     for (size_t candidate_idx = 0;
          candidate_idx != sparse_candidate_ct; ++candidate_idx) {
       const AnchorCandidate& candidate =
           sparse_candidates[candidate_idx];
-      const uintptr_t* sparse_anchor =
-          &(block_genovecs[static_cast<uintptr_t>(candidate.offset) *
-                            genovec_word_stride]);
       if (SparseRecordLowerBoundByteCt(
               RecordMode::kOneReference,
               candidate.sparse_exception_ct, sample_ct) >=
           output->size()) {
         continue;
       }
-      if (!EncodeSparsePredictorRecord(
+      const uintptr_t* sparse_anchor =
+          &(block_genovecs[static_cast<uintptr_t>(candidate.offset) *
+                            genovec_word_stride]);
+      if (!EncodeSparsePredictorRecordFromCounts(
               target64,
               reinterpret_cast<const uint64_t*>(sparse_anchor), nullptr,
               sample_ct, RecordMode::kOneReference,
               static_cast<uint8_t>(candidate.ordinal), 0,
+              candidate.joint_counts.data(),
               &alternate_record, error)) {
         return false;
       }
       KeepSmallerRecord(&alternate_record, output);
     }
-  }
-
-  if ((!params.two_ref_shortlist) || (candidates.size() < 2)) {
-    return true;
-  }
-  if (candidates.size() > params.two_ref_shortlist) {
-    candidates.resize(params.two_ref_shortlist);
-  }
-  uint64_t best_pair_estimate = std::numeric_limits<uint64_t>::max();
-  uint64_t best_sparse_exception_ct =
-      std::numeric_limits<uint64_t>::max();
-  uint32_t best_first_idx = 0;
-  uint32_t best_second_idx = 0;
-  uint32_t best_sparse_first_idx = 0;
-  uint32_t best_sparse_second_idx = 0;
-  for (uint32_t first_idx = 0; first_idx + 1 != candidates.size();
-       ++first_idx) {
-    const uintptr_t* anchor1 =
-        &(block_genovecs[static_cast<uintptr_t>(
-                              candidates[first_idx].offset) *
-                          genovec_word_stride]);
-    for (uint32_t second_idx = first_idx + 1;
-         second_idx != candidates.size(); ++second_idx) {
-      const uintptr_t* anchor2 =
+    if (has_pair &&
+        (SparseRecordLowerBoundByteCt(
+             RecordMode::kTwoReference, best_sparse_exception_ct,
+             sample_ct) < output->size())) {
+      const AnchorCandidate& sparse_first =
+          candidates[best_sparse_first_idx];
+      const AnchorCandidate& sparse_second =
+          candidates[best_sparse_second_idx];
+      const uintptr_t* sparse_anchor1 =
           &(block_genovecs[static_cast<uintptr_t>(
-                                candidates[second_idx].offset) *
+                                sparse_first.offset) *
                             genovec_word_stride]);
-      uint32_t triple_counts[64];
-      CountTripleGenotypes(anchor1, anchor2, target, sample_ct,
-                           triple_counts);
-      uint64_t estimated_bytes;
-      if (!EstimateRecordBytes(triple_counts, RecordMode::kTwoReference,
-                               codec_params, &estimated_bytes, error)) {
-        return false;
-      }
-      if (estimated_bytes < best_pair_estimate) {
-        best_pair_estimate = estimated_bytes;
-        best_first_idx = first_idx;
-        best_second_idx = second_idx;
-      }
-      if (params.enable_alternate_records) {
-        const uint64_t sparse_exception_ct =
-            SparseExceptionCt(triple_counts, RecordMode::kTwoReference);
-        if (sparse_exception_ct < best_sparse_exception_ct) {
-          best_sparse_exception_ct = sparse_exception_ct;
-          best_sparse_first_idx = first_idx;
-          best_sparse_second_idx = second_idx;
-        }
-      }
-    }
-  }
-  const AnchorCandidate& first = candidates[best_first_idx];
-  const AnchorCandidate& second = candidates[best_second_idx];
-  const uintptr_t* anchor1 =
-      &(block_genovecs[static_cast<uintptr_t>(first.offset) *
-                        genovec_word_stride]);
-  const uintptr_t* anchor2 =
-      &(block_genovecs[static_cast<uintptr_t>(second.offset) *
-                        genovec_word_stride]);
-  std::vector<uint8_t> pair_record;
-  if (!EncodeRecord(
-          target64, reinterpret_cast<const uint64_t*>(anchor1),
-          reinterpret_cast<const uint64_t*>(anchor2), sample_ct,
-          RecordMode::kTwoReference, static_cast<uint8_t>(first.ordinal),
-          static_cast<uint8_t>(second.ordinal), codec_params, &pair_record,
-          error)) {
-    return false;
-  }
-  if (pair_record.size() < output->size()) {
-    *output = std::move(pair_record);
-  }
-  if (params.enable_alternate_records) {
-    const AnchorCandidate& sparse_first =
-        candidates[best_sparse_first_idx];
-    const AnchorCandidate& sparse_second =
-        candidates[best_sparse_second_idx];
-    const uintptr_t* sparse_anchor1 =
-        &(block_genovecs[static_cast<uintptr_t>(
-                              sparse_first.offset) *
-                          genovec_word_stride]);
-    const uintptr_t* sparse_anchor2 =
-        &(block_genovecs[static_cast<uintptr_t>(
-                              sparse_second.offset) *
-                          genovec_word_stride]);
-    if (SparseRecordLowerBoundByteCt(
-            RecordMode::kTwoReference, best_sparse_exception_ct,
-            sample_ct) < output->size()) {
-      if (!EncodeSparsePredictorRecord(
+      const uintptr_t* sparse_anchor2 =
+          &(block_genovecs[static_cast<uintptr_t>(
+                                sparse_second.offset) *
+                            genovec_word_stride]);
+      if (!EncodeSparsePredictorRecordFromCounts(
               target64, reinterpret_cast<const uint64_t*>(sparse_anchor1),
               reinterpret_cast<const uint64_t*>(sparse_anchor2), sample_ct,
               RecordMode::kTwoReference,
               static_cast<uint8_t>(sparse_first.ordinal),
               static_cast<uint8_t>(sparse_second.ordinal),
+              best_sparse_pair_counts.data(),
               &alternate_record, error)) {
         return false;
       }
