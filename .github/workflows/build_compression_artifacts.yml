@@ -214,10 +214,12 @@ jobs:
             "$artifact_dir/lib/libpgen_rans.a"
           install -m 644 \
             2.0/pgen_rans_codec.h \
+            2.0/pgen_rans_hybrid.h \
             2.0/pgen_rans_container.h \
             2.0/pgen_rans_cpu.h \
             2.0/pgen_rans_encode.h \
             2.0/pgen_rans_reader.h \
+            2.0/pgen_rans_size.h \
             "$artifact_dir/include/"
           install -m 644 1.9/LICENSE "$artifact_dir/LICENSE"
           {
@@ -437,10 +439,12 @@ jobs:
             "$artifact_dir/lib/libpgen_rans.a"
           install -m 644 \
             2.0/pgen_rans_codec.h \
+            2.0/pgen_rans_hybrid.h \
             2.0/pgen_rans_container.h \
             2.0/pgen_rans_cpu.h \
             2.0/pgen_rans_encode.h \
             2.0/pgen_rans_reader.h \
+            2.0/pgen_rans_size.h \
             "$artifact_dir/include/"
           install -m 644 1.9/LICENSE "$artifact_dir/LICENSE"
           {

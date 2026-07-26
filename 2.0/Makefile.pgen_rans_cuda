@@ -12,7 +12,8 @@ PGENRANS_BUILD_DIR ?= build_pgen_rans
 PGENRANS_CUDA_OBJ_DIR := $(PGENRANS_BUILD_DIR)/cuda_obj
 PGENRANS_BIN_DIR := $(PGENRANS_BUILD_DIR)/bin
 PGENRANSCUDAOBJ = $(addprefix $(PGENRANS_CUDA_OBJ_DIR)/,\
-	pgen_rans_codec.o pgen_rans_container.o pgen_rans_cpu.o \
+	pgen_rans_codec.o pgen_rans_hybrid.o pgen_rans_container.o \
+	pgen_rans_cpu.o \
 	pgen_rans_cuda.o pgen_rans_cuda_benchmark.o)
 
 .PHONY: pgen_rans_cuda_benchmark

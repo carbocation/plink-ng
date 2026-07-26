@@ -7,7 +7,7 @@
 
 namespace pgen_rans {
 
-// Conditional-rANS container v1 serialized sizes.  Keep these synchronized
+// Conditional-rANS container serialized sizes.  Keep these synchronized
 // with SerializeHeader(), SerializeBlockIndex(), and
 // ContainerWriter::WriteBlock().
 constexpr uint64_t kContainerHeaderByteCt = 96;

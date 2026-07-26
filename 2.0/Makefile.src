@@ -81,6 +81,7 @@ TEXTLIB_CCSRC = include/plink2_base.cc \
 
 CCSRC = $(PLINK2LIB_CCSRC) \
         pgen_rans_codec.cc \
+        pgen_rans_hybrid.cc \
         pgen_rans_container.cc \
         pgen_rans_cpu.cc \
         pgen_rans_encode.cc \

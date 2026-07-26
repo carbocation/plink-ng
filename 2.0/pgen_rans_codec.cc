@@ -1887,7 +1887,8 @@ bool DecodeMultiallelicPatches(const uint8_t* record, size_t record_size,
     if (!ReadPackedValue(
             payload, payload_size, patch_01_bit_width, &offset,
             &bit_buffer, &bit_ct, &encoded_value) ||
-        (encoded_value >= patches->allele_ct - 2)) {
+        (encoded_value >=
+         static_cast<uint32_t>(patches->allele_ct - 2))) {
       SetError("Invalid or truncated ref/ALT multiallelic patch values.",
                error);
       return false;
@@ -1911,7 +1912,8 @@ bool DecodeMultiallelicPatches(const uint8_t* record, size_t record_size,
     if (!ReadPackedValue(
             payload, payload_size, patch_10_bit_width, &offset,
             &bit_buffer, &bit_ct, &encoded_value) ||
-        (encoded_value >= patches->allele_ct - 1)) {
+        (encoded_value >=
+         static_cast<uint32_t>(patches->allele_ct - 1))) {
       SetError("Invalid or truncated ALT/ALT multiallelic patch values.",
                error);
       return false;
