@@ -28,6 +28,7 @@ PlinkPgrAdapter::PlinkPgrAdapter() {
   backend_.get_allele = &GetAllele;
   backend_.get_counts = &GetCounts;
   backend_.get_packed = &GetPacked;
+  backend_.get_raw = &GetRaw;
 }
 
 PlinkPgrAdapter::~PlinkPgrAdapter() {
@@ -218,6 +219,115 @@ PglErr PlinkPgrAdapter::ReadAllele(
   return kPglRetSuccess;
 }
 
+PglErr PlinkPgrAdapter::ReadRawRecord(
+    uint32_t vidx, PgenGlobalFlags read_gflags,
+    uintptr_t** loadbuf_iter_ptr,
+    unsigned char* loaded_vrtype_ptr) {
+  if ((!loadbuf_iter_ptr) || (!*loadbuf_iter_ptr) ||
+      (vidx >= reader_.variant_ct())) {
+    return kPglRetImproperFunctionCall;
+  }
+  const uint32_t raw_sample_ct = reader_.raw_sample_ct();
+  uintptr_t* genovec = *loadbuf_iter_ptr;
+  const uint32_t aligned_genovec_word_ct =
+      NypCtToAlignedWordCt(raw_sample_ct);
+  ZeroWArr(aligned_genovec_word_ct, genovec);
+  std::string error;
+  if (!reader_.ReadVariant(
+          vidx, reinterpret_cast<uint8_t*>(genovec),
+          reader_.packed_variant_byte_ct(), nullptr, &error)) {
+    return ReadFailure(error, &last_error_);
+  }
+  ZeroTrailingNyps(raw_sample_ct, genovec);
+  uintptr_t* loadbuf_iter =
+      &(genovec[aligned_genovec_word_ct]);
+  if (loaded_vrtype_ptr) {
+    *loaded_vrtype_ptr = 0;
+  }
+  if ((reader_.max_allele_ct() == 2) ||
+      (!(read_gflags & kfPgenGlobalMultiallelicHardcallFound))) {
+    *loadbuf_iter_ptr = loadbuf_iter;
+    return kPglRetSuccess;
+  }
+
+  MultiallelicPatches patches;
+  if (!reader_.ReadVariantPatches(
+          vidx, &patches, nullptr, &error)) {
+    return ReadFailure(error, &last_error_);
+  }
+  const uint32_t rare01_ct =
+      static_cast<uint32_t>(patches.patch_01_sample_ids.size());
+  const uint32_t rare10_ct =
+      static_cast<uint32_t>(patches.patch_10_sample_ids.size());
+  if ((!rare01_ct) && (!rare10_ct)) {
+    *loadbuf_iter_ptr = loadbuf_iter;
+    return kPglRetSuccess;
+  }
+  if ((patches.patch_01_values.size() != rare01_ct) ||
+      (patches.patch_10_values.size() != 2 * rare10_ct)) {
+    last_error_ = "Malformed PGR multiallelic patch vectors.";
+    return kPglRetMalformedInput;
+  }
+  if (loaded_vrtype_ptr) {
+    *loaded_vrtype_ptr = 8;
+  }
+  loadbuf_iter[0] = rare01_ct;
+  loadbuf_iter[1] = rare10_ct;
+  loadbuf_iter = &(loadbuf_iter[RoundUpPow2(2, kWordsPerVec)]);
+  const uint32_t raw_sample_ctl = BitCtToWordCt(raw_sample_ct);
+  if (rare01_ct) {
+    uintptr_t* patch_set = loadbuf_iter;
+    ZeroWArr(raw_sample_ctl, patch_set);
+    loadbuf_iter = &(loadbuf_iter[raw_sample_ctl]);
+    AlleleCode* patch_values =
+        reinterpret_cast<AlleleCode*>(loadbuf_iter);
+    for (uint32_t patch_idx = 0; patch_idx != rare01_ct;
+         ++patch_idx) {
+      const uint32_t sample_idx =
+          patches.patch_01_sample_ids[patch_idx];
+      if (sample_idx >= raw_sample_ct) {
+        last_error_ = "PGR multiallelic patch sample is out of range.";
+        return kPglRetMalformedInput;
+      }
+      SetBit(sample_idx, patch_set);
+      patch_values[patch_idx] =
+          patches.patch_01_values[patch_idx];
+    }
+    loadbuf_iter = &(loadbuf_iter[
+        DivUp(rare01_ct,
+              kBytesPerWord / sizeof(AlleleCode))]);
+    AlignWToVec(&loadbuf_iter);
+  }
+  if (rare10_ct) {
+    uintptr_t* patch_set = loadbuf_iter;
+    ZeroWArr(raw_sample_ctl, patch_set);
+    loadbuf_iter = &(loadbuf_iter[raw_sample_ctl]);
+    AlleleCode* patch_values =
+        reinterpret_cast<AlleleCode*>(loadbuf_iter);
+    for (uint32_t patch_idx = 0; patch_idx != rare10_ct;
+         ++patch_idx) {
+      const uint32_t sample_idx =
+          patches.patch_10_sample_ids[patch_idx];
+      if (sample_idx >= raw_sample_ct) {
+        last_error_ = "PGR multiallelic patch sample is out of range.";
+        return kPglRetMalformedInput;
+      }
+      SetBit(sample_idx, patch_set);
+      patch_values[2 * patch_idx] =
+          patches.patch_10_values[2 * patch_idx];
+      patch_values[2 * patch_idx + 1] =
+          patches.patch_10_values[2 * patch_idx + 1];
+    }
+    loadbuf_iter = &(loadbuf_iter[
+        DivUp(rare10_ct,
+              kBytesPerWord /
+                  (2 * sizeof(AlleleCode)))]);
+    AlignWToVec(&loadbuf_iter);
+  }
+  *loadbuf_iter_ptr = loadbuf_iter;
+  return kPglRetSuccess;
+}
+
 PglErr PlinkPgrAdapter::Get(
     void* context, const uintptr_t* sample_include,
     const uint32_t*, uint32_t sample_ct, uint32_t vidx,
@@ -266,6 +376,15 @@ PglErr PlinkPgrAdapter::GetPacked(
     return ReadFailure(error, &adapter->last_error_);
   }
   return kPglRetSuccess;
+}
+
+PglErr PlinkPgrAdapter::GetRaw(
+    void* context, uint32_t vidx,
+    PgenGlobalFlags read_gflags,
+    uintptr_t** loadbuf_iter_ptr,
+    unsigned char* loaded_vrtype_ptr) {
+  return static_cast<PlinkPgrAdapter*>(context)->ReadRawRecord(
+      vidx, read_gflags, loadbuf_iter_ptr, loaded_vrtype_ptr);
 }
 
 }  // namespace pgen_rans

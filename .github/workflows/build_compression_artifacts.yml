@@ -106,6 +106,45 @@ jobs:
             --export A \
             --out "$smoke_prefix-pgr-export"
           cmp "$smoke_prefix-pgen-export.raw" "$smoke_prefix-pgr-export.raw"
+          2.0/build_dynamic/plink2 \
+            --pgr "$smoke_prefix" \
+            --make-pgen \
+            --out "$smoke_prefix-roundtrip"
+          2.0/build_dynamic/plink2 \
+            --pfile "$smoke_prefix-input" \
+            --export vcf \
+            --out "$smoke_prefix-pgen-vcf"
+          2.0/build_dynamic/plink2 \
+            --pfile "$smoke_prefix-roundtrip" \
+            --export vcf \
+            --out "$smoke_prefix-roundtrip-vcf"
+          cmp "$smoke_prefix-pgen-vcf.vcf" \
+            "$smoke_prefix-roundtrip-vcf.vcf"
+          head -n 129 "$smoke_prefix-input.psam" \
+            >"$smoke_prefix-pca.keep"
+          2.0/build_dynamic/plink2 \
+            --pfile "$smoke_prefix-input" \
+            --keep "$smoke_prefix-pca.keep" \
+            --max-alleles 2 \
+            --make-pgen \
+            --out "$smoke_prefix-pca-input"
+          2.0/build_dynamic/plink2 \
+            --pfile "$smoke_prefix-pca-input" \
+            --make-pgr \
+            --threads 2 \
+            --out "$smoke_prefix-pca"
+          2.0/build_dynamic/plink2 \
+            --pfile "$smoke_prefix-pca-input" \
+            --pca 3 \
+            --out "$smoke_prefix-pgen-pca"
+          2.0/build_dynamic/plink2 \
+            --pgr "$smoke_prefix-pca" \
+            --pca 3 \
+            --out "$smoke_prefix-pgr-pca"
+          cmp "$smoke_prefix-pgen-pca.eigenval" \
+            "$smoke_prefix-pgr-pca.eigenval"
+          cmp "$smoke_prefix-pgen-pca.eigenvec" \
+            "$smoke_prefix-pgr-pca.eigenvec"
           if ldd 2.0/build_dynamic/plink2 | grep -Eq 'mkl|iomp'; then
             echo "PLINK has an unexpected dynamic oneMKL dependency." >&2
             exit 1
@@ -247,6 +286,45 @@ jobs:
             --export A \
             --out "$smoke_prefix-pgr-export"
           cmp "$smoke_prefix-pgen-export.raw" "$smoke_prefix-pgr-export.raw"
+          2.0/build_dynamic/plink2 \
+            --pgr "$smoke_prefix" \
+            --make-pgen \
+            --out "$smoke_prefix-roundtrip"
+          2.0/build_dynamic/plink2 \
+            --pfile "$smoke_prefix-input" \
+            --export vcf \
+            --out "$smoke_prefix-pgen-vcf"
+          2.0/build_dynamic/plink2 \
+            --pfile "$smoke_prefix-roundtrip" \
+            --export vcf \
+            --out "$smoke_prefix-roundtrip-vcf"
+          cmp "$smoke_prefix-pgen-vcf.vcf" \
+            "$smoke_prefix-roundtrip-vcf.vcf"
+          head -n 129 "$smoke_prefix-input.psam" \
+            >"$smoke_prefix-pca.keep"
+          2.0/build_dynamic/plink2 \
+            --pfile "$smoke_prefix-input" \
+            --keep "$smoke_prefix-pca.keep" \
+            --max-alleles 2 \
+            --make-pgen \
+            --out "$smoke_prefix-pca-input"
+          2.0/build_dynamic/plink2 \
+            --pfile "$smoke_prefix-pca-input" \
+            --make-pgr \
+            --threads 2 \
+            --out "$smoke_prefix-pca"
+          2.0/build_dynamic/plink2 \
+            --pfile "$smoke_prefix-pca-input" \
+            --pca 3 \
+            --out "$smoke_prefix-pgen-pca"
+          2.0/build_dynamic/plink2 \
+            --pgr "$smoke_prefix-pca" \
+            --pca 3 \
+            --out "$smoke_prefix-pgr-pca"
+          cmp "$smoke_prefix-pgen-pca.eigenval" \
+            "$smoke_prefix-pgr-pca.eigenval"
+          cmp "$smoke_prefix-pgen-pca.eigenvec" \
+            "$smoke_prefix-pgr-pca.eigenvec"
 
       - name: Package macOS artifact
         shell: bash

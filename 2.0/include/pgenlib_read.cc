@@ -9401,6 +9401,14 @@ uintptr_t CountAux1bHets(const AlleleCode* patch_10_vals, uintptr_t rare10_ct) {
 
 PglErr PgrGetRaw(uint32_t vidx, PgenGlobalFlags read_gflags, PgenReader* pgr_ptr, uintptr_t** loadbuf_iter_ptr, unsigned char* loaded_vrtype_ptr) {
   PgenReaderMain* pgrp = GetPgrp(pgr_ptr);
+  if (pgrp->hardcall_backend) {
+    if (!pgrp->hardcall_backend->get_raw) {
+      return kPglRetNotYetSupported;
+    }
+    return pgrp->hardcall_backend->get_raw(
+        pgrp->hardcall_backend->context, vidx, read_gflags,
+        loadbuf_iter_ptr, loaded_vrtype_ptr);
+  }
   // currently handles multiallelic hardcalls, hardcall phase, and biallelic
   // dosage (both unphased and phased)
   // todo: multiallelic dosage

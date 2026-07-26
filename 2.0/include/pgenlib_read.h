@@ -62,6 +62,9 @@ typedef struct PgrHardcallBackendStruct {
   PglErr (*get_packed)(void* context, uint32_t vidx,
                        unsigned char* packed_genotypes,
                        uint32_t packed_byte_ct);
+  PglErr (*get_raw)(
+      void* context, uint32_t vidx, PgenGlobalFlags read_gflags,
+      uintptr_t** loadbuf_iter_ptr, unsigned char* loaded_vrtype_ptr);
 } PgrHardcallBackend;
 
 // PgenFileInfo and PgenReader are the main exported "classes".

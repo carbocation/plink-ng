@@ -235,14 +235,17 @@ plink2 --pgr cohort-chr22 \
 ```
 
 The initial production surface includes `--score[-list]`, `--freq`,
-`--export A/Av`, `--indep-pairwise`, `--r-unphased`, `--clump`,
-`--write-snplist`, and `--write-samples`. Sample, position, ID, and
-genotype-frequency filters can be applied with these commands. PGR filesets
-with more than two alleles at any variant currently require `--read-freq` for
-scoring; multiallelic `--r-unphased` and allele-aware A/Av exports are exact,
-while frequency scans, LD pruning, clumping, and genotype-frequency filters
-are currently limited to biallelic PGR filesets. Construction and merge
-commands continue to use PGEN as their working format.
+`--export A/Av`, `--indep-pairwise`, `--r-unphased`, `--clump`, `--pca`,
+`--make-pgen`, `--write-snplist`, and `--write-samples`. Sample, position, ID,
+and genotype-frequency filters can be applied with these commands. Standard
+`--make-pgen` reconstructs an exact hardcall PGEN fileset; phase and dosage
+cannot be reconstructed because PGR does not store them. PGR filesets with
+more than two alleles at any variant currently require `--read-freq` for
+scoring; multiallelic `--make-pgen`, `--r-unphased`, and allele-aware A/Av
+exports are exact, while PCA, frequency scans, LD pruning, clumping, and
+genotype-frequency filters are currently limited to biallelic PGR filesets.
+Merge and other construction commands continue to use PGEN as their working
+format.
 
 Encode an unphased hardcall PGEN, including exact multiallelic calls:
 

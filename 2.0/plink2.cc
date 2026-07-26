@@ -1272,6 +1272,13 @@ PglErr Plink2Core(const Plink2Cmdline* pcp, MakePlink2Flags make_plink2_flags, c
           goto Plink2Core_ret_INCONSISTENT_INPUT;
         }
         if (unlikely((max_allele_ct > 2) &&
+                     (pcp->command_flags1 & kfCommand1Pca))) {
+          logerrputs(
+              "Error: --pca is currently limited to biallelic PGR "
+              "filesets.\n");
+          goto Plink2Core_ret_INCONSISTENT_INPUT;
+        }
+        if (unlikely((max_allele_ct > 2) &&
                      (((pcp->command_flags1 & kfCommand1Score) &&
                       (!pcp->read_freq_fname)) ||
                       (pcp->command_flags1 & kfCommand1AlleleFreq) ||
@@ -13073,14 +13080,33 @@ int main(int argc, char** argv) {
                                   kfCommand1LdPrune | kfCommand1Score |
                                   kfCommand1WriteSnplist |
                                   kfCommand1WriteSamples |
-                                  kfCommand1Clump | kfCommand1Vcor);
+                                  kfCommand1Clump | kfCommand1Vcor |
+                                  kfCommand1Pca |
+                                  kfCommand1MakePlink2);
       if (unlikely(pc.command_flags1 & (~pgr_supported_commands))) {
         logerrputs(
             "Error: --pgr currently supports --score[-list], --freq, "
             "--export A/Av,\n--indep-pairwise, --r-unphased, --clump, "
-            "--write-snplist, and\n--write-samples.  Use the matching .pgen "
-            "for other PLINK operations.\n");
+            "--pca, --make-pgen,\n--write-snplist, and --write-samples.  Use "
+            "the matching .pgen for other PLINK\noperations.\n");
         goto main_ret_INVALID_CMDLINE_A;
+      }
+      if (pc.command_flags1 & kfCommand1MakePlink2) {
+        const MakePlink2Flags unsupported_make_flags =
+            S_CAST(
+                MakePlink2Flags,
+                kfMakeBed | kfMakeBim | kfMakeFam |
+                    (3 * kfMakePgenFormatBase) |
+                    kfMakePlink2MMask);
+        if (unlikely(
+                (!(make_plink2_flags & kfMakePgen)) ||
+                (make_plink2_flags & unsupported_make_flags))) {
+          logerrputs(
+              "Error: --pgr fileset creation currently supports standard "
+              "--make-pgen only;\nfixed-width/legacy output and "
+              "multiallelic split/join modifiers are not supported.\n");
+          goto main_ret_INVALID_CMDLINE_A;
+        }
       }
       if (pc.command_flags1 & kfCommand1Exportf) {
         const ExportfFlags export_type =

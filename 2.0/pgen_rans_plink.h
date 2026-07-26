@@ -51,6 +51,11 @@ class PlinkPgrAdapter {
   static plink2::PglErr GetPacked(
       void* context, uint32_t vidx, unsigned char* packed_genotypes,
       uint32_t packed_byte_ct);
+  static plink2::PglErr GetRaw(
+      void* context, uint32_t vidx,
+      plink2::PgenGlobalFlags read_gflags,
+      uintptr_t** loadbuf_iter_ptr,
+      unsigned char* loaded_vrtype_ptr);
 
   plink2::PglErr ReadBase(
       const uintptr_t* sample_include, uint32_t sample_ct,
@@ -59,6 +64,10 @@ class PlinkPgrAdapter {
       const uintptr_t* sample_include, uint32_t sample_ct,
       uint32_t vidx, uint32_t allele_idx, uintptr_t* allele_countvec);
   bool ReadRaw(uint32_t vidx);
+  plink2::PglErr ReadRawRecord(
+      uint32_t vidx, plink2::PgenGlobalFlags read_gflags,
+      uintptr_t** loadbuf_iter_ptr,
+      unsigned char* loaded_vrtype_ptr);
   void CopySubset(const uintptr_t* sample_include, uint32_t sample_ct,
                   uintptr_t* destination) const;
 

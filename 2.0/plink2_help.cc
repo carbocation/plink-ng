@@ -123,8 +123,8 @@ PglErr DispHelp(const char* const* argvk, uint32_t param_ct) {
 "                              .psam prefix.\n"
 "  --pgr <prefix>            : Specify .pgr + .pvar + .psam prefix.  This\n"
 "                              supports --score[-list], --freq, --export A/Av,\n"
-"                              --indep-pairwise, --r-unphased, --clump,\n"
-"                              --write-snplist, and --write-samples.\n"
+"                              --indep-pairwise, --r-unphased, --clump, --pca,\n"
+"                              --make-pgen, --write-snplist, and --write-samples.\n"
 "  --pgen <filename>         : Specify full name of .pgen/.bed file.\n"
 "  --pgi <filename>          : Specify full name of .pgen.pgi file.\n"
                );
