@@ -241,6 +241,13 @@ int main() {
   reader.Close();
 
   MemoryReader memory_reader = LoadMemoryReader(path);
+  MemoryReader obsolete_reader = memory_reader;
+  obsolete_reader.bytes[6] = '1';
+  ContainerReader obsolete_container;
+  Expect(!obsolete_container.OpenReadAt(
+             obsolete_reader.bytes.size(), ReadMemory,
+             &obsolete_reader, &error),
+         "obsolete experimental container identity was accepted");
   Expect(reader.OpenReadAt(memory_reader.bytes.size(), ReadMemory,
                            &memory_reader, &error),
          "ranged reader open failed: " + error);

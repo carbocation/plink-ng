@@ -116,9 +116,6 @@ void RoundTrip(const std::vector<uint8_t>& target,
                       params, &decoded, &metadata, &error),
          "decode failed: " + error);
   Expect(metadata.mode == mode, "decoded mode mismatch");
-  Expect(metadata.has_interleaved_payload ==
-             metadata.has_entropy_payload,
-         "interleaved-payload flag mismatch");
   ExpectEqual(decoded, target, "round-trip");
 
   const uint32_t packed_word_ct = PackedWordCt(sample_ct);
@@ -154,7 +151,12 @@ void RoundTrip(const std::vector<uint8_t>& target,
   Expect(!DecodeRecord(invalid_flags.data(), invalid_flags.size(), anchors, 8,
                        sample_ct, params, &decoded, nullptr, &error),
          "unknown record flag was accepted");
-  if (metadata.has_interleaved_payload) {
+  invalid_flags = record;
+  invalid_flags[0] |= 0x08;
+  Expect(!DecodeRecord(invalid_flags.data(), invalid_flags.size(), anchors, 8,
+                       sample_ct, params, &decoded, nullptr, &error),
+         "obsolete payload-layout flag was accepted");
+  if (metadata.has_entropy_payload) {
     std::vector<uint8_t> invalid_padding = record;
     invalid_padding.back() = 1;
     Expect(!DecodeRecord(invalid_padding.data(), invalid_padding.size(),

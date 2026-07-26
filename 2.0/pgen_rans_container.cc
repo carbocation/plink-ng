@@ -28,8 +28,8 @@ namespace pgen_rans {
 namespace {
 
 constexpr std::array<uint8_t, 8> kFileMagic = {
-    'P', 'G', 'R', 'A', 'N', 'S', '1', '\0'};
-constexpr uint32_t kFormatVersion = 1;
+    'P', 'G', 'R', 'A', 'N', 'S', '2', '\0'};
+constexpr uint32_t kFormatVersion = 2;
 constexpr uint32_t kFileHeaderByteCt = 64;
 constexpr uint32_t kBlockIndexByteCt = 32;
 constexpr uint32_t kBlockHeaderByteCt = 16;

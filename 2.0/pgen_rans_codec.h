@@ -30,7 +30,6 @@ struct RecordMetadata {
   uint8_t reference1 = 0;
   uint8_t reference2 = 0;
   bool has_entropy_payload = false;
-  bool has_interleaved_payload = false;
 };
 
 uint32_t PackedWordCt(uint32_t sample_ct);

@@ -26,9 +26,8 @@ namespace {
 constexpr uint32_t kRansLowerBound = 1U << 23;
 constexpr uint8_t kModeMask = 3;
 constexpr uint8_t kEntropyPayloadFlag = 1U << 2;
-constexpr uint8_t kInterleavedPayloadFlag = 1U << 3;
 constexpr uint8_t kKnownFlagMask =
-    kModeMask | kEntropyPayloadFlag | kInterleavedPayloadFlag;
+    kModeMask | kEntropyPayloadFlag;
 constexpr uint32_t kInterleavedPaddingByteCt = 15;
 constexpr uint32_t kDefaultScaleBits = 12;
 #if PGEN_RANS_X86_RUNTIME_DISPATCH
@@ -474,36 +473,6 @@ bool BuildInterleavedPayload(
   return true;
 }
 
-template <uint32_t kScaleBits>
-PGEN_RANS_ALWAYS_INLINE bool RansDecodeSymbol(
-    const ModelRow& row, uint32_t runtime_scale_bits,
-    const uint8_t* lane_start, const uint8_t** lane_iter,
-    uint32_t* state, uint8_t* symbol, std::string* error) {
-  const uint32_t scale_bits =
-      kScaleBits ? kScaleBits : runtime_scale_bits;
-  const uint32_t slot = *state & ((1U << scale_bits) - 1);
-  // ParseModel() guarantees monotonically increasing cumulative
-  // frequencies ending at 1 << scale_bits.  Repeated boundaries skip
-  // zero-frequency symbols, so these comparisons replace a branchy
-  // four-symbol interval search.
-  const uint32_t selected_symbol =
-      static_cast<uint32_t>(slot >= row.cumulative[1]) +
-      static_cast<uint32_t>(slot >= row.cumulative[2]) +
-      static_cast<uint32_t>(slot >= row.cumulative[3]);
-  const uint32_t frequency = row.frequencies[selected_symbol];
-  *state = frequency * (*state >> scale_bits) + slot -
-           row.cumulative[selected_symbol];
-  while (*state < kRansLowerBound) {
-    if (*lane_iter == lane_start) {
-      SetError("Truncated rANS lane payload.", error);
-      return false;
-    }
-    *state = (*state << 8) | *--(*lane_iter);
-  }
-  *symbol = static_cast<uint8_t>(selected_symbol);
-  return true;
-}
-
 #if PGEN_RANS_X86_RUNTIME_DISPATCH
 constexpr uint32_t kDecodeTableAbsentFlag = 1U << 30;
 constexpr uint32_t kDecodeTableDeterministicFlag = 1U << 31;
@@ -569,17 +538,13 @@ void BuildAvx512DecodeModel12(
   }
 }
 
-template <RecordMode kMode, uint32_t kGroup, bool kInterleaved,
-          bool kAllEntropy>
+template <RecordMode kMode, uint32_t kGroup, bool kAllEntropy>
 PGEN_RANS_TARGET_AVX512 PGEN_RANS_ALWAYS_INLINE
 bool RansDecodeGroup16Avx512(
     const Avx512DecodeModel12& decode_model,
     uint64_t reference1_word,
     uint64_t reference2_word,
-    const uint8_t* lane_base, uint32_t lane_payload_size,
-    const __m512i& lane_start_offsets,
-    __m512i* lane_iter_offsets, __m512i* state,
-    const uint8_t** interleaved_iter,
+    __m512i* state, const uint8_t** interleaved_iter,
     const uint8_t* interleaved_end,
     uint32_t* packed_symbols, uint32_t* absent_context_mask,
     std::string* error) {
@@ -685,106 +650,36 @@ bool RansDecodeGroup16Avx512(
       _mm512_cmp_epu32_mask(
           *state, _mm512_set1_epi32(kRansLowerBound),
           _MM_CMPINT_LT);
-  if constexpr (kInterleaved) {
-    while (renormalization_mask) {
-      const uint32_t refill_byte_ct =
-          static_cast<uint32_t>(__builtin_popcount(
-              static_cast<uint32_t>(renormalization_mask)));
-      if (static_cast<size_t>(
-              interleaved_end - *interleaved_iter) <
-          refill_byte_ct) {
-        SetError("Truncated interleaved rANS payload.", error);
-        return false;
-      }
-      // Fifteen zero padding bytes at the end of an interleaved
-      // record make this 16-byte load safe even for the final refill.
-      const __m128i packed_bytes = _mm_loadu_si128(
-          reinterpret_cast<const __m128i*>(*interleaved_iter));
-      const __m512i refill_values =
-          _mm512_cvtepu8_epi32(packed_bytes);
-      const __m512i expanded_values =
-          _mm512_maskz_expand_epi32(
-              renormalization_mask, refill_values);
-      const __m512i renormalized_states = _mm512_or_si512(
-          _mm512_slli_epi32(*state, 8), expanded_values);
-      *state = _mm512_mask_mov_epi32(
-          *state, renormalization_mask,
-          renormalized_states);
-      *interleaved_iter += refill_byte_ct;
-      renormalization_mask =
-          entropy_mask &
-          _mm512_cmp_epu32_mask(
-              *state, _mm512_set1_epi32(kRansLowerBound),
-              _MM_CMPINT_LT);
+  while (renormalization_mask) {
+    const uint32_t refill_byte_ct =
+        static_cast<uint32_t>(__builtin_popcount(
+            static_cast<uint32_t>(renormalization_mask)));
+    if (static_cast<size_t>(
+            interleaved_end - *interleaved_iter) <
+        refill_byte_ct) {
+      SetError("Truncated interleaved rANS payload.", error);
+      return false;
     }
-  } else {
-    // AVX-512 has no byte gather, but a dword gather whose low byte is
-    // still substantially cheaper than spilling every state and
-    // chasing individual lane pointers.
-    while (renormalization_mask) {
-      const __mmask16 available_mask =
-          _mm512_cmp_epu32_mask(
-              *lane_iter_offsets, lane_start_offsets,
-              _MM_CMPINT_GT);
-      if (renormalization_mask &
-          static_cast<__mmask16>(~available_mask)) {
-        SetError("Truncated rANS lane payload.", error);
-        return false;
-      }
-      const __m512i next_offsets = _mm512_mask_sub_epi32(
-          *lane_iter_offsets, renormalization_mask,
-          *lane_iter_offsets, _mm512_set1_epi32(1));
-      __mmask16 gather_mask = 0;
-      if (lane_payload_size >= sizeof(uint32_t)) {
-        gather_mask =
-            renormalization_mask &
-            _mm512_cmp_epu32_mask(
-                next_offsets,
-                _mm512_set1_epi32(
-                    static_cast<int>(
-                        lane_payload_size - sizeof(uint32_t))),
-                _MM_CMPINT_LE);
-      }
-      const __m512i input_dwords = _mm512_mask_i32gather_epi32(
-          _mm512_setzero_si512(), gather_mask,
-          next_offsets, lane_base, 1);
-      const __m512i renormalized_states = _mm512_or_si512(
-          _mm512_slli_epi32(*state, 8),
-          _mm512_and_si512(
-              input_dwords, _mm512_set1_epi32(255)));
-      *state = _mm512_mask_mov_epi32(
-          *state, gather_mask,
-          renormalized_states);
-      *lane_iter_offsets = _mm512_mask_mov_epi32(
-          *lane_iter_offsets, renormalization_mask,
-          next_offsets);
-      __mmask16 scalar_mask =
-          renormalization_mask &
-          static_cast<__mmask16>(~gather_mask);
-      if (scalar_mask) {
-        alignas(64) uint32_t state_lanes[16];
-        alignas(64) uint32_t iter_offsets[16];
-        _mm512_store_si512(state_lanes, *state);
-        _mm512_store_si512(
-            iter_offsets, *lane_iter_offsets);
-        while (scalar_mask) {
-          const uint32_t lane = static_cast<uint32_t>(
-              __builtin_ctz(
-                  static_cast<uint32_t>(scalar_mask)));
-          scalar_mask = static_cast<__mmask16>(
-              scalar_mask & (scalar_mask - 1));
-          state_lanes[lane] =
-              (state_lanes[lane] << 8) |
-              lane_base[iter_offsets[lane]];
-        }
-        *state = _mm512_load_si512(state_lanes);
-      }
-      renormalization_mask =
-          entropy_mask &
-          _mm512_cmp_epu32_mask(
-              *state, _mm512_set1_epi32(kRansLowerBound),
-              _MM_CMPINT_LT);
-    }
+    // Fifteen zero padding bytes at the end of an interleaved
+    // record make this 16-byte load safe even for the final refill.
+    const __m128i packed_bytes = _mm_loadu_si128(
+        reinterpret_cast<const __m128i*>(*interleaved_iter));
+    const __m512i refill_values =
+        _mm512_cvtepu8_epi32(packed_bytes);
+    const __m512i expanded_values =
+        _mm512_maskz_expand_epi32(
+            renormalization_mask, refill_values);
+    const __m512i renormalized_states = _mm512_or_si512(
+        _mm512_slli_epi32(*state, 8), expanded_values);
+    *state = _mm512_mask_mov_epi32(
+        *state, renormalization_mask,
+        renormalized_states);
+    *interleaved_iter += refill_byte_ct;
+    renormalization_mask =
+        entropy_mask &
+        _mm512_cmp_epu32_mask(
+            *state, _mm512_set1_epi32(kRansLowerBound),
+            _MM_CMPINT_LT);
   }
 
   // With monotonic threshold masks, symbol = above0 + above1 +
@@ -801,140 +696,6 @@ bool RansDecodeGroup16Avx512(
   return true;
 }
 
-template <RecordMode kMode>
-PGEN_RANS_TARGET_AVX512
-bool DecodeEntropyWords32Avx512(
-    const Model& model, const uint64_t* reference1,
-    const uint64_t* reference2, uint32_t sample_ct,
-    const std::array<const uint8_t*, 256>& lane_starts,
-    std::array<const uint8_t*, 256>* lane_iters,
-    std::array<uint32_t, 256>* states, uint64_t* target,
-    std::string* error) {
-  Avx512DecodeModel12 decode_model;
-  BuildAvx512DecodeModel12(model, &decode_model);
-  const uint8_t* const lane_base = lane_starts[0];
-  alignas(64) uint32_t lane_start_offset_values[32];
-  alignas(64) uint32_t lane_iter_offset_values[32];
-  for (uint32_t lane = 0; lane != 32; ++lane) {
-    lane_start_offset_values[lane] = static_cast<uint32_t>(
-        lane_starts[lane] - lane_base);
-    lane_iter_offset_values[lane] = static_cast<uint32_t>(
-        (*lane_iters)[lane] - lane_base);
-  }
-  const uint32_t lane_payload_size =
-      lane_iter_offset_values[31];
-  const __m512i lane_start_offsets0 =
-      _mm512_load_si512(lane_start_offset_values);
-  const __m512i lane_start_offsets1 =
-      _mm512_load_si512(lane_start_offset_values + 16);
-  __m512i lane_iter_offsets0 =
-      _mm512_load_si512(lane_iter_offset_values);
-  __m512i lane_iter_offsets1 =
-      _mm512_load_si512(lane_iter_offset_values + 16);
-  __m512i state0 = _mm512_loadu_si512(&(states->at(0)));
-  __m512i state1 = _mm512_loadu_si512(&(states->at(16)));
-  uint32_t absent_context_mask = 0;
-  const uint32_t full_word_ct = sample_ct / 32;
-  for (uint32_t word_idx = 0; word_idx != full_word_ct; ++word_idx) {
-    const uint64_t reference1_word =
-        (kMode == RecordMode::kMarginal) ? 0 : reference1[word_idx];
-    const uint64_t reference2_word =
-        (kMode == RecordMode::kTwoReference) ? reference2[word_idx] : 0;
-    uint32_t packed0;
-    uint32_t packed1;
-    if (!RansDecodeGroup16Avx512<kMode, 0, false, false>(
-            decode_model, reference1_word, reference2_word,
-            lane_base, lane_payload_size, lane_start_offsets0,
-            &lane_iter_offsets0, &state0, nullptr, nullptr,
-            &packed0,
-            &absent_context_mask, error) ||
-        !RansDecodeGroup16Avx512<kMode, 1, false, false>(
-            decode_model, reference1_word, reference2_word,
-            lane_base, lane_payload_size, lane_start_offsets1,
-            &lane_iter_offsets1, &state1, nullptr, nullptr,
-            &packed1,
-            &absent_context_mask, error)) {
-      return false;
-    }
-    target[word_idx] =
-        static_cast<uint64_t>(packed0) |
-        (static_cast<uint64_t>(packed1) << 32);
-  }
-  _mm512_storeu_si512(&(states->at(0)), state0);
-  _mm512_storeu_si512(&(states->at(16)), state1);
-  _mm512_store_si512(
-      lane_iter_offset_values, lane_iter_offsets0);
-  _mm512_store_si512(
-      lane_iter_offset_values + 16, lane_iter_offsets1);
-  for (uint32_t lane = 0; lane != 32; ++lane) {
-    (*lane_iters)[lane] =
-        lane_base + lane_iter_offset_values[lane];
-  }
-
-  const uint32_t tail_sample_ct = sample_ct % 32;
-  if (tail_sample_ct) {
-    const uint32_t word_idx = full_word_ct;
-    const uint64_t reference1_word =
-        (kMode == RecordMode::kMarginal) ? 0 : reference1[word_idx];
-    const uint64_t reference2_word =
-        (kMode == RecordMode::kTwoReference) ? reference2[word_idx] : 0;
-    uint64_t packed_word = 0;
-    for (uint32_t lane = 0; lane != tail_sample_ct; ++lane) {
-      uint32_t context = 0;
-      if (kMode != RecordMode::kMarginal) {
-        context = static_cast<uint32_t>(
-            (reference1_word >> (2 * lane)) & 3U);
-      }
-      if (kMode == RecordMode::kTwoReference) {
-        context =
-            4 * context +
-            static_cast<uint32_t>(
-                (reference2_word >> (2 * lane)) & 3U);
-      }
-      const uint32_t slot =
-          (*states)[lane] & (kDefaultSlotCt - 1);
-      const uint32_t active_symbol_ct =
-          model.active_symbol_cts[context];
-      if (!active_symbol_ct) {
-        absent_context_mask |= kDecodeTableAbsentFlag;
-      }
-      uint8_t symbol = model.deterministic_symbols[context];
-      if (active_symbol_ct > 1) {
-        const ModelRow& row = model.rows[context];
-        symbol = static_cast<uint8_t>(
-            static_cast<uint32_t>(
-                slot >= row.cumulative[1]) +
-            static_cast<uint32_t>(
-                slot >= row.cumulative[2]) +
-            static_cast<uint32_t>(
-                slot >= row.cumulative[3]));
-        const uint32_t frequency = row.frequencies[symbol];
-        const uint32_t cumulative = row.cumulative[symbol];
-        (*states)[lane] =
-            frequency *
-                ((*states)[lane] >> kDefaultScaleBits) +
-            slot - cumulative;
-        while ((*states)[lane] < kRansLowerBound) {
-          if ((*lane_iters)[lane] == lane_starts[lane]) {
-            SetError("Truncated rANS lane payload.", error);
-            return false;
-          }
-          (*states)[lane] =
-              ((*states)[lane] << 8) |
-              *--((*lane_iters)[lane]);
-        }
-      }
-      packed_word |= static_cast<uint64_t>(symbol) << (2 * lane);
-    }
-    target[word_idx] = packed_word;
-  }
-  if (absent_context_mask) {
-    SetError("Reference selects an absent model context.", error);
-    return false;
-  }
-  return true;
-}
-
 template <RecordMode kMode, bool kAllEntropy>
 PGEN_RANS_TARGET_AVX512
 bool DecodeEntropyWords32InterleavedAvx512(
@@ -947,8 +708,6 @@ bool DecodeEntropyWords32InterleavedAvx512(
   BuildAvx512DecodeModel12(model, &decode_model);
   __m512i state0 = _mm512_loadu_si512(&(states->at(0)));
   __m512i state1 = _mm512_loadu_si512(&(states->at(16)));
-  const __m512i unused_offsets = _mm512_setzero_si512();
-  __m512i unused_iter_offsets = _mm512_setzero_si512();
   const uint8_t* payload_iter = payload_begin;
   uint32_t absent_context_mask = 0;
   const uint32_t full_word_ct = sample_ct / 32;
@@ -965,15 +724,13 @@ bool DecodeEntropyWords32InterleavedAvx512(
     uint32_t packed0;
     uint32_t packed1;
     if (!RansDecodeGroup16Avx512<
-            kMode, 0, true, kAllEntropy>(
+            kMode, 0, kAllEntropy>(
             decode_model, reference1_word, reference2_word,
-            nullptr, 0, unused_offsets, &unused_iter_offsets,
             &state0, &payload_iter, payload_end, &packed0,
             &absent_context_mask, error) ||
         !RansDecodeGroup16Avx512<
-            kMode, 1, true, kAllEntropy>(
+            kMode, 1, kAllEntropy>(
             decode_model, reference1_word, reference2_word,
-            nullptr, 0, unused_offsets, &unused_iter_offsets,
             &state1, &payload_iter, payload_end, &packed1,
             &absent_context_mask, error)) {
       return false;
@@ -1078,32 +835,6 @@ bool DecodeEntropyWords32InterleavedAvx512(
   }
   *payload_iter_out = payload_iter;
   return true;
-}
-
-PGEN_RANS_TARGET_AVX512
-bool DecodeEntropyRecord32Avx512(
-    RecordMode mode, const Model& model, const uint64_t* reference1,
-    const uint64_t* reference2, uint32_t sample_ct,
-    const std::array<const uint8_t*, 256>& lane_starts,
-    std::array<const uint8_t*, 256>* lane_iters,
-    std::array<uint32_t, 256>* states, uint64_t* target,
-    std::string* error) {
-  switch (mode) {
-    case RecordMode::kMarginal:
-      return DecodeEntropyWords32Avx512<RecordMode::kMarginal>(
-          model, reference1, reference2, sample_ct, lane_starts,
-          lane_iters, states, target, error);
-    case RecordMode::kOneReference:
-      return DecodeEntropyWords32Avx512<RecordMode::kOneReference>(
-          model, reference1, reference2, sample_ct, lane_starts,
-          lane_iters, states, target, error);
-    case RecordMode::kTwoReference:
-      return DecodeEntropyWords32Avx512<RecordMode::kTwoReference>(
-          model, reference1, reference2, sample_ct, lane_starts,
-          lane_iters, states, target, error);
-  }
-  SetError("Unknown rANS record mode.", error);
-  return false;
 }
 
 template <bool kAllEntropy>
@@ -1268,136 +999,6 @@ bool DecodeEntropyRecordInterleaved(
   return false;
 }
 
-template <RecordMode kMode, uint32_t kScaleBits, bool kAllEntropy>
-bool DecodeEntropyWords32(
-    const Model& model, const uint64_t* reference1,
-    const uint64_t* reference2, uint32_t sample_ct,
-    uint32_t runtime_scale_bits,
-    const std::array<const uint8_t*, 256>& lane_starts,
-    std::array<const uint8_t*, 256>* lane_iters,
-    std::array<uint32_t, 256>* states, uint64_t* target,
-    std::string* error) {
-  uint16_t observed_context_mask =
-      (kMode == RecordMode::kMarginal) ? 1 : 0;
-  const uint32_t full_word_ct = sample_ct / 32;
-  for (uint32_t word_idx = 0; word_idx != full_word_ct; ++word_idx) {
-    const uint64_t reference1_word =
-        (kMode == RecordMode::kMarginal) ? 0 : reference1[word_idx];
-    const uint64_t reference2_word =
-        (kMode == RecordMode::kTwoReference) ? reference2[word_idx] : 0;
-    uint64_t packed_word = 0;
-    for (uint32_t lane = 0; lane != 32; ++lane) {
-      uint32_t context = 0;
-      if (kMode != RecordMode::kMarginal) {
-        context =
-            static_cast<uint32_t>((reference1_word >> (2 * lane)) & 3U);
-      }
-      if (kMode == RecordMode::kTwoReference) {
-        context =
-            4 * context +
-            static_cast<uint32_t>(
-                (reference2_word >> (2 * lane)) & 3U);
-      }
-      if (kMode != RecordMode::kMarginal) {
-        observed_context_mask |=
-            static_cast<uint16_t>(1U << context);
-      }
-      uint8_t symbol;
-      if (kAllEntropy ||
-          (model.entropy_context_mask & (1U << context))) {
-        if (!RansDecodeSymbol<kScaleBits>(
-                model.rows[context], runtime_scale_bits,
-                lane_starts[lane], &((*lane_iters)[lane]),
-                &((*states)[lane]), &symbol, error)) {
-          return false;
-        }
-      } else {
-        symbol = model.deterministic_symbols[context];
-      }
-      packed_word |= static_cast<uint64_t>(symbol) << (2 * lane);
-    }
-    target[word_idx] = packed_word;
-  }
-  const uint32_t tail_sample_ct = sample_ct % 32;
-  if (tail_sample_ct) {
-    const uint32_t word_idx = full_word_ct;
-    const uint64_t reference1_word =
-        (kMode == RecordMode::kMarginal) ? 0 : reference1[word_idx];
-    const uint64_t reference2_word =
-        (kMode == RecordMode::kTwoReference) ? reference2[word_idx] : 0;
-    uint64_t packed_word = 0;
-    for (uint32_t lane = 0; lane != tail_sample_ct; ++lane) {
-      uint32_t context = 0;
-      if (kMode != RecordMode::kMarginal) {
-        context =
-            static_cast<uint32_t>((reference1_word >> (2 * lane)) & 3U);
-      }
-      if (kMode == RecordMode::kTwoReference) {
-        context =
-            4 * context +
-            static_cast<uint32_t>(
-                (reference2_word >> (2 * lane)) & 3U);
-      }
-      if (kMode != RecordMode::kMarginal) {
-        observed_context_mask |=
-            static_cast<uint16_t>(1U << context);
-      }
-      uint8_t symbol;
-      if (kAllEntropy ||
-          (model.entropy_context_mask & (1U << context))) {
-        if (!RansDecodeSymbol<kScaleBits>(
-                model.rows[context], runtime_scale_bits,
-                lane_starts[lane], &((*lane_iters)[lane]),
-                &((*states)[lane]), &symbol, error)) {
-          return false;
-        }
-      } else {
-        symbol = model.deterministic_symbols[context];
-      }
-      packed_word |= static_cast<uint64_t>(symbol) << (2 * lane);
-    }
-    target[word_idx] = packed_word;
-  }
-  if (observed_context_mask & ~model.context_mask) {
-    SetError("Reference selects an absent model context.", error);
-    return false;
-  }
-  return true;
-}
-
-template <uint32_t kScaleBits, bool kAllEntropy>
-bool DecodeEntropyRecord32(
-    RecordMode mode, const Model& model, const uint64_t* reference1,
-    const uint64_t* reference2, uint32_t sample_ct,
-    uint32_t runtime_scale_bits,
-    const std::array<const uint8_t*, 256>& lane_starts,
-    std::array<const uint8_t*, 256>* lane_iters,
-    std::array<uint32_t, 256>* states, uint64_t* target,
-    std::string* error) {
-  switch (mode) {
-    case RecordMode::kMarginal:
-      return DecodeEntropyWords32<
-          RecordMode::kMarginal, kScaleBits, kAllEntropy>(
-              model, reference1, reference2, sample_ct,
-              runtime_scale_bits, lane_starts, lane_iters, states,
-              target, error);
-    case RecordMode::kOneReference:
-      return DecodeEntropyWords32<
-          RecordMode::kOneReference, kScaleBits, kAllEntropy>(
-              model, reference1, reference2, sample_ct,
-              runtime_scale_bits, lane_starts, lane_iters, states,
-              target, error);
-    case RecordMode::kTwoReference:
-      return DecodeEntropyWords32<
-          RecordMode::kTwoReference, kScaleBits, kAllEntropy>(
-              model, reference1, reference2, sample_ct,
-              runtime_scale_bits, lane_starts, lane_iters, states,
-              target, error);
-  }
-  SetError("Unknown rANS record mode.", error);
-  return false;
-}
-
 bool ParsePrefix(const uint8_t* record, size_t record_size,
                  RecordMetadata* metadata, size_t* offset,
                  std::string* error) {
@@ -1417,15 +1018,6 @@ bool ParsePrefix(const uint8_t* record, size_t record_size,
   }
   metadata->mode = static_cast<RecordMode>(mode_code);
   metadata->has_entropy_payload = (flags & kEntropyPayloadFlag);
-  metadata->has_interleaved_payload =
-      (flags & kInterleavedPayloadFlag);
-  if (metadata->has_interleaved_payload &&
-      !metadata->has_entropy_payload) {
-    SetError(
-        "Interleaved record is missing the entropy-payload flag.",
-        error);
-    return false;
-  }
   *offset = 1;
   if (metadata->mode != RecordMode::kMarginal) {
     if (*offset == record_size) {
@@ -1499,7 +1091,7 @@ bool EncodeRecord(const uint64_t* target, const uint64_t* reference1,
   }
   uint8_t flags = static_cast<uint8_t>(mode);
   if (model.has_entropy) {
-    flags |= kEntropyPayloadFlag | kInterleavedPayloadFlag;
+    flags |= kEntropyPayloadFlag;
   }
   record->push_back(flags);
   if (mode != RecordMode::kMarginal) {
@@ -1711,190 +1303,74 @@ bool DecodeRecordToBufferImpl(
       return false;
     }
   }
-  if (parsed_metadata.has_interleaved_payload) {
-    if (record_size - offset < kInterleavedPaddingByteCt) {
-      SetError("Truncated interleaved rANS padding.", error);
-      return false;
-    }
-    const uint8_t* const payload_begin = record + offset;
-    const uint8_t* const payload_end =
-        record + record_size - kInterleavedPaddingByteCt;
-    for (const uint8_t* padding_iter = payload_end;
-         padding_iter != record + record_size; ++padding_iter) {
-      if (*padding_iter) {
-        SetError("Interleaved rANS padding is nonzero.", error);
-        return false;
-      }
-    }
-    const uint8_t* payload_iter = payload_begin;
-    bool decode_ok = false;
-    bool used_vector_decoder = false;
-#if PGEN_RANS_X86_RUNTIME_DISPATCH
-    if ((state_ct == 32) &&
-        (params.scale_bits == kDefaultScaleBits) &&
-        (sample_ct >= kAvx512MinimumSampleCt) &&
-        HasAvx512Decoder()) {
-      used_vector_decoder = true;
-      const uint16_t full_context_mask = static_cast<uint16_t>(
-          (1U << model.row_ct) - 1);
-      decode_ok =
-          (validated_contexts ||
-           (model.entropy_context_mask == full_context_mask))
-              ? DecodeEntropyRecordInterleavedAvx512<true>(
-                    parsed_metadata.mode, model, reference1,
-                    reference2, sample_ct, payload_begin,
-                    payload_end, &states, target, &payload_iter,
-                    error)
-              : DecodeEntropyRecordInterleavedAvx512<false>(
-                    parsed_metadata.mode, model, reference1,
-                    reference2, sample_ct, payload_begin,
-                    payload_end, &states, target, &payload_iter,
-                    error);
-    }
-#endif
-    if (!used_vector_decoder) {
-      decode_ok =
-          (params.scale_bits == kDefaultScaleBits)
-              ? DecodeEntropyRecordInterleaved<
-                    kDefaultScaleBits>(
-                    parsed_metadata.mode, model, reference1,
-                    reference2, sample_ct, state_ct,
-                    params.scale_bits, payload_begin, payload_end,
-                    &states, target, &payload_iter, error)
-              : DecodeEntropyRecordInterleaved<0>(
-                    parsed_metadata.mode, model, reference1,
-                    reference2, sample_ct, state_ct,
-                    params.scale_bits, payload_begin, payload_end,
-                    &states, target, &payload_iter, error);
-    }
-    if (!decode_ok) {
-      return false;
-    }
-    if (payload_iter != payload_end) {
-      SetError(
-          "Interleaved rANS payload has trailing bytes.", error);
-      return false;
-    }
-    for (uint32_t lane = 0; lane != state_ct; ++lane) {
-      if (states[lane] != kRansLowerBound) {
-        SetError(
-            "Interleaved rANS state did not terminate canonically.",
-            error);
-        return false;
-      }
-    }
-    if (metadata) {
-      *metadata = parsed_metadata;
-    }
-    return true;
-  }
-  std::array<uint32_t, 257> lane_boundaries = {};
-  for (uint32_t lane = 0; lane + 1 != state_ct; ++lane) {
-    if (!ReadU32(record, record_size, &offset,
-                 &(lane_boundaries[lane + 1]))) {
-      SetError("Truncated rANS lane boundary table.", error);
-      return false;
-    }
-  }
-  const size_t payload_size = record_size - offset;
-  if (payload_size > UINT32_MAX) {
-    SetError("rANS payload exceeds the v1 record limit.", error);
+  if (record_size - offset < kInterleavedPaddingByteCt) {
+    SetError("Truncated interleaved rANS padding.", error);
     return false;
   }
-  lane_boundaries[state_ct] = static_cast<uint32_t>(payload_size);
-  std::array<const uint8_t*, 256> lane_starts = {};
-  std::array<const uint8_t*, 256> lane_iters = {};
-  for (uint32_t lane = 0; lane != state_ct; ++lane) {
-    if ((lane_boundaries[lane] > lane_boundaries[lane + 1]) ||
-        (lane_boundaries[lane + 1] > payload_size)) {
-      SetError("Invalid rANS lane boundary.", error);
+  const uint8_t* const payload_begin = record + offset;
+  const uint8_t* const payload_end =
+      record + record_size - kInterleavedPaddingByteCt;
+  for (const uint8_t* padding_iter = payload_end;
+       padding_iter != record + record_size; ++padding_iter) {
+    if (*padding_iter) {
+      SetError("Interleaved rANS padding is nonzero.", error);
       return false;
     }
-    lane_starts[lane] = record + offset + lane_boundaries[lane];
-    lane_iters[lane] =
-        record + offset + lane_boundaries[lane + 1];
   }
-  if (state_ct == 32) {
-    bool used_vector_decoder = false;
-    bool decode_ok = false;
+  const uint8_t* payload_iter = payload_begin;
+  bool decode_ok = false;
+  bool used_vector_decoder = false;
 #if PGEN_RANS_X86_RUNTIME_DISPATCH
-    if ((params.scale_bits == kDefaultScaleBits) &&
-        (sample_ct >= kAvx512MinimumSampleCt) &&
-        HasAvx512Decoder()) {
-      used_vector_decoder = true;
-      decode_ok = DecodeEntropyRecord32Avx512(
-          parsed_metadata.mode, model, reference1, reference2,
-          sample_ct, lane_starts, &lane_iters, &states, target,
-          error);
-    }
+  if ((state_ct == 32) &&
+      (params.scale_bits == kDefaultScaleBits) &&
+      (sample_ct >= kAvx512MinimumSampleCt) &&
+      HasAvx512Decoder()) {
+    used_vector_decoder = true;
+    const uint16_t full_context_mask = static_cast<uint16_t>(
+        (1U << model.row_ct) - 1);
+    decode_ok =
+        (validated_contexts ||
+         (model.entropy_context_mask == full_context_mask))
+            ? DecodeEntropyRecordInterleavedAvx512<true>(
+                  parsed_metadata.mode, model, reference1,
+                  reference2, sample_ct, payload_begin,
+                  payload_end, &states, target, &payload_iter,
+                  error)
+            : DecodeEntropyRecordInterleavedAvx512<false>(
+                  parsed_metadata.mode, model, reference1,
+                  reference2, sample_ct, payload_begin,
+                  payload_end, &states, target, &payload_iter,
+                  error);
+  }
 #endif
-    const bool all_contexts_have_entropy =
-        model.entropy_context_mask == model.context_mask;
-    if (!used_vector_decoder) {
-      if (params.scale_bits == kDefaultScaleBits) {
-        decode_ok =
-            all_contexts_have_entropy
-                ? DecodeEntropyRecord32<
-                      kDefaultScaleBits, true>(
-                      parsed_metadata.mode, model, reference1,
-                      reference2, sample_ct, params.scale_bits,
-                      lane_starts, &lane_iters, &states, target, error)
-                : DecodeEntropyRecord32<
-                      kDefaultScaleBits, false>(
-                      parsed_metadata.mode, model, reference1,
-                      reference2, sample_ct, params.scale_bits,
-                      lane_starts, &lane_iters, &states, target, error);
-      } else {
-        decode_ok =
-            all_contexts_have_entropy
-                ? DecodeEntropyRecord32<0, true>(
-                      parsed_metadata.mode, model, reference1,
-                      reference2, sample_ct, params.scale_bits,
-                      lane_starts, &lane_iters, &states, target, error)
-                : DecodeEntropyRecord32<0, false>(
-                      parsed_metadata.mode, model, reference1,
-                      reference2, sample_ct, params.scale_bits,
-                      lane_starts, &lane_iters, &states, target, error);
-      }
-    }
-    if (!decode_ok) {
-      return false;
-    }
-  } else {
-    memset(target, 0,
-           static_cast<size_t>(packed_word_ct) * sizeof(uint64_t));
-    for (uint32_t first_sample = 0; first_sample < sample_ct;
-         first_sample += state_ct) {
-      const uint32_t round_sample_ct =
-          std::min(state_ct, sample_ct - first_sample);
-      for (uint32_t lane = 0; lane != round_sample_ct; ++lane) {
-        const uint32_t sample_idx = first_sample + lane;
-        const uint32_t context = ContextIndex(
-            parsed_metadata.mode, reference1, reference2, sample_idx);
-        const ModelRow& row = model.rows[context];
-        const uint32_t active_symbol_ct =
-            model.active_symbol_cts[context];
-        if (!active_symbol_ct) {
-          SetError("Reference selects an absent model context.", error);
-          return false;
-        }
-        uint8_t symbol;
-        if (active_symbol_ct == 1) {
-          symbol = model.deterministic_symbols[context];
-        } else if (!RansDecodeSymbol<0>(
-                       row, params.scale_bits, lane_starts[lane],
-                       &(lane_iters[lane]), &(states[lane]), &symbol,
-                       error)) {
-          return false;
-        }
-        SetPackedGenotype(target, sample_idx, symbol);
-      }
-    }
+  if (!used_vector_decoder) {
+    decode_ok =
+        (params.scale_bits == kDefaultScaleBits)
+            ? DecodeEntropyRecordInterleaved<
+                  kDefaultScaleBits>(
+                  parsed_metadata.mode, model, reference1,
+                  reference2, sample_ct, state_ct,
+                  params.scale_bits, payload_begin, payload_end,
+                  &states, target, &payload_iter, error)
+            : DecodeEntropyRecordInterleaved<0>(
+                  parsed_metadata.mode, model, reference1,
+                  reference2, sample_ct, state_ct,
+                  params.scale_bits, payload_begin, payload_end,
+                  &states, target, &payload_iter, error);
+  }
+  if (!decode_ok) {
+    return false;
+  }
+  if (payload_iter != payload_end) {
+    SetError(
+        "Interleaved rANS payload has trailing bytes.", error);
+    return false;
   }
   for (uint32_t lane = 0; lane != state_ct; ++lane) {
-    if ((lane_iters[lane] != lane_starts[lane]) ||
-        (states[lane] != kRansLowerBound)) {
-      SetError("rANS lane did not terminate at its canonical state.", error);
+    if (states[lane] != kRansLowerBound) {
+      SetError(
+          "Interleaved rANS state did not terminate canonically.",
+          error);
       return false;
     }
   }

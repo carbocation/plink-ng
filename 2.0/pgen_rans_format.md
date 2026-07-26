@@ -26,11 +26,10 @@ The first byte contains:
 
 - bits 0-1: mode (`0` marginal, `1` one reference, `2` two references);
 - bit 2: rANS state and byte-renormalization payload are present;
-- bit 3: refill-interleaved payload layout;
-- bits 4-7: reserved and zero.
+- bits 3-7: reserved and zero.
 
 One-reference records next store one byte containing the anchor ordinal.
-Two-reference records store two distinct anchor ordinals. Version 1 therefore
+Two-reference records store two distinct anchor ordinals. Version 2 therefore
 supports at most 256 anchors per block.
 
 The probability model follows:
@@ -59,48 +58,40 @@ When any model row has more than one active symbol, the record stores:
 The intended lane count is 32. Sample `i` belongs to lane `i mod lane_count`.
 Each lane is an independent bytewise-rANS state.
 
-When bit 3 is clear, the legacy payload stores one 32-bit cumulative boundary
-after every lane except the last, followed by the concatenated lane byte
-streams. Lane streams are stored in encoder emission order and consumed
-backward. The record length supplies the final lane boundary. Readers retain
-this path for backward compatibility.
+There is no lane-boundary table. Refill bytes are merged in forward decoder
+order. Each 32-sample round visits lanes 0-15 and then 16-31. For each group,
+the decoder computes the mask of states below the rANS lower bound and consumes
+one byte for every set lane, in ascending lane order; it repeats until no lane
+in that group needs another byte. Fifteen zero bytes follow the payload. They
+make a final unaligned 16-byte CPU load safe without becoming part of the coded
+stream.
 
-When bit 3 is set, no lane-boundary table is present. Refill bytes are merged
-in forward decoder order. Each 32-sample round visits lanes 0-15 and then
-16-31. For each group, the decoder computes the mask of states below the rANS
-lower bound and consumes one byte for every set lane, in ascending lane order;
-it repeats until no lane in that group needs another byte. Fifteen zero bytes
-follow the payload. They make a final unaligned 16-byte CPU load safe without
-becoming part of the coded stream.
+AVX-512 can load each refill layer contiguously and expand it under the state
+mask, while CUDA lanes read a coalesced span in warp order.
 
-This refill-interleaved layout replaces 124 bytes of lane boundaries with 15
-bytes of padding. More importantly, AVX-512 can load each refill layer
-contiguously and expand it under the state mask, while CUDA lanes read a
-coalesced span in warp order.
-
-If every populated row is deterministic, the state table, boundary table, and
-lane payload are omitted and bit 3 is clear.
+If every populated row is deterministic, the state table and refill payload
+are omitted.
 
 ## Canonical validation
 
 A conforming decoder rejects:
 
 - unknown flag bits or modes;
-- truncated selectors, models, states, boundaries, or lane payloads;
+- truncated selectors, models, states, or refill payloads;
 - duplicate two-reference selectors;
 - selectors outside the block anchor slab;
 - invalid normalized-frequency totals;
 - references selecting an absent model context;
-- nonmonotonic lane boundaries;
 - nonzero refill-interleaved padding;
 - refill-interleaved payloads that are not consumed exactly;
-- lanes that do not consume exactly their payload or terminate at the rANS
-  lower-bound state.
+- lanes that do not terminate at the rANS lower-bound state.
 
 ## Standalone container
 
 The reference implementation wraps records in an experimental `.pgr` file.
 This is deliberately separate from PGEN storage-mode assignment.
+Version 2 files begin with `PGRANS2\0` and carry format version 2 in the
+container header. Earlier experimental container identities are not supported.
 
 The 64-byte file header stores the version, sample and variant counts, block
 and anchor sizes, rANS parameters, restart interval, block count, and offsets
@@ -120,7 +111,7 @@ To find a record, a reader starts from the closest preceding cumulative
 restart and sums at most `restart_interval - 1` 24-bit lengths. The default
 restart interval is 64 variants.
 
-Version 1 readers validate that block-table entries cover the variants and
+Version 2 readers validate that block-table entries cover the variants and
 file exactly, blocks are contiguous, restart offsets agree with record
 lengths, record lengths span each block payload, and the block CRC32C matches.
 
@@ -217,11 +208,9 @@ double-buffer block reads and decoding.
 
 The CUDA decoder batches multiple container blocks, launches one warp per
 record, and preserves the two-level dependency graph with separate anchor and
-target kernels. Each lane owns one rANS state. Refill-interleaved records use
-warp ballots and population counts to assign a contiguous refill span to the
-active lanes; old lane-separated records remain supported. Warp ballots also
-assemble the low and high genotype bits into the standard packed 64-bit output
-word.
+target kernels. Each lane owns one rANS state. Warp ballots and population
+counts assign a contiguous refill span to the active lanes, and also assemble
+the low and high genotype bits into the standard packed 64-bit output word.
 
 On a CUDA machine, build and run the exact CPU/GPU comparison with:
 
