@@ -62,6 +62,16 @@ typedef struct PgrHardcallBackendStruct {
   PglErr (*get_packed)(void* context, uint32_t vidx,
                        unsigned char* packed_genotypes,
                        uint32_t packed_byte_ct);
+  // Optional PgfiMultiread() fast path.  output contains one
+  // raw_variant_stride-byte slot for every raw variant position in
+  // [variant_uidx_start, variant_uidx_end), including holes excluded by
+  // variant_include.  Backends must populate exactly the load_variant_ct
+  // selected slots.
+  PglErr (*get_packed_batch)(
+      void* context, const uintptr_t* variant_include,
+      uint32_t variant_uidx_start, uint32_t variant_uidx_end,
+      uint32_t load_variant_ct, unsigned char* output,
+      uint32_t raw_variant_stride);
   PglErr (*get_m)(
       void* context, const uintptr_t* sample_include,
       const uint32_t* sample_include_cumulative_popcounts,

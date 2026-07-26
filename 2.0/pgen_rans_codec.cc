@@ -14,12 +14,23 @@
     (defined(__GNUC__) || defined(__clang__))
 #include <immintrin.h>
 #define PGEN_RANS_X86_RUNTIME_DISPATCH 1
+#define PGEN_RANS_TARGET_AVX2 \
+  __attribute__((target("avx2,bmi2")))
 #define PGEN_RANS_TARGET_AVX512 \
   __attribute__((target( \
       "avx512f,avx512dq,avx512bw,avx512vl,bmi2")))
 #else
 #define PGEN_RANS_X86_RUNTIME_DISPATCH 0
+#define PGEN_RANS_TARGET_AVX2
 #define PGEN_RANS_TARGET_AVX512
+#endif
+
+#if (defined(__aarch64__) || defined(__arm64__)) && \
+    (defined(__GNUC__) || defined(__clang__))
+#include <arm_neon.h>
+#define PGEN_RANS_ARM64_NEON 1
+#else
+#define PGEN_RANS_ARM64_NEON 0
 #endif
 
 namespace pgen_rans {
@@ -42,9 +53,15 @@ constexpr uint8_t kKnownPatchFlagMask =
     kPatch01BitmapFlag | kPatch10BitmapFlag;
 constexpr size_t kMultiallelicPatchHeaderByteCt = 11;
 constexpr size_t kMultiallelicPatchFooterByteCt = 4;
-#if PGEN_RANS_X86_RUNTIME_DISPATCH
+#if PGEN_RANS_X86_RUNTIME_DISPATCH || PGEN_RANS_ARM64_NEON
 constexpr uint32_t kDefaultSlotCt = 1U << kDefaultScaleBits;
+#endif
+#if PGEN_RANS_X86_RUNTIME_DISPATCH
+constexpr uint32_t kAvx2MinimumSampleCt = 32768;
 constexpr uint32_t kAvx512MinimumSampleCt = 32768;
+#endif
+#if PGEN_RANS_ARM64_NEON
+constexpr uint32_t kNeonMinimumSampleCt = 128;
 #endif
 
 #if defined(_MSC_VER)
@@ -57,6 +74,11 @@ constexpr uint32_t kAvx512MinimumSampleCt = 32768;
 #define PGEN_RANS_ALWAYS_INLINE inline
 #define PGEN_RANS_NOINLINE
 #endif
+
+thread_local DecodeKernel g_decode_kernel_override = DecodeKernel::kAuto;
+thread_local DecodeKernel g_last_decode_kernel = DecodeKernel::kScalar;
+thread_local EncodeKernel g_encode_kernel_override = EncodeKernel::kAuto;
+thread_local EncodeKernel g_last_encode_kernel = EncodeKernel::kScalar;
 
 struct ModelRow {
   std::array<uint32_t, 4> frequencies = {};
@@ -973,7 +995,7 @@ bool BuildInterleavedPayloadDirectForMode(
       scale_bits, encoders, states, reverse_payload, error);
 }
 
-bool BuildInterleavedPayloadDirect(
+bool BuildInterleavedPayloadDirectScalar(
     const uint64_t* target, const uint64_t* reference1,
     const uint64_t* reference2, uint32_t sample_ct,
     RecordMode mode, const Model& model, uint32_t scale_bits,
@@ -1009,20 +1031,22 @@ bool BuildInterleavedPayloadDirect(
 }
 
 #if PGEN_RANS_X86_RUNTIME_DISPATCH
-constexpr uint32_t kDecodeTableAbsentFlag = 1U << 30;
-constexpr uint32_t kDecodeTableDeterministicFlag = 1U << 31;
-
-struct alignas(64) Avx512DecodeModel12 {
-  // The three cumulative boundaries for all 16 contexts fit in three
-  // zmm registers, and context flags fit in one more.  The selected
-  // interval's cumulative and frequency are derived directly from
-  // adjacent boundaries, avoiding both a random gather and a second
-  // symbol-indexed lookup.
-  std::array<std::array<uint32_t, 16>, 3> thresholds = {};
-  std::array<uint32_t, 16> context_flags = {};
+// AVX-512 encoder
+//
+// This is deliberately a byte-layout-preserving implementation.  The rANS
+// recurrence runs in 16 lanes, but emitted bytes are copied to
+// reverse_payload in precisely the scalar encoder's layer/lane order.
+// Consequently runtime dispatch cannot change serialized records.
+struct alignas(64) Avx512EncodeModel12 {
+  std::array<uint32_t, 64> maximum_states = {};
+  std::array<uint32_t, 64> division_multipliers = {};
+  std::array<uint32_t, 64> cumulatives = {};
+  std::array<uint32_t, 64> packed_division = {};
+  std::array<uint32_t, 16> active_symbol_cts = {};
+  std::array<uint32_t, 16> deterministic_symbols = {};
 };
 
-bool HasAvx512Decoder() {
+bool HasAvx512Encoder() {
   static const bool result = []() {
     __builtin_cpu_init();
     return __builtin_cpu_supports("avx512f") &&
@@ -1034,8 +1058,406 @@ bool HasAvx512Decoder() {
   return result;
 }
 
-void BuildAvx512DecodeModel12(
-    const Model& model, Avx512DecodeModel12* decode_model) {
+void BuildAvx512EncodeModel12(
+    const Model& model,
+    const std::array<std::array<RansEncoderSymbol, 4>, 16>& encoders,
+    Avx512EncodeModel12* encode_model) {
+  for (uint32_t context = 0; context != 16; ++context) {
+    encode_model->active_symbol_cts[context] =
+        model.active_symbol_cts[context];
+    encode_model->deterministic_symbols[context] =
+        model.deterministic_symbols[context];
+    if (model.active_symbol_cts[context] <= 1) {
+      continue;
+    }
+    for (uint32_t symbol = 0; symbol != 4; ++symbol) {
+      const RansEncoderSymbol& encoder = encoders[context][symbol];
+      if (!encoder.frequency) {
+        continue;
+      }
+      const uint32_t idx = 4 * context + symbol;
+      encode_model->maximum_states[idx] = encoder.maximum_state;
+      encode_model->division_multipliers[idx] =
+          encoder.division_multiplier;
+      encode_model->cumulatives[idx] = encoder.cumulative;
+      encode_model->packed_division[idx] =
+          encoder.division_pre_shift |
+          (static_cast<uint32_t>(encoder.division_post_shift) << 8) |
+          (static_cast<uint32_t>(encoder.division_increment) << 16);
+    }
+  }
+}
+
+PGEN_RANS_TARGET_AVX512 PGEN_RANS_ALWAYS_INLINE
+__m512i RansDivide16Avx512(
+    const __m512i& states, const __m512i& multipliers,
+    const __m512i& packed_division) {
+  const __m512i byte_mask = _mm512_set1_epi32(0xff);
+  const __m512i pre_shifts =
+      _mm512_and_si512(packed_division, byte_mask);
+  const __m512i post_shifts = _mm512_and_si512(
+      _mm512_srli_epi32(packed_division, 8), byte_mask);
+  const __m512i increments = _mm512_and_si512(
+      _mm512_srli_epi32(packed_division, 16),
+      _mm512_set1_epi32(1));
+  const __m512i numerators = _mm512_add_epi32(
+      _mm512_srlv_epi32(states, pre_shifts), increments);
+
+  const __m256i numerator_low =
+      _mm512_castsi512_si256(numerators);
+  const __m256i numerator_high =
+      _mm512_extracti64x4_epi64(numerators, 1);
+  const __m256i multiplier_low =
+      _mm512_castsi512_si256(multipliers);
+  const __m256i multiplier_high =
+      _mm512_extracti64x4_epi64(multipliers, 1);
+  const __m256i post_shift_low =
+      _mm512_castsi512_si256(post_shifts);
+  const __m256i post_shift_high =
+      _mm512_extracti64x4_epi64(post_shifts, 1);
+
+  const __m512i quotient_low_64 = _mm512_srlv_epi64(
+      _mm512_mullo_epi64(
+          _mm512_cvtepu32_epi64(numerator_low),
+          _mm512_cvtepu32_epi64(multiplier_low)),
+      _mm512_cvtepu32_epi64(post_shift_low));
+  const __m512i quotient_high_64 = _mm512_srlv_epi64(
+      _mm512_mullo_epi64(
+          _mm512_cvtepu32_epi64(numerator_high),
+          _mm512_cvtepu32_epi64(multiplier_high)),
+      _mm512_cvtepu32_epi64(post_shift_high));
+  const __m256i quotient_low =
+      _mm512_cvtepi64_epi32(quotient_low_64);
+  const __m256i quotient_high =
+      _mm512_cvtepi64_epi32(quotient_high_64);
+  return _mm512_inserti64x4(
+      _mm512_castsi256_si512(quotient_low), quotient_high, 1);
+}
+
+template <RecordMode kMode, uint32_t kStateCt>
+PGEN_RANS_TARGET_AVX512
+bool BuildInterleavedPayloadDirectModeAvx51212(
+    const uint64_t* target, const uint64_t* reference1,
+    const uint64_t* reference2, uint32_t sample_ct,
+    const Avx512EncodeModel12& encode_model,
+    std::vector<uint32_t>* states,
+    std::vector<uint8_t>* reverse_payload, std::string* error) {
+  static_assert((kStateCt == 16) || (kStateCt == 32));
+  const __m512i genotype_shifts = _mm512_setr_epi32(
+      0, 2, 4, 6, 8, 10, 12, 14,
+      16, 18, 20, 22, 24, 26, 28, 30);
+  const __m512i genotype_mask = _mm512_set1_epi32(3);
+  const __m512i one = _mm512_set1_epi32(1);
+  const __m512i total_frequency =
+      _mm512_set1_epi32(kDefaultSlotCt);
+  const __m512i active_symbol_cts = _mm512_load_si512(
+      reinterpret_cast<const __m512i*>(
+          encode_model.active_symbol_cts.data()));
+  const __m512i deterministic_symbols = _mm512_load_si512(
+      reinterpret_cast<const __m512i*>(
+          encode_model.deterministic_symbols.data()));
+
+  reverse_payload->clear();
+  reverse_payload->reserve(sample_ct / 8);
+  uint32_t first_sample =
+      ((sample_ct - 1) / kStateCt) * kStateCt;
+  while (true) {
+    const uint32_t round_sample_ct =
+        std::min(kStateCt, sample_ct - first_sample);
+    const uint32_t word_idx = first_sample / 32;
+    const uint64_t target_word = target[word_idx];
+    uint64_t reference1_word = 0;
+    uint64_t reference2_word = 0;
+    if constexpr (kMode != RecordMode::kMarginal) {
+      reference1_word = reference1[word_idx];
+    }
+    if constexpr (kMode == RecordMode::kTwoReference) {
+      reference2_word = reference2[word_idx];
+    }
+    const uint32_t word_sample_offset =
+        (kStateCt == 16) ? (first_sample % 32) : 0;
+
+    uint32_t group_start =
+        ((round_sample_ct - 1) / 16) * 16;
+    while (true) {
+      const uint32_t group_end =
+          std::min(group_start + 16, round_sample_ct);
+      const uint32_t valid_lane_ct = group_end - group_start;
+      const __mmask16 valid_lanes = static_cast<__mmask16>(
+          (1U << valid_lane_ct) - 1);
+      const uint32_t group_shift =
+          2 * (word_sample_offset + group_start);
+      const uint32_t target_chunk =
+          static_cast<uint32_t>(target_word >> group_shift);
+      const __m512i symbols = _mm512_and_si512(
+          _mm512_srlv_epi32(
+              _mm512_set1_epi32(static_cast<int>(target_chunk)),
+              genotype_shifts),
+          genotype_mask);
+
+      __m512i contexts = _mm512_setzero_si512();
+      if constexpr (kMode != RecordMode::kMarginal) {
+        const uint32_t reference1_chunk =
+            static_cast<uint32_t>(
+                reference1_word >> group_shift);
+        contexts = _mm512_and_si512(
+            _mm512_srlv_epi32(
+                _mm512_set1_epi32(
+                    static_cast<int>(reference1_chunk)),
+                genotype_shifts),
+            genotype_mask);
+      }
+      if constexpr (kMode == RecordMode::kTwoReference) {
+        const uint32_t reference2_chunk =
+            static_cast<uint32_t>(
+                reference2_word >> group_shift);
+        const __m512i second_contexts = _mm512_and_si512(
+            _mm512_srlv_epi32(
+                _mm512_set1_epi32(
+                    static_cast<int>(reference2_chunk)),
+                genotype_shifts),
+            genotype_mask);
+        contexts = _mm512_add_epi32(
+            _mm512_slli_epi32(contexts, 2), second_contexts);
+      }
+      const __m512i encoder_indices = _mm512_add_epi32(
+          _mm512_slli_epi32(contexts, 2), symbols);
+      const __m512i maximum_states = _mm512_i32gather_epi32(
+          encoder_indices, encode_model.maximum_states.data(), 4);
+      const __m512i multipliers = _mm512_i32gather_epi32(
+          encoder_indices,
+          encode_model.division_multipliers.data(), 4);
+      const __m512i cumulatives = _mm512_i32gather_epi32(
+          encoder_indices, encode_model.cumulatives.data(), 4);
+      const __m512i packed_division = _mm512_i32gather_epi32(
+          encoder_indices, encode_model.packed_division.data(), 4);
+
+      __m512i lane_active_symbol_cts;
+      __m512i lane_deterministic_symbols;
+      if constexpr (kMode == RecordMode::kMarginal) {
+        lane_active_symbol_cts = _mm512_set1_epi32(
+            static_cast<int>(
+                encode_model.active_symbol_cts[0]));
+        lane_deterministic_symbols = _mm512_set1_epi32(
+            static_cast<int>(
+                encode_model.deterministic_symbols[0]));
+      } else {
+        lane_active_symbol_cts = _mm512_permutexvar_epi32(
+            contexts, active_symbol_cts);
+        lane_deterministic_symbols = _mm512_permutexvar_epi32(
+            contexts, deterministic_symbols);
+      }
+      const __mmask16 entropy_lanes =
+          valid_lanes &
+          _mm512_cmp_epu32_mask(
+              lane_active_symbol_cts, one, _MM_CMPINT_NLE);
+      const __mmask16 deterministic_lanes =
+          valid_lanes & static_cast<__mmask16>(~entropy_lanes);
+      const __mmask16 invalid_entropy_lanes =
+          entropy_lanes &
+          _mm512_cmpeq_epi32_mask(
+              maximum_states, _mm512_setzero_si512());
+      const __mmask16 invalid_deterministic_lanes =
+          deterministic_lanes &
+          (_mm512_cmpeq_epi32_mask(
+               lane_active_symbol_cts,
+               _mm512_setzero_si512()) |
+           _mm512_cmpneq_epi32_mask(
+               symbols, lane_deterministic_symbols));
+      if (invalid_entropy_lanes ||
+          invalid_deterministic_lanes) {
+        SetError("Supplied rANS model counts do not match genotypes.",
+                 error);
+        return false;
+      }
+
+      __m512i lane_states = _mm512_loadu_si512(
+          reinterpret_cast<const void*>(
+              states->data() + group_start));
+      __m512i emitted_byte_cts = _mm512_setzero_si512();
+      std::array<std::array<uint8_t, 16>, 4> emitted_layers = {};
+      uint32_t maximum_emitted_byte_ct = 0;
+      for (uint32_t emission_idx = 0;
+           emission_idx != emitted_layers.size(); ++emission_idx) {
+        const __mmask16 renormalize_lanes =
+            entropy_lanes &
+            _mm512_cmp_epu32_mask(
+                lane_states, maximum_states, _MM_CMPINT_NLT);
+        if (!renormalize_lanes) {
+          break;
+        }
+        maximum_emitted_byte_ct = emission_idx + 1;
+        const __m128i emitted_bytes =
+            _mm512_cvtepi32_epi8(lane_states);
+        _mm_storeu_si128(
+            reinterpret_cast<__m128i*>(
+                emitted_layers[emission_idx].data()),
+            emitted_bytes);
+        lane_states = _mm512_mask_srli_epi32(
+            lane_states, renormalize_lanes, lane_states, 8);
+        emitted_byte_cts = _mm512_mask_add_epi32(
+            emitted_byte_cts, renormalize_lanes,
+            emitted_byte_cts, one);
+      }
+      if (entropy_lanes &
+          _mm512_cmp_epu32_mask(
+              lane_states, maximum_states, _MM_CMPINT_NLT)) {
+        SetError("Internal rANS encoder renormalization overflow.",
+                 error);
+        return false;
+      }
+
+      const __m512i quotients = RansDivide16Avx512(
+          lane_states, multipliers, packed_division);
+      // At scale 12, maximum_state is frequency * 2^19.  Deriving the
+      // frequency from it saves a fifth indexed gather.
+      const __m512i frequencies =
+          _mm512_srli_epi32(maximum_states, 19);
+      const __m512i updated_states = _mm512_add_epi32(
+          _mm512_add_epi32(
+              lane_states,
+              _mm512_mullo_epi32(
+                  quotients,
+                  _mm512_sub_epi32(
+                      total_frequency, frequencies))),
+          cumulatives);
+      lane_states = _mm512_mask_mov_epi32(
+          lane_states, entropy_lanes, updated_states);
+      _mm512_storeu_si512(
+          reinterpret_cast<void*>(
+              states->data() + group_start),
+          lane_states);
+
+      alignas(64) std::array<uint32_t, 16> emitted_byte_ct_array;
+      _mm512_store_si512(
+          reinterpret_cast<__m512i*>(
+              emitted_byte_ct_array.data()),
+          emitted_byte_cts);
+      // Match BuildInterleavedPayloadDirectMode() exactly: reverse
+      // decoder refill layers, then reverse lane order.  The complete
+      // reverse_payload is reversed once when serialized.
+      for (uint32_t layer_plus_one = maximum_emitted_byte_ct;
+           layer_plus_one; --layer_plus_one) {
+        const uint32_t decoder_layer = layer_plus_one - 1;
+        for (uint32_t lane = valid_lane_ct; lane;) {
+          --lane;
+          const uint32_t emitted_byte_ct =
+              emitted_byte_ct_array[lane];
+          if (emitted_byte_ct <= decoder_layer) {
+            continue;
+          }
+          reverse_payload->push_back(
+              emitted_layers[
+                  emitted_byte_ct - 1 - decoder_layer][lane]);
+        }
+      }
+
+      if (!group_start) {
+        break;
+      }
+      group_start -= 16;
+    }
+    if (!first_sample) {
+      break;
+    }
+    first_sample -= kStateCt;
+  }
+  return true;
+}
+
+template <RecordMode kMode>
+PGEN_RANS_TARGET_AVX512
+bool BuildInterleavedPayloadDirectForModeAvx51212(
+    const uint64_t* target, const uint64_t* reference1,
+    const uint64_t* reference2, uint32_t sample_ct,
+    const Avx512EncodeModel12& encode_model,
+    std::vector<uint32_t>* states,
+    std::vector<uint8_t>* reverse_payload, std::string* error) {
+  if (states->size() == 32) {
+    return BuildInterleavedPayloadDirectModeAvx51212<kMode, 32>(
+        target, reference1, reference2, sample_ct, encode_model,
+        states, reverse_payload, error);
+  }
+  return BuildInterleavedPayloadDirectModeAvx51212<kMode, 16>(
+      target, reference1, reference2, sample_ct, encode_model,
+      states, reverse_payload, error);
+}
+
+PGEN_RANS_TARGET_AVX512
+bool BuildInterleavedPayloadDirectAvx51212(
+    const uint64_t* target, const uint64_t* reference1,
+    const uint64_t* reference2, uint32_t sample_ct,
+    RecordMode mode, const Model& model,
+    const std::array<std::array<RansEncoderSymbol, 4>, 16>& encoders,
+    std::vector<uint32_t>* states,
+    std::vector<uint8_t>* reverse_payload, std::string* error) {
+  Avx512EncodeModel12 encode_model;
+  BuildAvx512EncodeModel12(model, encoders, &encode_model);
+  switch (mode) {
+    case RecordMode::kMarginal:
+      return BuildInterleavedPayloadDirectForModeAvx51212<
+          RecordMode::kMarginal>(
+          target, reference1, reference2, sample_ct, encode_model,
+          states, reverse_payload, error);
+    case RecordMode::kOneReference:
+      return BuildInterleavedPayloadDirectForModeAvx51212<
+          RecordMode::kOneReference>(
+          target, reference1, reference2, sample_ct, encode_model,
+          states, reverse_payload, error);
+    case RecordMode::kTwoReference:
+      return BuildInterleavedPayloadDirectForModeAvx51212<
+          RecordMode::kTwoReference>(
+          target, reference1, reference2, sample_ct, encode_model,
+          states, reverse_payload, error);
+  }
+  SetError("Invalid conditional-rANS record mode.", error);
+  return false;
+}
+#endif
+
+bool BuildInterleavedPayloadDirect(
+    const uint64_t* target, const uint64_t* reference1,
+    const uint64_t* reference2, uint32_t sample_ct,
+    RecordMode mode, const Model& model, uint32_t scale_bits,
+    const std::array<std::array<RansEncoderSymbol, 4>, 16>& encoders,
+    std::vector<uint32_t>* states, std::vector<uint8_t>* reverse_payload,
+    std::string* error) {
+  g_last_encode_kernel = EncodeKernel::kScalar;
+#if PGEN_RANS_X86_RUNTIME_DISPATCH
+  const bool eligible_for_avx512 =
+      (scale_bits == kDefaultScaleBits) &&
+      ((states->size() == 16) || (states->size() == 32));
+  const bool force_avx512 =
+      g_encode_kernel_override == EncodeKernel::kAvx512;
+  if (eligible_for_avx512 && HasAvx512Encoder() &&
+      (force_avx512 ||
+       ((g_encode_kernel_override == EncodeKernel::kAuto) &&
+        (sample_ct >= kAvx512MinimumSampleCt)))) {
+    g_last_encode_kernel = EncodeKernel::kAvx512;
+    return BuildInterleavedPayloadDirectAvx51212(
+        target, reference1, reference2, sample_ct, mode, model,
+        encoders, states, reverse_payload, error);
+  }
+#endif
+  return BuildInterleavedPayloadDirectScalar(
+      target, reference1, reference2, sample_ct, mode, model,
+      scale_bits, encoders, states, reverse_payload, error);
+}
+
+#if PGEN_RANS_X86_RUNTIME_DISPATCH || PGEN_RANS_ARM64_NEON
+constexpr uint32_t kDecodeTableAbsentFlag = 1U << 30;
+constexpr uint32_t kDecodeTableDeterministicFlag = 1U << 31;
+
+struct alignas(64) VectorDecodeModel12 {
+  // The selected interval's cumulative and frequency are derived directly
+  // from adjacent boundaries.  AVX-512 permutes these rows in-register,
+  // AVX2 uses two-register permutes, and NEON performs byte-table lookups.
+  std::array<std::array<uint32_t, 16>, 3> thresholds = {};
+  std::array<uint32_t, 16> context_flags = {};
+};
+
+void BuildVectorDecodeModel12(
+    const Model& model, VectorDecodeModel12* decode_model) {
   for (uint32_t context = 0; context != 16; ++context) {
     const uint32_t active_symbol_ct =
         (context < model.row_ct)
@@ -1072,11 +1494,445 @@ void BuildAvx512DecodeModel12(
     decode_model->context_flags[context] = 0;
   }
 }
+#endif
+
+#if PGEN_RANS_X86_RUNTIME_DISPATCH
+bool HasAvx2Decoder() {
+  static const bool result = []() {
+    __builtin_cpu_init();
+    return __builtin_cpu_supports("avx2") &&
+           __builtin_cpu_supports("bmi2");
+  }();
+  return result;
+}
+
+bool HasAvx512Decoder() {
+  static const bool result = []() {
+    __builtin_cpu_init();
+    return __builtin_cpu_supports("avx512f") &&
+           __builtin_cpu_supports("avx512dq") &&
+           __builtin_cpu_supports("avx512bw") &&
+           __builtin_cpu_supports("avx512vl") &&
+           __builtin_cpu_supports("bmi2");
+  }();
+  return result;
+}
+
+template <RecordMode kMode>
+PGEN_RANS_TARGET_AVX2 PGEN_RANS_ALWAYS_INLINE
+__m256i Avx2LookupContextRow(
+    const uint32_t* row, const __m256i& contexts) {
+  const __m256i indices = _mm256_and_si256(
+      contexts, _mm256_set1_epi32(7));
+  const __m256i low_values = _mm256_permutevar8x32_epi32(
+      _mm256_load_si256(
+          reinterpret_cast<const __m256i*>(row)),
+      indices);
+  if constexpr (kMode == RecordMode::kOneReference) {
+    return low_values;
+  }
+  const __m256i high_values = _mm256_permutevar8x32_epi32(
+      _mm256_load_si256(
+          reinterpret_cast<const __m256i*>(row + 8)),
+      indices);
+  const __m256i high_context_mask = _mm256_cmpgt_epi32(
+      contexts, _mm256_set1_epi32(7));
+  return _mm256_blendv_epi8(
+      low_values, high_values, high_context_mask);
+}
+
+template <RecordMode kMode, uint32_t kFirstLane, bool kAllEntropy>
+PGEN_RANS_TARGET_AVX2 PGEN_RANS_ALWAYS_INLINE
+void RansTransformGroup8Avx2(
+    const VectorDecodeModel12& decode_model,
+    uint64_t reference1_word, uint64_t reference2_word,
+    __m256i* state, uint32_t* packed_symbols,
+    __m256i* entropy_mask, uint32_t* absent_context_mask) {
+  const __m256i shifts =
+      _mm256_setr_epi32(0, 2, 4, 6, 8, 10, 12, 14);
+  __m256i contexts = _mm256_setzero_si256();
+  if (kMode != RecordMode::kMarginal) {
+    const uint32_t reference1_chunk = static_cast<uint32_t>(
+        reference1_word >> (2 * kFirstLane));
+    contexts = _mm256_and_si256(
+        _mm256_srlv_epi32(
+            _mm256_set1_epi32(
+                static_cast<int>(reference1_chunk)),
+            shifts),
+        _mm256_set1_epi32(3));
+  }
+  if (kMode == RecordMode::kTwoReference) {
+    const uint32_t reference2_chunk = static_cast<uint32_t>(
+        reference2_word >> (2 * kFirstLane));
+    const __m256i second_contexts = _mm256_and_si256(
+        _mm256_srlv_epi32(
+            _mm256_set1_epi32(
+                static_cast<int>(reference2_chunk)),
+            shifts),
+        _mm256_set1_epi32(3));
+    contexts = _mm256_add_epi32(
+        _mm256_slli_epi32(contexts, 2), second_contexts);
+  }
+
+  const __m256i slots = _mm256_and_si256(
+      *state, _mm256_set1_epi32(kDefaultSlotCt - 1));
+  __m256i threshold0;
+  __m256i threshold1;
+  __m256i threshold2;
+  if (kMode == RecordMode::kMarginal) {
+    threshold0 = _mm256_set1_epi32(
+        static_cast<int>(decode_model.thresholds[0][0]));
+    threshold1 = _mm256_set1_epi32(
+        static_cast<int>(decode_model.thresholds[1][0]));
+    threshold2 = _mm256_set1_epi32(
+        static_cast<int>(decode_model.thresholds[2][0]));
+  } else {
+    threshold0 = Avx2LookupContextRow<kMode>(
+        decode_model.thresholds[0].data(), contexts);
+    threshold1 = Avx2LookupContextRow<kMode>(
+        decode_model.thresholds[1].data(), contexts);
+    threshold2 = Avx2LookupContextRow<kMode>(
+        decode_model.thresholds[2].data(), contexts);
+  }
+  const __m256i one = _mm256_set1_epi32(1);
+  const __m256i above0 = _mm256_cmpgt_epi32(
+      slots, _mm256_sub_epi32(threshold0, one));
+  const __m256i above1 = _mm256_cmpgt_epi32(
+      slots, _mm256_sub_epi32(threshold1, one));
+  const __m256i above2 = _mm256_cmpgt_epi32(
+      slots, _mm256_sub_epi32(threshold2, one));
+
+  *entropy_mask = _mm256_set1_epi32(-1);
+  if ((kMode != RecordMode::kMarginal) && !kAllEntropy) {
+    const __m256i context_flags =
+        Avx2LookupContextRow<kMode>(
+            decode_model.context_flags.data(), contexts);
+    *absent_context_mask |= static_cast<uint32_t>(
+        _mm256_movemask_ps(_mm256_castsi256_ps(
+            _mm256_slli_epi32(context_flags, 1))));
+    *entropy_mask = _mm256_xor_si256(
+        _mm256_srai_epi32(context_flags, 31),
+        _mm256_set1_epi32(-1));
+  }
+
+  __m256i cumulatives = _mm256_setzero_si256();
+  cumulatives =
+      _mm256_blendv_epi8(cumulatives, threshold0, above0);
+  cumulatives =
+      _mm256_blendv_epi8(cumulatives, threshold1, above1);
+  cumulatives =
+      _mm256_blendv_epi8(cumulatives, threshold2, above2);
+  __m256i upper_bounds =
+      _mm256_blendv_epi8(threshold0, threshold1, above0);
+  upper_bounds =
+      _mm256_blendv_epi8(upper_bounds, threshold2, above1);
+  upper_bounds = _mm256_blendv_epi8(
+      upper_bounds, _mm256_set1_epi32(kDefaultSlotCt), above2);
+  const __m256i frequencies =
+      _mm256_sub_epi32(upper_bounds, cumulatives);
+  const __m256i updated_states = _mm256_add_epi32(
+      _mm256_mullo_epi32(
+          frequencies,
+          _mm256_srli_epi32(*state, kDefaultScaleBits)),
+      _mm256_sub_epi32(slots, cumulatives));
+  *state = _mm256_blendv_epi8(
+      *state, updated_states, *entropy_mask);
+
+  const uint32_t above0_bits = static_cast<uint32_t>(
+      _mm256_movemask_ps(_mm256_castsi256_ps(above0)));
+  const uint32_t above1_bits = static_cast<uint32_t>(
+      _mm256_movemask_ps(_mm256_castsi256_ps(above1)));
+  const uint32_t above2_bits = static_cast<uint32_t>(
+      _mm256_movemask_ps(_mm256_castsi256_ps(above2)));
+  const uint32_t low_bits = above0_bits ^ above1_bits ^ above2_bits;
+  *packed_symbols = static_cast<uint32_t>(
+      _pdep_u64(low_bits, 0x5555ULL) |
+      (_pdep_u64(above1_bits, 0x5555ULL) << 1));
+}
+
+PGEN_RANS_TARGET_AVX2 PGEN_RANS_ALWAYS_INLINE
+bool RefillGroup8Avx2(
+    uint32_t refill_mask, const __m256i& refill_vector_mask,
+    __m256i* state, const uint8_t** interleaved_iter,
+    const uint8_t* interleaved_end, std::string* error) {
+  const uint32_t refill_byte_ct =
+      static_cast<uint32_t>(__builtin_popcount(refill_mask));
+  if (static_cast<size_t>(
+          interleaved_end - *interleaved_iter) <
+      refill_byte_ct) {
+    SetError("Truncated interleaved rANS payload.", error);
+    return false;
+  }
+  uint64_t packed_bytes = 0;
+  memcpy(&packed_bytes, *interleaved_iter, refill_byte_ct);
+  const uint64_t selected_byte_mask =
+      _pdep_u64(refill_mask, 0x0101010101010101ULL) * 0xffU;
+  const uint64_t expanded_bytes =
+      _pdep_u64(packed_bytes, selected_byte_mask);
+  const __m256i refill_values = _mm256_cvtepu8_epi32(
+      _mm_cvtsi64_si128(static_cast<long long>(expanded_bytes)));
+  const __m256i renormalized_states = _mm256_or_si256(
+      _mm256_slli_epi32(*state, 8), refill_values);
+  *state = _mm256_blendv_epi8(
+      *state, renormalized_states, refill_vector_mask);
+  *interleaved_iter += refill_byte_ct;
+  return true;
+}
+
+template <RecordMode kMode, uint32_t kGroup, bool kAllEntropy>
+PGEN_RANS_TARGET_AVX2 PGEN_RANS_ALWAYS_INLINE
+bool RansDecodeGroup16Avx2(
+    const VectorDecodeModel12& decode_model,
+    uint64_t reference1_word, uint64_t reference2_word,
+    __m256i* state0, __m256i* state1,
+    const uint8_t** interleaved_iter,
+    const uint8_t* interleaved_end, uint32_t* packed_symbols,
+    uint32_t* absent_context_mask, std::string* error) {
+  uint32_t packed0;
+  uint32_t packed1;
+  __m256i entropy_mask0;
+  __m256i entropy_mask1;
+  RansTransformGroup8Avx2<
+      kMode, 16 * kGroup, kAllEntropy>(
+      decode_model, reference1_word, reference2_word, state0,
+      &packed0, &entropy_mask0, absent_context_mask);
+  RansTransformGroup8Avx2<
+      kMode, 16 * kGroup + 8, kAllEntropy>(
+      decode_model, reference1_word, reference2_word, state1,
+      &packed1, &entropy_mask1, absent_context_mask);
+
+  const __m256i lower_bound =
+      _mm256_set1_epi32(kRansLowerBound);
+  const __m256i sign_bit =
+      _mm256_set1_epi32(static_cast<int>(0x80000000U));
+  const __m256i biased_lower_bound =
+      _mm256_xor_si256(lower_bound, sign_bit);
+  while (true) {
+    const __m256i refill_vector_mask0 = _mm256_and_si256(
+        _mm256_cmpgt_epi32(
+            biased_lower_bound,
+            _mm256_xor_si256(*state0, sign_bit)),
+        entropy_mask0);
+    const __m256i refill_vector_mask1 = _mm256_and_si256(
+        _mm256_cmpgt_epi32(
+            biased_lower_bound,
+            _mm256_xor_si256(*state1, sign_bit)),
+        entropy_mask1);
+    const uint32_t refill_mask0 = static_cast<uint32_t>(
+        _mm256_movemask_ps(
+            _mm256_castsi256_ps(refill_vector_mask0)));
+    const uint32_t refill_mask1 = static_cast<uint32_t>(
+        _mm256_movemask_ps(
+            _mm256_castsi256_ps(refill_vector_mask1)));
+    if (!(refill_mask0 | refill_mask1)) {
+      break;
+    }
+    if (refill_mask0 &&
+        !RefillGroup8Avx2(
+            refill_mask0, refill_vector_mask0, state0,
+            interleaved_iter, interleaved_end, error)) {
+      return false;
+    }
+    if (refill_mask1 &&
+        !RefillGroup8Avx2(
+            refill_mask1, refill_vector_mask1, state1,
+            interleaved_iter, interleaved_end, error)) {
+      return false;
+    }
+  }
+  *packed_symbols = packed0 | (packed1 << 16);
+  return true;
+}
+
+template <RecordMode kMode, bool kAllEntropy>
+PGEN_RANS_TARGET_AVX2
+bool DecodeEntropyWords32InterleavedAvx2(
+    const Model& model, const uint64_t* reference1,
+    const uint64_t* reference2, uint32_t sample_ct,
+    const uint8_t* payload_begin, const uint8_t* payload_end,
+    std::array<uint32_t, 256>* states, uint64_t* target,
+    const uint8_t** payload_iter_out, std::string* error) {
+  VectorDecodeModel12 decode_model;
+  BuildVectorDecodeModel12(model, &decode_model);
+  __m256i state0 = _mm256_loadu_si256(
+      reinterpret_cast<const __m256i*>(&(states->at(0))));
+  __m256i state1 = _mm256_loadu_si256(
+      reinterpret_cast<const __m256i*>(&(states->at(8))));
+  __m256i state2 = _mm256_loadu_si256(
+      reinterpret_cast<const __m256i*>(&(states->at(16))));
+  __m256i state3 = _mm256_loadu_si256(
+      reinterpret_cast<const __m256i*>(&(states->at(24))));
+  const uint8_t* payload_iter = payload_begin;
+  uint32_t absent_context_mask = 0;
+  const uint32_t full_word_ct = sample_ct / 32;
+  for (uint32_t word_idx = 0; word_idx != full_word_ct;
+       ++word_idx) {
+    const uint64_t reference1_word =
+        (kMode == RecordMode::kMarginal)
+            ? 0
+            : reference1[word_idx];
+    const uint64_t reference2_word =
+        (kMode == RecordMode::kTwoReference)
+            ? reference2[word_idx]
+            : 0;
+    uint32_t packed0;
+    uint32_t packed1;
+    if (!RansDecodeGroup16Avx2<
+            kMode, 0, kAllEntropy>(
+            decode_model, reference1_word, reference2_word,
+            &state0, &state1, &payload_iter, payload_end, &packed0,
+            &absent_context_mask, error) ||
+        !RansDecodeGroup16Avx2<
+            kMode, 1, kAllEntropy>(
+            decode_model, reference1_word, reference2_word,
+            &state2, &state3, &payload_iter, payload_end, &packed1,
+            &absent_context_mask, error)) {
+      return false;
+    }
+    target[word_idx] =
+        static_cast<uint64_t>(packed0) |
+        (static_cast<uint64_t>(packed1) << 32);
+  }
+  _mm256_storeu_si256(
+      reinterpret_cast<__m256i*>(&(states->at(0))), state0);
+  _mm256_storeu_si256(
+      reinterpret_cast<__m256i*>(&(states->at(8))), state1);
+  _mm256_storeu_si256(
+      reinterpret_cast<__m256i*>(&(states->at(16))), state2);
+  _mm256_storeu_si256(
+      reinterpret_cast<__m256i*>(&(states->at(24))), state3);
+
+  const uint32_t tail_sample_ct = sample_ct % 32;
+  if (tail_sample_ct) {
+    const uint32_t word_idx = full_word_ct;
+    const uint64_t reference1_word =
+        (kMode == RecordMode::kMarginal)
+            ? 0
+            : reference1[word_idx];
+    const uint64_t reference2_word =
+        (kMode == RecordMode::kTwoReference)
+            ? reference2[word_idx]
+            : 0;
+    uint64_t packed_word = 0;
+    for (uint32_t group_start = 0;
+         group_start < tail_sample_ct; group_start += 16) {
+      const uint32_t group_end =
+          std::min(group_start + 16, tail_sample_ct);
+      uint32_t entropy_lane_mask = 0;
+      for (uint32_t lane = group_start; lane != group_end;
+           ++lane) {
+        uint32_t context = 0;
+        if (kMode != RecordMode::kMarginal) {
+          context = static_cast<uint32_t>(
+              (reference1_word >> (2 * lane)) & 3U);
+        }
+        if (kMode == RecordMode::kTwoReference) {
+          context =
+              4 * context +
+              static_cast<uint32_t>(
+                  (reference2_word >> (2 * lane)) & 3U);
+        }
+        const uint32_t active_symbol_ct =
+            model.active_symbol_cts[context];
+        if (!active_symbol_ct) {
+          absent_context_mask = 1;
+          continue;
+        }
+        uint8_t symbol = model.deterministic_symbols[context];
+        if (active_symbol_ct > 1) {
+          entropy_lane_mask |= 1U << (lane - group_start);
+          const ModelRow& row = model.rows[context];
+          const uint32_t slot =
+              (*states)[lane] & (kDefaultSlotCt - 1);
+          symbol = static_cast<uint8_t>(
+              static_cast<uint32_t>(
+                  slot >= row.cumulative[1]) +
+              static_cast<uint32_t>(
+                  slot >= row.cumulative[2]) +
+              static_cast<uint32_t>(
+                  slot >= row.cumulative[3]));
+          (*states)[lane] =
+              row.frequencies[symbol] *
+                  ((*states)[lane] >> kDefaultScaleBits) +
+              slot - row.cumulative[symbol];
+        }
+        packed_word |=
+            static_cast<uint64_t>(symbol) << (2 * lane);
+      }
+      while (true) {
+        uint32_t refill_mask = 0;
+        for (uint32_t lane = group_start; lane != group_end;
+             ++lane) {
+          if ((entropy_lane_mask &
+               (1U << (lane - group_start))) &&
+              ((*states)[lane] < kRansLowerBound)) {
+            refill_mask |= 1U << (lane - group_start);
+          }
+        }
+        if (!refill_mask) {
+          break;
+        }
+        for (uint32_t lane = group_start; lane != group_end;
+             ++lane) {
+          if (!(refill_mask & (1U << (lane - group_start)))) {
+            continue;
+          }
+          if (payload_iter == payload_end) {
+            SetError(
+                "Truncated interleaved rANS payload.", error);
+            return false;
+          }
+          (*states)[lane] =
+              ((*states)[lane] << 8) | *payload_iter++;
+        }
+      }
+    }
+    target[word_idx] = packed_word;
+  }
+  if (absent_context_mask) {
+    SetError("Reference selects an absent model context.", error);
+    return false;
+  }
+  *payload_iter_out = payload_iter;
+  return true;
+}
+
+template <bool kAllEntropy>
+PGEN_RANS_TARGET_AVX2
+bool DecodeEntropyRecordInterleavedAvx2(
+    RecordMode mode, const Model& model, const uint64_t* reference1,
+    const uint64_t* reference2, uint32_t sample_ct,
+    const uint8_t* payload_begin, const uint8_t* payload_end,
+    std::array<uint32_t, 256>* states, uint64_t* target,
+    const uint8_t** payload_iter_out, std::string* error) {
+  switch (mode) {
+    case RecordMode::kMarginal:
+      return DecodeEntropyWords32InterleavedAvx2<
+          RecordMode::kMarginal, kAllEntropy>(
+          model, reference1, reference2, sample_ct,
+          payload_begin, payload_end, states, target,
+          payload_iter_out, error);
+    case RecordMode::kOneReference:
+      return DecodeEntropyWords32InterleavedAvx2<
+          RecordMode::kOneReference, kAllEntropy>(
+          model, reference1, reference2, sample_ct,
+          payload_begin, payload_end, states, target,
+          payload_iter_out, error);
+    case RecordMode::kTwoReference:
+      return DecodeEntropyWords32InterleavedAvx2<
+          RecordMode::kTwoReference, kAllEntropy>(
+          model, reference1, reference2, sample_ct,
+          payload_begin, payload_end, states, target,
+          payload_iter_out, error);
+  }
+  SetError("Unknown rANS record mode.", error);
+  return false;
+}
 
 template <RecordMode kMode, uint32_t kGroup, bool kAllEntropy>
 PGEN_RANS_TARGET_AVX512 PGEN_RANS_ALWAYS_INLINE
 bool RansDecodeGroup16Avx512(
-    const Avx512DecodeModel12& decode_model,
+    const VectorDecodeModel12& decode_model,
     uint64_t reference1_word,
     uint64_t reference2_word,
     __m512i* state, const uint8_t** interleaved_iter,
@@ -1245,8 +2101,8 @@ bool DecodeEntropyWords32InterleavedAvx512(
     const uint8_t* payload_begin, const uint8_t* payload_end,
     std::array<uint32_t, 256>* states, uint64_t* target,
     const uint8_t** payload_iter_out, std::string* error) {
-  Avx512DecodeModel12 decode_model;
-  BuildAvx512DecodeModel12(model, &decode_model);
+  VectorDecodeModel12 decode_model;
+  BuildVectorDecodeModel12(model, &decode_model);
   __m512i state0 = _mm512_loadu_si512(&(states->at(0)));
   __m512i state1 = _mm512_loadu_si512(&(states->at(16)));
   const uint8_t* payload_iter = payload_begin;
@@ -1408,6 +2264,517 @@ bool DecodeEntropyRecordInterleavedAvx512(
   }
   SetError("Unknown rANS record mode.", error);
   return false;
+}
+#endif
+
+#if PGEN_RANS_ARM64_NEON
+struct NeonDecodeModel12 {
+  std::array<uint8x16x4_t, 3> thresholds;
+  uint8x16x4_t context_flags;
+};
+
+constexpr std::array<std::array<uint8_t, 16>, 16>
+BuildNeonRefillShuffleTable() {
+  std::array<std::array<uint8_t, 16>, 16> result = {};
+  for (uint32_t mask = 0; mask != 16; ++mask) {
+    for (uint32_t output_byte = 0; output_byte != 16;
+         ++output_byte) {
+      result[mask][output_byte] = 0xff;
+    }
+    uint8_t source_byte = 0;
+    for (uint32_t lane = 0; lane != 4; ++lane) {
+      if (mask & (1U << lane)) {
+        result[mask][4 * lane] = source_byte++;
+      }
+    }
+  }
+  return result;
+}
+
+constexpr auto kNeonRefillShuffleTable =
+    BuildNeonRefillShuffleTable();
+
+NeonDecodeModel12 BuildNeonDecodeModel12(
+    const VectorDecodeModel12& decode_model) {
+  NeonDecodeModel12 result;
+  for (uint32_t boundary = 0; boundary != 3; ++boundary) {
+    const uint8_t* const row = reinterpret_cast<const uint8_t*>(
+        decode_model.thresholds[boundary].data());
+    for (uint32_t part = 0; part != 4; ++part) {
+      result.thresholds[boundary].val[part] =
+          vld1q_u8(row + 16 * part);
+    }
+  }
+  const uint8_t* const flags = reinterpret_cast<const uint8_t*>(
+      decode_model.context_flags.data());
+  for (uint32_t part = 0; part != 4; ++part) {
+    result.context_flags.val[part] =
+        vld1q_u8(flags + 16 * part);
+  }
+  return result;
+}
+
+PGEN_RANS_ALWAYS_INLINE uint32x4_t NeonLookupU32(
+    const uint8x16x4_t& table, uint32x4_t indices) {
+  // Replicate 4 * context into every byte of its 32-bit lane, then add
+  // the byte-within-dword offsets.  Contexts are at most 15, so the
+  // bytewise products cannot carry.
+  const uint32x4_t byte_indices_u32 = vaddq_u32(
+      vmulq_n_u32(indices, 0x04040404U),
+      vdupq_n_u32(0x03020100U));
+  const uint8x16_t byte_indices =
+      vreinterpretq_u8_u32(byte_indices_u32);
+  return vreinterpretq_u32_u8(
+      vqtbl4q_u8(table, byte_indices));
+}
+
+PGEN_RANS_ALWAYS_INLINE uint32_t NeonLaneMask(
+    uint32x4_t vector_mask) {
+  const uint32x4_t lane_bits = {1, 2, 4, 8};
+  return vaddvq_u32(vandq_u32(vector_mask, lane_bits));
+}
+
+template <RecordMode kMode, uint32_t kFirstLane, bool kAllEntropy>
+PGEN_RANS_ALWAYS_INLINE
+void RansTransformGroup4Neon(
+    const NeonDecodeModel12& decode_model,
+    uint64_t reference1_word, uint64_t reference2_word,
+    uint32x4_t* state, uint32_t* packed_symbols,
+    uint32x4_t* entropy_mask, uint32_t* absent_context_mask) {
+  const int32x4_t shifts = {0, -2, -4, -6};
+  uint32x4_t contexts = vdupq_n_u32(0);
+  if (kMode != RecordMode::kMarginal) {
+    const uint32_t reference1_chunk = static_cast<uint32_t>(
+        reference1_word >> (2 * kFirstLane));
+    contexts = vandq_u32(
+        vshlq_u32(vdupq_n_u32(reference1_chunk), shifts),
+        vdupq_n_u32(3));
+  }
+  if (kMode == RecordMode::kTwoReference) {
+    const uint32_t reference2_chunk = static_cast<uint32_t>(
+        reference2_word >> (2 * kFirstLane));
+    const uint32x4_t second_contexts = vandq_u32(
+        vshlq_u32(vdupq_n_u32(reference2_chunk), shifts),
+        vdupq_n_u32(3));
+    contexts = vaddq_u32(
+        vshlq_n_u32(contexts, 2), second_contexts);
+  }
+
+  const uint32x4_t slots = vandq_u32(
+      *state, vdupq_n_u32(kDefaultSlotCt - 1));
+  uint32x4_t threshold0;
+  uint32x4_t threshold1;
+  uint32x4_t threshold2;
+  if (kMode == RecordMode::kMarginal) {
+    threshold0 = vdupq_n_u32(vgetq_lane_u32(
+        vreinterpretq_u32_u8(
+            decode_model.thresholds[0].val[0]),
+        0));
+    threshold1 = vdupq_n_u32(vgetq_lane_u32(
+        vreinterpretq_u32_u8(
+            decode_model.thresholds[1].val[0]),
+        0));
+    threshold2 = vdupq_n_u32(vgetq_lane_u32(
+        vreinterpretq_u32_u8(
+            decode_model.thresholds[2].val[0]),
+        0));
+  } else {
+    threshold0 =
+        NeonLookupU32(decode_model.thresholds[0], contexts);
+    threshold1 =
+        NeonLookupU32(decode_model.thresholds[1], contexts);
+    threshold2 =
+        NeonLookupU32(decode_model.thresholds[2], contexts);
+  }
+  const uint32x4_t above0 = vcgeq_u32(slots, threshold0);
+  const uint32x4_t above1 = vcgeq_u32(slots, threshold1);
+  const uint32x4_t above2 = vcgeq_u32(slots, threshold2);
+
+  *entropy_mask = vdupq_n_u32(~0U);
+  if ((kMode != RecordMode::kMarginal) && !kAllEntropy) {
+    const uint32x4_t context_flags =
+        NeonLookupU32(decode_model.context_flags, contexts);
+    *absent_context_mask |= vmaxvq_u32(vandq_u32(
+        context_flags, vdupq_n_u32(kDecodeTableAbsentFlag)));
+    *entropy_mask = vmvnq_u32(vcltq_s32(
+        vreinterpretq_s32_u32(context_flags),
+        vdupq_n_s32(0)));
+  }
+
+  uint32x4_t cumulatives = vdupq_n_u32(0);
+  cumulatives = vbslq_u32(above0, threshold0, cumulatives);
+  cumulatives = vbslq_u32(above1, threshold1, cumulatives);
+  cumulatives = vbslq_u32(above2, threshold2, cumulatives);
+  uint32x4_t upper_bounds =
+      vbslq_u32(above0, threshold1, threshold0);
+  upper_bounds = vbslq_u32(above1, threshold2, upper_bounds);
+  upper_bounds = vbslq_u32(
+      above2, vdupq_n_u32(kDefaultSlotCt), upper_bounds);
+  const uint32x4_t frequencies =
+      vsubq_u32(upper_bounds, cumulatives);
+  const uint32x4_t updated_states = vaddq_u32(
+      vmulq_u32(
+          frequencies,
+          vshrq_n_u32(*state, kDefaultScaleBits)),
+      vsubq_u32(slots, cumulatives));
+  *state = vbslq_u32(*entropy_mask, updated_states, *state);
+
+  const uint32x4_t symbols = vaddq_u32(
+      vaddq_u32(
+          vshrq_n_u32(above0, 31),
+          vshrq_n_u32(above1, 31)),
+      vshrq_n_u32(above2, 31));
+  const int32x4_t pack_shifts = {0, 2, 4, 6};
+  *packed_symbols = vaddvq_u32(
+      vshlq_u32(symbols, pack_shifts));
+}
+
+PGEN_RANS_ALWAYS_INLINE
+bool RefillGroup4Neon(
+    uint32_t refill_mask, uint32x4_t refill_vector_mask,
+    uint32x4_t* state, const uint8_t** interleaved_iter,
+    const uint8_t* interleaved_end, std::string* error) {
+  const uint32_t refill_byte_ct =
+      static_cast<uint32_t>(__builtin_popcount(refill_mask));
+  if (static_cast<size_t>(
+          interleaved_end - *interleaved_iter) <
+      refill_byte_ct) {
+    SetError("Truncated interleaved rANS payload.", error);
+    return false;
+  }
+  uint32_t packed_bytes = 0;
+  memcpy(&packed_bytes, *interleaved_iter, refill_byte_ct);
+  const uint8x16_t refill_bytes =
+      vreinterpretq_u8_u32(vdupq_n_u32(packed_bytes));
+  const uint8x16_t expansion_indices = vld1q_u8(
+      kNeonRefillShuffleTable[refill_mask].data());
+  const uint32x4_t refill_values = vreinterpretq_u32_u8(
+      vqtbl1q_u8(refill_bytes, expansion_indices));
+  const uint32x4_t renormalized_states = vorrq_u32(
+      vshlq_n_u32(*state, 8), refill_values);
+  *state = vbslq_u32(
+      refill_vector_mask, renormalized_states, *state);
+  *interleaved_iter += refill_byte_ct;
+  return true;
+}
+
+template <RecordMode kMode, uint32_t kGroup, bool kAllEntropy>
+PGEN_RANS_ALWAYS_INLINE
+bool RansDecodeGroup16Neon(
+    const NeonDecodeModel12& decode_model,
+    uint64_t reference1_word, uint64_t reference2_word,
+    uint32x4_t* state0, uint32x4_t* state1,
+    uint32x4_t* state2, uint32x4_t* state3,
+    const uint8_t** interleaved_iter,
+    const uint8_t* interleaved_end, uint32_t* packed_symbols,
+    uint32_t* absent_context_mask, std::string* error) {
+  uint32_t packed0;
+  uint32_t packed1;
+  uint32_t packed2;
+  uint32_t packed3;
+  uint32x4_t entropy_mask0;
+  uint32x4_t entropy_mask1;
+  uint32x4_t entropy_mask2;
+  uint32x4_t entropy_mask3;
+  RansTransformGroup4Neon<
+      kMode, 16 * kGroup, kAllEntropy>(
+      decode_model, reference1_word, reference2_word, state0,
+      &packed0, &entropy_mask0, absent_context_mask);
+  RansTransformGroup4Neon<
+      kMode, 16 * kGroup + 4, kAllEntropy>(
+      decode_model, reference1_word, reference2_word, state1,
+      &packed1, &entropy_mask1, absent_context_mask);
+  RansTransformGroup4Neon<
+      kMode, 16 * kGroup + 8, kAllEntropy>(
+      decode_model, reference1_word, reference2_word, state2,
+      &packed2, &entropy_mask2, absent_context_mask);
+  RansTransformGroup4Neon<
+      kMode, 16 * kGroup + 12, kAllEntropy>(
+      decode_model, reference1_word, reference2_word, state3,
+      &packed3, &entropy_mask3, absent_context_mask);
+
+  const uint32x4_t lower_bound =
+      vdupq_n_u32(kRansLowerBound);
+  while (true) {
+    const uint32x4_t refill_vector_mask0 =
+        vandq_u32(vcltq_u32(*state0, lower_bound), entropy_mask0);
+    const uint32x4_t refill_vector_mask1 =
+        vandq_u32(vcltq_u32(*state1, lower_bound), entropy_mask1);
+    const uint32x4_t refill_vector_mask2 =
+        vandq_u32(vcltq_u32(*state2, lower_bound), entropy_mask2);
+    const uint32x4_t refill_vector_mask3 =
+        vandq_u32(vcltq_u32(*state3, lower_bound), entropy_mask3);
+    const uint32_t refill_mask0 =
+        NeonLaneMask(refill_vector_mask0);
+    const uint32_t refill_mask1 =
+        NeonLaneMask(refill_vector_mask1);
+    const uint32_t refill_mask2 =
+        NeonLaneMask(refill_vector_mask2);
+    const uint32_t refill_mask3 =
+        NeonLaneMask(refill_vector_mask3);
+    if (!(refill_mask0 | refill_mask1 |
+          refill_mask2 | refill_mask3)) {
+      break;
+    }
+    if (refill_mask0 &&
+        !RefillGroup4Neon(
+            refill_mask0, refill_vector_mask0, state0,
+            interleaved_iter, interleaved_end, error)) {
+      return false;
+    }
+    if (refill_mask1 &&
+        !RefillGroup4Neon(
+            refill_mask1, refill_vector_mask1, state1,
+            interleaved_iter, interleaved_end, error)) {
+      return false;
+    }
+    if (refill_mask2 &&
+        !RefillGroup4Neon(
+            refill_mask2, refill_vector_mask2, state2,
+            interleaved_iter, interleaved_end, error)) {
+      return false;
+    }
+    if (refill_mask3 &&
+        !RefillGroup4Neon(
+            refill_mask3, refill_vector_mask3, state3,
+            interleaved_iter, interleaved_end, error)) {
+      return false;
+    }
+  }
+  *packed_symbols =
+      packed0 | (packed1 << 8) |
+      (packed2 << 16) | (packed3 << 24);
+  return true;
+}
+
+template <RecordMode kMode, uint32_t kStateCt, bool kAllEntropy>
+bool DecodeEntropyWords32InterleavedNeon(
+    const Model& model, const uint64_t* reference1,
+    const uint64_t* reference2, uint32_t sample_ct,
+    const uint8_t* payload_begin, const uint8_t* payload_end,
+    std::array<uint32_t, 256>* states, uint64_t* target,
+    const uint8_t** payload_iter_out, std::string* error) {
+  static_assert((kStateCt == 16) || (kStateCt == 32));
+  VectorDecodeModel12 portable_decode_model;
+  BuildVectorDecodeModel12(model, &portable_decode_model);
+  const NeonDecodeModel12 decode_model =
+      BuildNeonDecodeModel12(portable_decode_model);
+  uint32x4_t state0 = vld1q_u32(&(states->at(0)));
+  uint32x4_t state1 = vld1q_u32(&(states->at(4)));
+  uint32x4_t state2 = vld1q_u32(&(states->at(8)));
+  uint32x4_t state3 = vld1q_u32(&(states->at(12)));
+  uint32x4_t state4 = state0;
+  uint32x4_t state5 = state1;
+  uint32x4_t state6 = state2;
+  uint32x4_t state7 = state3;
+  if constexpr (kStateCt == 32) {
+    state4 = vld1q_u32(&(states->at(16)));
+    state5 = vld1q_u32(&(states->at(20)));
+    state6 = vld1q_u32(&(states->at(24)));
+    state7 = vld1q_u32(&(states->at(28)));
+  }
+  const uint8_t* payload_iter = payload_begin;
+  uint32_t absent_context_mask = 0;
+  const uint32_t full_word_ct = sample_ct / 32;
+  for (uint32_t word_idx = 0; word_idx != full_word_ct;
+       ++word_idx) {
+    const uint64_t reference1_word =
+        (kMode == RecordMode::kMarginal)
+            ? 0
+            : reference1[word_idx];
+    const uint64_t reference2_word =
+        (kMode == RecordMode::kTwoReference)
+            ? reference2[word_idx]
+            : 0;
+    uint32_t packed0;
+    uint32_t packed1;
+    if (!RansDecodeGroup16Neon<
+            kMode, 0, kAllEntropy>(
+            decode_model, reference1_word, reference2_word,
+            &state0, &state1, &state2, &state3, &payload_iter,
+            payload_end, &packed0, &absent_context_mask, error)) {
+      return false;
+    }
+    if constexpr (kStateCt == 16) {
+      if (!RansDecodeGroup16Neon<
+              kMode, 1, kAllEntropy>(
+              decode_model, reference1_word, reference2_word,
+              &state0, &state1, &state2, &state3, &payload_iter,
+              payload_end, &packed1, &absent_context_mask, error)) {
+        return false;
+      }
+    } else {
+      if (!RansDecodeGroup16Neon<
+              kMode, 1, kAllEntropy>(
+              decode_model, reference1_word, reference2_word,
+              &state4, &state5, &state6, &state7, &payload_iter,
+              payload_end, &packed1, &absent_context_mask, error)) {
+        return false;
+      }
+    }
+    target[word_idx] =
+        static_cast<uint64_t>(packed0) |
+        (static_cast<uint64_t>(packed1) << 32);
+  }
+  vst1q_u32(&(states->at(0)), state0);
+  vst1q_u32(&(states->at(4)), state1);
+  vst1q_u32(&(states->at(8)), state2);
+  vst1q_u32(&(states->at(12)), state3);
+  if constexpr (kStateCt == 32) {
+    vst1q_u32(&(states->at(16)), state4);
+    vst1q_u32(&(states->at(20)), state5);
+    vst1q_u32(&(states->at(24)), state6);
+    vst1q_u32(&(states->at(28)), state7);
+  }
+
+  const uint32_t tail_sample_ct = sample_ct % 32;
+  if (tail_sample_ct) {
+    const uint32_t word_idx = full_word_ct;
+    const uint64_t reference1_word =
+        (kMode == RecordMode::kMarginal)
+            ? 0
+            : reference1[word_idx];
+    const uint64_t reference2_word =
+        (kMode == RecordMode::kTwoReference)
+            ? reference2[word_idx]
+            : 0;
+    uint64_t packed_word = 0;
+    for (uint32_t group_start = 0;
+         group_start < tail_sample_ct; group_start += 16) {
+      const uint32_t group_end =
+          std::min(group_start + 16, tail_sample_ct);
+      uint32_t entropy_lane_mask = 0;
+      for (uint32_t lane = group_start; lane != group_end;
+           ++lane) {
+        const uint32_t state_lane = lane & (kStateCt - 1);
+        uint32_t context = 0;
+        if (kMode != RecordMode::kMarginal) {
+          context = static_cast<uint32_t>(
+              (reference1_word >> (2 * lane)) & 3U);
+        }
+        if (kMode == RecordMode::kTwoReference) {
+          context =
+              4 * context +
+              static_cast<uint32_t>(
+                  (reference2_word >> (2 * lane)) & 3U);
+        }
+        const uint32_t active_symbol_ct =
+            model.active_symbol_cts[context];
+        if (!active_symbol_ct) {
+          absent_context_mask = 1;
+          continue;
+        }
+        uint8_t symbol = model.deterministic_symbols[context];
+        if (active_symbol_ct > 1) {
+          entropy_lane_mask |= 1U << (lane - group_start);
+          const ModelRow& row = model.rows[context];
+          const uint32_t slot =
+              (*states)[state_lane] & (kDefaultSlotCt - 1);
+          symbol = static_cast<uint8_t>(
+              static_cast<uint32_t>(
+                  slot >= row.cumulative[1]) +
+              static_cast<uint32_t>(
+                  slot >= row.cumulative[2]) +
+              static_cast<uint32_t>(
+                  slot >= row.cumulative[3]));
+          (*states)[state_lane] =
+              row.frequencies[symbol] *
+                  ((*states)[state_lane] >> kDefaultScaleBits) +
+              slot - row.cumulative[symbol];
+        }
+        packed_word |=
+            static_cast<uint64_t>(symbol) << (2 * lane);
+      }
+      while (true) {
+        uint32_t refill_mask = 0;
+        for (uint32_t lane = group_start; lane != group_end;
+             ++lane) {
+          const uint32_t state_lane = lane & (kStateCt - 1);
+          if ((entropy_lane_mask &
+               (1U << (lane - group_start))) &&
+              ((*states)[state_lane] < kRansLowerBound)) {
+            refill_mask |= 1U << (lane - group_start);
+          }
+        }
+        if (!refill_mask) {
+          break;
+        }
+        for (uint32_t lane = group_start; lane != group_end;
+             ++lane) {
+          if (!(refill_mask & (1U << (lane - group_start)))) {
+            continue;
+          }
+          if (payload_iter == payload_end) {
+            SetError(
+                "Truncated interleaved rANS payload.", error);
+            return false;
+          }
+          const uint32_t state_lane = lane & (kStateCt - 1);
+          (*states)[state_lane] =
+              ((*states)[state_lane] << 8) | *payload_iter++;
+        }
+      }
+    }
+    target[word_idx] = packed_word;
+  }
+  if (absent_context_mask) {
+    SetError("Reference selects an absent model context.", error);
+    return false;
+  }
+  *payload_iter_out = payload_iter;
+  return true;
+}
+
+template <uint32_t kStateCt, bool kAllEntropy>
+bool DecodeEntropyRecordInterleavedNeonForStateCt(
+    RecordMode mode, const Model& model, const uint64_t* reference1,
+    const uint64_t* reference2, uint32_t sample_ct,
+    const uint8_t* payload_begin, const uint8_t* payload_end,
+    std::array<uint32_t, 256>* states, uint64_t* target,
+    const uint8_t** payload_iter_out, std::string* error) {
+  switch (mode) {
+    case RecordMode::kMarginal:
+      return DecodeEntropyWords32InterleavedNeon<
+          RecordMode::kMarginal, kStateCt, kAllEntropy>(
+          model, reference1, reference2, sample_ct,
+          payload_begin, payload_end, states, target,
+          payload_iter_out, error);
+    case RecordMode::kOneReference:
+      return DecodeEntropyWords32InterleavedNeon<
+          RecordMode::kOneReference, kStateCt, kAllEntropy>(
+          model, reference1, reference2, sample_ct,
+          payload_begin, payload_end, states, target,
+          payload_iter_out, error);
+    case RecordMode::kTwoReference:
+      return DecodeEntropyWords32InterleavedNeon<
+          RecordMode::kTwoReference, kStateCt, kAllEntropy>(
+          model, reference1, reference2, sample_ct,
+          payload_begin, payload_end, states, target,
+          payload_iter_out, error);
+  }
+  SetError("Unknown rANS record mode.", error);
+  return false;
+}
+
+template <bool kAllEntropy>
+bool DecodeEntropyRecordInterleavedNeon(
+    RecordMode mode, const Model& model, const uint64_t* reference1,
+    const uint64_t* reference2, uint32_t sample_ct, uint32_t state_ct,
+    const uint8_t* payload_begin, const uint8_t* payload_end,
+    std::array<uint32_t, 256>* states, uint64_t* target,
+    const uint8_t** payload_iter_out, std::string* error) {
+  if (state_ct == 16) {
+    return DecodeEntropyRecordInterleavedNeonForStateCt<
+        16, kAllEntropy>(
+        mode, model, reference1, reference2, sample_ct,
+        payload_begin, payload_end, states, target,
+        payload_iter_out, error);
+  }
+  return DecodeEntropyRecordInterleavedNeonForStateCt<
+      32, kAllEntropy>(
+      mode, model, reference1, reference2, sample_ct,
+      payload_begin, payload_end, states, target,
+      payload_iter_out, error);
 }
 #endif
 
@@ -1786,6 +3153,66 @@ bool ParsePrefix(const uint8_t* record, size_t record_size,
 
 }  // namespace
 
+bool DecodeKernelSupported(DecodeKernel kernel) {
+  switch (kernel) {
+    case DecodeKernel::kAuto:
+    case DecodeKernel::kScalar:
+      return true;
+    case DecodeKernel::kAvx2:
+#if PGEN_RANS_X86_RUNTIME_DISPATCH
+      return HasAvx2Decoder();
+#else
+      return false;
+#endif
+    case DecodeKernel::kAvx512:
+#if PGEN_RANS_X86_RUNTIME_DISPATCH
+      return HasAvx512Decoder();
+#else
+      return false;
+#endif
+    case DecodeKernel::kNeon:
+#if PGEN_RANS_ARM64_NEON
+      return true;
+#else
+      return false;
+#endif
+  }
+  return false;
+}
+
+void SetDecodeKernelForTesting(DecodeKernel kernel) {
+  g_decode_kernel_override =
+      DecodeKernelSupported(kernel) ? kernel : DecodeKernel::kScalar;
+}
+
+DecodeKernel LastDecodeKernelForTesting() {
+  return g_last_decode_kernel;
+}
+
+bool EncodeKernelSupported(EncodeKernel kernel) {
+  switch (kernel) {
+    case EncodeKernel::kAuto:
+    case EncodeKernel::kScalar:
+      return true;
+    case EncodeKernel::kAvx512:
+#if PGEN_RANS_X86_RUNTIME_DISPATCH
+      return HasAvx512Encoder();
+#else
+      return false;
+#endif
+  }
+  return false;
+}
+
+void SetEncodeKernelForTesting(EncodeKernel kernel) {
+  g_encode_kernel_override =
+      EncodeKernelSupported(kernel) ? kernel : EncodeKernel::kScalar;
+}
+
+EncodeKernel LastEncodeKernelForTesting() {
+  return g_last_encode_kernel;
+}
+
 uint32_t PackedWordCt(uint32_t sample_ct) {
   return (sample_ct + 31) / 32;
 }
@@ -1884,7 +3311,7 @@ static bool EncodeRecordImpl(
 
   const uint32_t state_ct = std::min(params.state_ct, sample_ct);
   std::vector<uint32_t> states(state_ct, kRansLowerBound);
-  std::array<std::array<RansEncoderSymbol, 4>, 16> encoders;
+  std::array<std::array<RansEncoderSymbol, 4>, 16> encoders = {};
   for (uint32_t context = 0; context != model.row_ct; ++context) {
     if (model.active_symbol_cts[context] <= 1) {
       continue;
@@ -2394,12 +3821,21 @@ bool DecodeRecordToBufferImpl(
   const uint8_t* payload_iter = payload_begin;
   bool decode_ok = false;
   bool used_vector_decoder = false;
+  g_last_decode_kernel = DecodeKernel::kScalar;
 #if PGEN_RANS_X86_RUNTIME_DISPATCH
-  if ((state_ct == 32) &&
-      (params.scale_bits == kDefaultScaleBits) &&
-      (sample_ct >= kAvx512MinimumSampleCt) &&
-      HasAvx512Decoder()) {
+  const bool vector_parameters =
+      (state_ct == 32) &&
+      (params.scale_bits == kDefaultScaleBits);
+#endif
+#if PGEN_RANS_X86_RUNTIME_DISPATCH
+  const bool use_avx512 =
+      vector_parameters && HasAvx512Decoder() &&
+      ((g_decode_kernel_override == DecodeKernel::kAvx512) ||
+       ((g_decode_kernel_override == DecodeKernel::kAuto) &&
+        (sample_ct >= kAvx512MinimumSampleCt)));
+  if (use_avx512) {
     used_vector_decoder = true;
+    g_last_decode_kernel = DecodeKernel::kAvx512;
     const uint16_t full_context_mask = static_cast<uint16_t>(
         (1U << model.row_ct) - 1);
     decode_ok =
@@ -2413,6 +3849,60 @@ bool DecodeRecordToBufferImpl(
             : DecodeEntropyRecordInterleavedAvx512<false>(
                   parsed_metadata.mode, model, reference1,
                   reference2, sample_ct, payload_begin,
+                  payload_end, &states, target, &payload_iter,
+                  error);
+  }
+  const bool use_avx2 =
+      !used_vector_decoder && vector_parameters &&
+      HasAvx2Decoder() &&
+      ((g_decode_kernel_override == DecodeKernel::kAvx2) ||
+       ((g_decode_kernel_override == DecodeKernel::kAuto) &&
+        (sample_ct >= kAvx2MinimumSampleCt)));
+  if (use_avx2) {
+    used_vector_decoder = true;
+    g_last_decode_kernel = DecodeKernel::kAvx2;
+    const uint16_t full_context_mask = static_cast<uint16_t>(
+        (1U << model.row_ct) - 1);
+    decode_ok =
+        (validated_contexts ||
+         (model.entropy_context_mask == full_context_mask))
+            ? DecodeEntropyRecordInterleavedAvx2<true>(
+                  parsed_metadata.mode, model, reference1,
+                  reference2, sample_ct, payload_begin,
+                  payload_end, &states, target, &payload_iter,
+                  error)
+            : DecodeEntropyRecordInterleavedAvx2<false>(
+                  parsed_metadata.mode, model, reference1,
+                  reference2, sample_ct, payload_begin,
+                  payload_end, &states, target, &payload_iter,
+                  error);
+  }
+#endif
+#if PGEN_RANS_ARM64_NEON
+  const bool neon_vector_parameters =
+      ((state_ct == 16) || (state_ct == 32)) &&
+      (params.scale_bits == kDefaultScaleBits);
+  const bool use_neon =
+      neon_vector_parameters &&
+      ((g_decode_kernel_override == DecodeKernel::kNeon) ||
+       ((g_decode_kernel_override == DecodeKernel::kAuto) &&
+        (sample_ct >= kNeonMinimumSampleCt)));
+  if (use_neon) {
+    used_vector_decoder = true;
+    g_last_decode_kernel = DecodeKernel::kNeon;
+    const uint16_t full_context_mask = static_cast<uint16_t>(
+        (1U << model.row_ct) - 1);
+    decode_ok =
+        (validated_contexts ||
+         (model.entropy_context_mask == full_context_mask))
+            ? DecodeEntropyRecordInterleavedNeon<true>(
+                  parsed_metadata.mode, model, reference1,
+                  reference2, sample_ct, state_ct, payload_begin,
+                  payload_end, &states, target, &payload_iter,
+                  error)
+            : DecodeEntropyRecordInterleavedNeon<false>(
+                  parsed_metadata.mode, model, reference1,
+                  reference2, sample_ct, state_ct, payload_begin,
                   payload_end, &states, target, &payload_iter,
                   error);
   }

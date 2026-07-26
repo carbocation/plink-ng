@@ -13,18 +13,26 @@ namespace {
 using pgen_rans::CodecParams;
 using pgen_rans::AppendMultiallelicPatches;
 using pgen_rans::DecodeMultiallelicPatches;
+using pgen_rans::DecodeKernel;
+using pgen_rans::DecodeKernelSupported;
 using pgen_rans::DecodeRecord;
 using pgen_rans::DecodeRecordToBuffer;
 using pgen_rans::DecodeRecordToBufferFromValidatedBlock;
+using pgen_rans::EncodeKernel;
+using pgen_rans::EncodeKernelSupported;
 using pgen_rans::EncodeRecord;
 using pgen_rans::EncodeRecordFromCounts;
 using pgen_rans::EstimateRecordBytes;
 using pgen_rans::GetPackedGenotype;
 using pgen_rans::GetBaseRecordByteCt;
+using pgen_rans::LastEncodeKernelForTesting;
+using pgen_rans::LastDecodeKernelForTesting;
 using pgen_rans::MultiallelicPatches;
 using pgen_rans::PackedWordCt;
 using pgen_rans::RecordMetadata;
 using pgen_rans::RecordMode;
+using pgen_rans::SetDecodeKernelForTesting;
+using pgen_rans::SetEncodeKernelForTesting;
 using pgen_rans::SetPackedGenotype;
 
 [[noreturn]] void Fail(const std::string& message) {
@@ -274,6 +282,309 @@ void TestLargeDefaultRoundTrips() {
             RecordMode::kTwoReference, params);
 }
 
+void TestForcedDefaultEncodeKernels() {
+  if (!EncodeKernelSupported(EncodeKernel::kAvx512)) {
+    return;
+  }
+  constexpr uint32_t kSampleCt = 65567;
+  std::mt19937_64 rng(0x617678353132656eULL);
+  std::vector<uint8_t> reference1(kSampleCt);
+  std::vector<uint8_t> reference2(kSampleCt);
+  std::vector<uint8_t> marginal(kSampleCt);
+  std::vector<uint8_t> one_reference(kSampleCt);
+  std::vector<uint8_t> two_reference(kSampleCt);
+  for (uint32_t sample_idx = 0; sample_idx != kSampleCt; ++sample_idx) {
+    reference1[sample_idx] = rng() % 4;
+    reference2[sample_idx] = rng() % 4;
+    marginal[sample_idx] = rng() % 4;
+    one_reference[sample_idx] =
+        (reference1[sample_idx] < 2)
+            ? reference1[sample_idx]
+            : (rng() % 4);
+    const uint32_t context =
+        4 * reference1[sample_idx] + reference2[sample_idx];
+    two_reference[sample_idx] =
+        (context & 1) ? (context % 4) : (rng() % 4);
+  }
+  const std::vector<uint8_t>* const targets[] = {
+      &marginal, &one_reference, &two_reference};
+  const RecordMode modes[] = {
+      RecordMode::kMarginal, RecordMode::kOneReference,
+      RecordMode::kTwoReference};
+  const std::vector<uint64_t> packed_reference1 = Pack(reference1);
+  const std::vector<uint64_t> packed_reference2 = Pack(reference2);
+  for (const uint32_t state_ct : {16U, 32U}) {
+    const CodecParams params(state_ct, 12);
+    for (uint32_t mode_idx = 0; mode_idx != 3; ++mode_idx) {
+      const RecordMode mode = modes[mode_idx];
+      const std::vector<uint64_t> packed_target =
+          Pack(*targets[mode_idx]);
+      const uint64_t* reference1_ptr =
+          (mode == RecordMode::kMarginal)
+              ? nullptr
+              : packed_reference1.data();
+      const uint64_t* reference2_ptr =
+          (mode == RecordMode::kTwoReference)
+              ? packed_reference2.data()
+              : nullptr;
+      std::vector<uint8_t> scalar_record;
+      std::vector<uint8_t> vector_record;
+      std::string error;
+      SetEncodeKernelForTesting(EncodeKernel::kScalar);
+      Expect(EncodeRecord(
+                 packed_target.data(), reference1_ptr,
+                 reference2_ptr, kSampleCt, mode, 3, 7, params,
+                 &scalar_record, &error),
+             "forced scalar encode failed: " + error);
+      Expect(LastEncodeKernelForTesting() == EncodeKernel::kScalar,
+             "forced scalar encoder kernel was not selected");
+      SetEncodeKernelForTesting(EncodeKernel::kAvx512);
+      Expect(EncodeRecord(
+                 packed_target.data(), reference1_ptr,
+                 reference2_ptr, kSampleCt, mode, 3, 7, params,
+                 &vector_record, &error),
+             "forced AVX-512 encode failed: " + error);
+      Expect(LastEncodeKernelForTesting() == EncodeKernel::kAvx512,
+             "forced AVX-512 encoder kernel was not selected");
+      Expect(vector_record == scalar_record,
+             "AVX-512 encoder changed serialized record bytes");
+    }
+  }
+  SetEncodeKernelForTesting(EncodeKernel::kAuto);
+}
+
+void TestForcedDefaultDecodeKernels() {
+  // A 31-sample tail exercises state reuse in the state-16 NEON path.
+  constexpr uint32_t kSampleCt = 4127;
+  std::mt19937_64 rng(0x73696d646465636fULL);
+  std::vector<uint8_t> reference1(kSampleCt);
+  std::vector<uint8_t> reference2(kSampleCt);
+  std::vector<uint8_t> marginal(kSampleCt);
+  std::vector<uint8_t> one_reference(kSampleCt);
+  std::vector<uint8_t> two_reference(kSampleCt);
+  for (uint32_t sample_idx = 0; sample_idx != kSampleCt; ++sample_idx) {
+    reference1[sample_idx] = rng() % 4;
+    reference2[sample_idx] = rng() % 4;
+    marginal[sample_idx] = rng() % 4;
+    one_reference[sample_idx] =
+        (reference1[sample_idx] < 2)
+            ? reference1[sample_idx]
+            : (rng() % 4);
+    const uint32_t context =
+        4 * reference1[sample_idx] + reference2[sample_idx];
+    two_reference[sample_idx] =
+        (context & 1) ? (context % 4) : (rng() % 4);
+  }
+  const std::vector<uint8_t>* const targets[] = {
+      &marginal, &one_reference, &two_reference};
+  const RecordMode modes[] = {
+      RecordMode::kMarginal, RecordMode::kOneReference,
+      RecordMode::kTwoReference};
+  const DecodeKernel kernels[] = {
+      DecodeKernel::kScalar, DecodeKernel::kAvx2,
+      DecodeKernel::kAvx512, DecodeKernel::kNeon};
+  const std::vector<uint64_t> packed_reference1 = Pack(reference1);
+  const std::vector<uint64_t> packed_reference2 = Pack(reference2);
+  const uint64_t* anchors[8] = {};
+  anchors[3] = packed_reference1.data();
+  anchors[7] = packed_reference2.data();
+  const CodecParams params;
+  for (uint32_t mode_idx = 0; mode_idx != 3; ++mode_idx) {
+    const RecordMode mode = modes[mode_idx];
+    const std::vector<uint64_t> packed_target =
+        Pack(*targets[mode_idx]);
+    const uint64_t* reference1_ptr =
+        (mode == RecordMode::kMarginal)
+            ? nullptr
+            : packed_reference1.data();
+    const uint64_t* reference2_ptr =
+        (mode == RecordMode::kTwoReference)
+            ? packed_reference2.data()
+            : nullptr;
+    std::vector<uint8_t> record;
+    std::string error;
+    Expect(EncodeRecord(
+               packed_target.data(), reference1_ptr, reference2_ptr,
+               kSampleCt, mode, 3, 7, params, &record, &error),
+           "forced-kernel encode failed: " + error);
+    for (const DecodeKernel kernel : kernels) {
+      if (!DecodeKernelSupported(kernel)) {
+        continue;
+      }
+      SetDecodeKernelForTesting(kernel);
+      std::vector<uint64_t> decoded(PackedWordCt(kSampleCt));
+      Expect(DecodeRecordToBuffer(
+                 record.data(), record.size(), anchors, 8, kSampleCt,
+                 params, decoded.data(), decoded.size(), nullptr,
+                 &error),
+             "forced-kernel decode failed: " + error);
+      Expect(LastDecodeKernelForTesting() == kernel,
+             "forced decoder kernel was not selected");
+      Expect(decoded == packed_target,
+             "forced decoder kernel changed the decoded genotypes");
+      Expect(DecodeRecordToBufferFromValidatedBlock(
+                 record.data(), record.size(), anchors, 8, kSampleCt,
+                 params, decoded.data(), decoded.size(), nullptr,
+                 &error),
+             "forced validated-block decode failed: " + error);
+      Expect(LastDecodeKernelForTesting() == kernel,
+             "forced validated-block kernel was not selected");
+      Expect(decoded == packed_target,
+             "forced validated-block kernel changed the genotypes");
+    }
+  }
+
+  if (DecodeKernelSupported(DecodeKernel::kNeon)) {
+    const CodecParams state16_params(16, 12);
+    for (uint32_t mode_idx = 0; mode_idx != 3; ++mode_idx) {
+      const RecordMode mode = modes[mode_idx];
+      const std::vector<uint64_t> packed_target =
+          Pack(*targets[mode_idx]);
+      const uint64_t* reference1_ptr =
+          (mode == RecordMode::kMarginal)
+              ? nullptr
+              : packed_reference1.data();
+      const uint64_t* reference2_ptr =
+          (mode == RecordMode::kTwoReference)
+              ? packed_reference2.data()
+              : nullptr;
+      std::vector<uint8_t> record;
+      std::string error;
+      Expect(EncodeRecord(
+                 packed_target.data(), reference1_ptr, reference2_ptr,
+                 kSampleCt, mode, 3, 7, state16_params, &record,
+                 &error),
+             "state-16 NEON test encode failed: " + error);
+      std::vector<uint64_t> scalar_decoded(PackedWordCt(kSampleCt));
+      SetDecodeKernelForTesting(DecodeKernel::kScalar);
+      Expect(DecodeRecordToBuffer(
+                 record.data(), record.size(), anchors, 8, kSampleCt,
+                 state16_params, scalar_decoded.data(),
+                 scalar_decoded.size(), nullptr, &error),
+             "forced state-16 scalar decode failed: " + error);
+      Expect(scalar_decoded == packed_target,
+             "forced state-16 scalar decoder changed the genotypes");
+
+      std::vector<uint64_t> neon_decoded(PackedWordCt(kSampleCt));
+      SetDecodeKernelForTesting(DecodeKernel::kNeon);
+      Expect(DecodeRecordToBuffer(
+                 record.data(), record.size(), anchors, 8, kSampleCt,
+                 state16_params, neon_decoded.data(),
+                 neon_decoded.size(), nullptr, &error),
+             "forced state-16 NEON decode failed: " + error);
+      Expect(LastDecodeKernelForTesting() == DecodeKernel::kNeon,
+             "forced state-16 NEON decoder was not selected");
+      Expect(neon_decoded == scalar_decoded,
+             "state-16 NEON decoder disagrees with scalar");
+      Expect(DecodeRecordToBufferFromValidatedBlock(
+                 record.data(), record.size(), anchors, 8, kSampleCt,
+                 state16_params, neon_decoded.data(),
+                 neon_decoded.size(), nullptr, &error),
+             "forced validated state-16 NEON decode failed: " + error);
+      Expect(LastDecodeKernelForTesting() == DecodeKernel::kNeon,
+             "validated state-16 NEON decoder was not selected");
+      Expect(neon_decoded == scalar_decoded,
+             "validated state-16 NEON decoder disagrees with scalar");
+
+      SetDecodeKernelForTesting(DecodeKernel::kAuto);
+      Expect(DecodeRecordToBuffer(
+                 record.data(), record.size(), anchors, 8, kSampleCt,
+                 state16_params, neon_decoded.data(),
+                 neon_decoded.size(), nullptr, &error),
+             "automatic state-16 NEON decode failed: " + error);
+      Expect(LastDecodeKernelForTesting() == DecodeKernel::kNeon,
+             "automatic state-16 decode did not select NEON");
+      Expect(neon_decoded == scalar_decoded,
+             "automatic state-16 NEON decoder disagrees with scalar");
+    }
+  }
+
+  // The non-validated entry point must retain the scalar decoder's absent
+  // model-context rejection in every SIMD implementation.
+  const std::vector<uint8_t> encoded_reference(kSampleCt, 0);
+  const std::vector<uint8_t> invalid_reference(kSampleCt, 1);
+  const std::vector<uint64_t> packed_encoded_reference =
+      Pack(encoded_reference);
+  const std::vector<uint64_t> packed_invalid_reference =
+      Pack(invalid_reference);
+  const std::vector<uint64_t> packed_absent_target = Pack(marginal);
+  std::vector<uint8_t> absent_context_record;
+  std::string error;
+  Expect(EncodeRecord(
+             packed_absent_target.data(),
+             packed_encoded_reference.data(), nullptr, kSampleCt,
+             RecordMode::kOneReference, 3, 0, params,
+             &absent_context_record, &error),
+         "absent-context test encode failed: " + error);
+  const uint64_t* invalid_anchors[4] = {};
+  invalid_anchors[3] = packed_invalid_reference.data();
+  std::vector<uint64_t> decoded(PackedWordCt(kSampleCt));
+  for (const DecodeKernel kernel : kernels) {
+    if (!DecodeKernelSupported(kernel)) {
+      continue;
+    }
+    SetDecodeKernelForTesting(kernel);
+    Expect(!DecodeRecordToBuffer(
+               absent_context_record.data(),
+               absent_context_record.size(), invalid_anchors, 4,
+               kSampleCt, params, decoded.data(), decoded.size(),
+               nullptr, &error),
+           "forced decoder accepted an absent model context");
+    Expect(LastDecodeKernelForTesting() == kernel,
+           "absent-context test did not reach the forced kernel");
+  }
+  SetDecodeKernelForTesting(DecodeKernel::kAuto);
+}
+
+void TestAvx2HighStateRejection() {
+  if (!DecodeKernelSupported(DecodeKernel::kAvx2)) {
+    return;
+  }
+  constexpr uint32_t kSampleCt = 4096;
+  constexpr size_t kInitialStateOffset = 4;
+  constexpr uint32_t kStateCt = 32;
+  std::vector<uint64_t> packed(PackedWordCt(kSampleCt), 0);
+  const CodecParams params(kStateCt, 12);
+  uint32_t counts[4] = {kSampleCt - 1, 1, 0, 0};
+  std::vector<uint8_t> record;
+  std::string error;
+  Expect(EncodeRecordFromCounts(
+             packed.data(), nullptr, nullptr, kSampleCt,
+             RecordMode::kMarginal, 0, 0, counts, params, &record,
+             &error),
+         "high-state regression encode failed: " + error);
+  Expect(record.size() >= kInitialStateOffset + 4 * kStateCt,
+         "high-state regression record is unexpectedly short");
+  record.resize(kInitialStateOffset + 4 * kStateCt);
+  for (uint32_t lane = 0; lane != kStateCt; ++lane) {
+    const size_t offset = kInitialStateOffset + 4 * lane;
+    record[offset] = 0;
+    record[offset + 1] = 0xf0;
+    record[offset + 2] = 0xff;
+    record[offset + 3] = 0xff;
+  }
+
+  const uint64_t* no_anchors[1] = {};
+  std::vector<uint64_t> decoded(PackedWordCt(kSampleCt));
+  SetDecodeKernelForTesting(DecodeKernel::kScalar);
+  Expect(!DecodeRecordToBuffer(
+             record.data(), record.size(), no_anchors, 0, kSampleCt,
+             params, decoded.data(), decoded.size(), nullptr, &error),
+         "scalar decoder accepted malformed high initial states");
+  const std::string scalar_error = error;
+
+  SetDecodeKernelForTesting(DecodeKernel::kAvx2);
+  Expect(!DecodeRecordToBuffer(
+             record.data(), record.size(), no_anchors, 0, kSampleCt,
+             params, decoded.data(), decoded.size(), nullptr, &error),
+         "AVX2 decoder accepted malformed high initial states");
+  Expect(LastDecodeKernelForTesting() == DecodeKernel::kAvx2,
+         "high-state regression did not reach the AVX2 decoder");
+  Expect(error == scalar_error,
+         "AVX2 high-state rejection differs from scalar");
+  SetDecodeKernelForTesting(DecodeKernel::kAuto);
+}
+
 void TestRuntimeDivisionFrequencies() {
   constexpr uint32_t kSampleCt = 1U << 12;
   std::vector<uint64_t> packed(
@@ -281,6 +592,7 @@ void TestRuntimeDivisionFrequencies() {
   const CodecParams params(16, 12);
   const uint64_t* no_anchors[1] = {};
   std::vector<uint8_t> record;
+  std::vector<uint8_t> scalar_record;
   std::vector<uint64_t> decoded;
   std::string error;
   uint32_t counts[4] = {};
@@ -288,12 +600,28 @@ void TestRuntimeDivisionFrequencies() {
     SetPackedGenotype(packed.data(), frequency - 1, 0);
     counts[0] = frequency;
     counts[1] = kSampleCt - frequency;
+    SetEncodeKernelForTesting(EncodeKernel::kScalar);
     Expect(EncodeRecordFromCounts(
                packed.data(), nullptr, nullptr, kSampleCt,
                RecordMode::kMarginal, 0, 0, counts, params, &record,
                &error),
            "runtime-division encode failed at frequency " +
                std::to_string(frequency) + ": " + error);
+    if (EncodeKernelSupported(EncodeKernel::kAvx512)) {
+      scalar_record = record;
+      SetEncodeKernelForTesting(EncodeKernel::kAvx512);
+      Expect(EncodeRecordFromCounts(
+                 packed.data(), nullptr, nullptr, kSampleCt,
+                 RecordMode::kMarginal, 0, 0, counts, params,
+                 &record, &error),
+             "AVX-512 runtime-division encode failed at frequency " +
+                 std::to_string(frequency) + ": " + error);
+      Expect(LastEncodeKernelForTesting() == EncodeKernel::kAvx512,
+             "forced AVX-512 runtime-division kernel was not selected");
+      Expect(record == scalar_record,
+             "AVX-512 runtime division changed bytes at frequency " +
+                 std::to_string(frequency));
+    }
     Expect(DecodeRecord(
                record.data(), record.size(), no_anchors, 0, kSampleCt,
                params, &decoded, nullptr, &error),
@@ -303,6 +631,7 @@ void TestRuntimeDivisionFrequencies() {
            "runtime-division round-trip mismatch at frequency " +
                std::to_string(frequency));
   }
+  SetEncodeKernelForTesting(EncodeKernel::kAuto);
 }
 
 void TestInvalidArguments() {
@@ -484,6 +813,9 @@ int main() {
   TestRandomRoundTrips();
   TestDeterministicRecords();
   TestLargeDefaultRoundTrips();
+  TestForcedDefaultEncodeKernels();
+  TestForcedDefaultDecodeKernels();
+  TestAvx2HighStateRejection();
   TestRuntimeDivisionFrequencies();
   TestInvalidArguments();
   TestMultiallelicPatches();

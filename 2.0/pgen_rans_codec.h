@@ -16,6 +16,34 @@ enum class RecordMode : uint8_t {
   kTwoReference = 2,
 };
 
+// Decoder selection is automatic in production.  The override and
+// observation hooks are thread-local and exist so each compiled SIMD path can
+// be covered by correctness tests and benchmarked against the scalar decoder.
+enum class DecodeKernel : uint8_t {
+  kAuto = 0,
+  kScalar = 1,
+  kAvx2 = 2,
+  kAvx512 = 3,
+  kNeon = 4,
+};
+
+bool DecodeKernelSupported(DecodeKernel kernel);
+void SetDecodeKernelForTesting(DecodeKernel kernel);
+DecodeKernel LastDecodeKernelForTesting();
+
+// Encoder selection is likewise automatic.  AVX-512 intentionally retains
+// the scalar encoder's byte layout, so these hooks can verify exact record
+// identity as well as round-trip correctness.
+enum class EncodeKernel : uint8_t {
+  kAuto = 0,
+  kScalar = 1,
+  kAvx512 = 2,
+};
+
+bool EncodeKernelSupported(EncodeKernel kernel);
+void SetEncodeKernelForTesting(EncodeKernel kernel);
+EncodeKernel LastEncodeKernelForTesting();
+
 struct CodecParams {
   CodecParams(uint32_t state_count = 32,
               uint32_t scale_bit_count = 12)

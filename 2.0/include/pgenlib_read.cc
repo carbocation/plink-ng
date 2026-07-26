@@ -2005,6 +2005,21 @@ PglErr PgfiMultiread(const uintptr_t* variant_include, uint32_t variant_uidx_sta
     const uint64_t block_offset =
         GetPgfiFpos(pgfip, variant_uidx_start);
     pgfip->block_offset = block_offset;
+    if (pgfip->multiread_backend->get_packed_batch) {
+      if (variant_include) {
+        // PgfiMultireadGetCachelineReq() sizes sparse buffers only through
+        // the last selected variant in each block.  Give alternate backends
+        // the same effective range so the callback's documented raw slots
+        // cannot extend beyond the allocation.
+        variant_uidx_end =
+            1 + FindLast1BitBefore(variant_include, variant_uidx_end);
+      }
+      return pgfip->multiread_backend->get_packed_batch(
+          pgfip->multiread_backend->context, variant_include,
+          variant_uidx_start, variant_uidx_end, load_variant_ct,
+          K_CAST(unsigned char*, pgfip->block_base),
+          pgfip->const_vrec_width);
+    }
     uint32_t variant_uidx = variant_uidx_start;
     for (uint32_t loaded_variant_ct = 0;
          loaded_variant_ct != load_variant_ct; ++loaded_variant_ct) {

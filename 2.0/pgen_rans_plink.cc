@@ -304,12 +304,13 @@ PglErr LoadPgen(
   return kPglRetSuccess;
 }
 
-PlinkRansAdapter::PlinkRansAdapter() {
+PlinkRansAdapter::PlinkRansAdapter() : backend_{} {
   backend_.context = this;
   backend_.get = &Get;
   backend_.get_allele = &GetAllele;
   backend_.get_counts = &GetCounts;
   backend_.get_packed = &GetPacked;
+  backend_.get_packed_batch = &GetPackedBatch;
   backend_.get_m = &GetM;
   backend_.get_raw = &GetRaw;
 }
@@ -748,6 +749,86 @@ PglErr PlinkRansAdapter::GetPacked(
         "variant %u: %s\n",
         vidx, error.c_str());
     return ReadFailure(error, &adapter->last_error_);
+  }
+  return kPglRetSuccess;
+}
+
+PglErr PlinkRansAdapter::GetPackedBatch(
+    void* context, const uintptr_t* variant_include,
+    uint32_t variant_uidx_start, uint32_t variant_uidx_end,
+    uint32_t load_variant_ct, unsigned char* output,
+    uint32_t raw_variant_stride) {
+  PlinkRansAdapter* adapter =
+      static_cast<PlinkRansAdapter*>(context);
+  const uint32_t variant_span =
+      variant_uidx_end - variant_uidx_start;
+  const size_t packed_byte_ct =
+      adapter->reader_.packed_variant_byte_ct();
+  if ((!output) || (!load_variant_ct) ||
+      (variant_uidx_start >= variant_uidx_end) ||
+      (variant_uidx_end > adapter->reader_.variant_ct()) ||
+      (raw_variant_stride < packed_byte_ct)) {
+    return kPglRetImproperFunctionCall;
+  }
+
+  std::vector<uint32_t> variants;
+  if (variant_include) {
+    variants.reserve(load_variant_ct);
+    for (uint32_t vidx = variant_uidx_start;
+         vidx != variant_uidx_end; ++vidx) {
+      if (IsSet(variant_include, vidx)) {
+        variants.push_back(vidx);
+      }
+    }
+    if (variants.size() != load_variant_ct) {
+      return kPglRetImproperFunctionCall;
+    }
+  } else if (load_variant_ct != variant_span) {
+    return kPglRetImproperFunctionCall;
+  }
+
+  std::string error;
+  const bool dense =
+      (!variant_include) || (load_variant_ct == variant_span);
+  if (dense) {
+    if (!adapter->reader_.ReadRange(
+            variant_uidx_start, variant_span, output,
+            raw_variant_stride, nullptr, &error)) {
+      fprintf(
+          stderr,
+          "Error: Conditional-rANS PGEN batch materialization failed at "
+          "variants %u-%u: %s\n",
+          variant_uidx_start, variant_uidx_end - 1, error.c_str());
+      return ReadFailure(error, &adapter->last_error_);
+    }
+    return kPglRetSuccess;
+  }
+
+  // ReadList() writes compactly at the start of output.  Scatter in reverse
+  // raw-variant order so destinations can only overwrite compact records
+  // which have already been moved.  This preserves PgfiMultiread()'s holes
+  // without allocating a second potentially very large genotype buffer.
+  if (!adapter->reader_.ReadList(
+          variants.data(), load_variant_ct, output, packed_byte_ct,
+          nullptr, &error)) {
+    fprintf(
+        stderr,
+        "Error: Conditional-rANS PGEN sparse batch materialization failed "
+        "at variants %u-%u: %s\n",
+        variant_uidx_start, variant_uidx_end - 1, error.c_str());
+    return ReadFailure(error, &adapter->last_error_);
+  }
+  for (uint32_t selected_idx = load_variant_ct;
+       selected_idx; --selected_idx) {
+    const uint32_t compact_idx = selected_idx - 1;
+    const size_t destination_offset =
+        static_cast<size_t>(
+            variants[compact_idx] - variant_uidx_start) *
+        raw_variant_stride;
+    const size_t source_offset =
+        static_cast<size_t>(compact_idx) * packed_byte_ct;
+    memmove(output + destination_offset, output + source_offset,
+            packed_byte_ct);
   }
   return kPglRetSuccess;
 }

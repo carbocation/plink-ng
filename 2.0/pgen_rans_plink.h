@@ -81,6 +81,11 @@ class PlinkRansAdapter {
   static plink2::PglErr GetPacked(
       void* context, uint32_t vidx, unsigned char* packed_genotypes,
       uint32_t packed_byte_ct);
+  static plink2::PglErr GetPackedBatch(
+      void* context, const uintptr_t* variant_include,
+      uint32_t variant_uidx_start, uint32_t variant_uidx_end,
+      uint32_t load_variant_ct, unsigned char* output,
+      uint32_t raw_variant_stride);
   static plink2::PglErr GetM(
       void* context, const uintptr_t* sample_include,
       const uint32_t* sample_include_cumulative_popcounts,
