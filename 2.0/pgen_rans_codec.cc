@@ -619,20 +619,36 @@ bool ParseModel(const uint8_t* input, size_t input_size, RecordMode mode,
   return true;
 }
 
+#if defined(__aarch64__) || defined(__arm64__) || defined(_M_ARM64)
+#define PGEN_RANS_ARM64_ENCODER 1
+#else
+#define PGEN_RANS_ARM64_ENCODER 0
+#endif
+
+#if PGEN_RANS_ARM64_ENCODER
 struct RansEncoderSymbol {
-  uint64_t division_multiplier = 0;
   uint64_t maximum_state = 0;
   uint32_t frequency = 0;
   uint32_t cumulative = 0;
-  uint32_t division_pre_shift = 0;
-  uint32_t division_post_shift = 0;
-  uint32_t division_increment = 0;
 };
+static_assert(sizeof(RansEncoderSymbol) == 16);
+#else
+struct RansEncoderSymbol {
+  uint32_t division_multiplier = 0;
+  uint32_t maximum_state = 0;
+  uint32_t frequency_complement = 0;
+  uint16_t frequency = 0;
+  uint16_t cumulative = 0;
+  uint8_t division_pre_shift = 0;
+  uint8_t division_post_shift = 0;
+  uint8_t division_increment = 0;
+};
+static_assert(sizeof(RansEncoderSymbol) == 20);
 
 // Runtime-constant unsigned division from "Labor of Division (Episode III)".
 // Model construction pays the hardware divides once; the sample loop then
 // uses one multiply and shift for both quotient and remainder.
-void BuildDivisionMagic(uint32_t divisor, uint64_t* multiplier,
+void BuildDivisionMagic(uint32_t divisor, uint32_t* multiplier,
                         uint32_t* pre_shift, uint32_t* post_shift,
                         uint32_t* increment) {
   if (!(divisor & (divisor - 1))) {
@@ -699,125 +715,297 @@ void BuildDivisionMagic(uint32_t divisor, uint64_t* multiplier,
       odd_divisor, multiplier, &ignored_pre_shift, post_shift, increment);
   *pre_shift = shift;
 }
+#endif
 
 RansEncoderSymbol BuildRansEncoderSymbol(
     uint32_t cumulative, uint32_t frequency, uint32_t scale_bits) {
   RansEncoderSymbol result;
+#if PGEN_RANS_ARM64_ENCODER
   result.maximum_state =
       ((static_cast<uint64_t>(kRansLowerBound) >> scale_bits) << 8) *
       frequency;
   result.frequency = frequency;
   result.cumulative = cumulative;
+#else
+  result.maximum_state = static_cast<uint32_t>(
+      ((static_cast<uint64_t>(kRansLowerBound) >> scale_bits) << 8) *
+      frequency);
+  result.frequency_complement =
+      (1U << scale_bits) - frequency;
+  result.frequency = static_cast<uint16_t>(frequency);
+  result.cumulative = static_cast<uint16_t>(cumulative);
+  uint32_t division_pre_shift;
+  uint32_t division_post_shift;
+  uint32_t division_increment;
   BuildDivisionMagic(
       frequency, &result.division_multiplier,
-      &result.division_pre_shift, &result.division_post_shift,
-      &result.division_increment);
+      &division_pre_shift, &division_post_shift, &division_increment);
+  result.division_pre_shift =
+      static_cast<uint8_t>(division_pre_shift);
+  result.division_post_shift =
+      static_cast<uint8_t>(division_post_shift);
+  result.division_increment =
+      static_cast<uint8_t>(division_increment);
+#endif
   return result;
 }
 
-PGEN_RANS_ALWAYS_INLINE void RansEncodeSymbol(
+PGEN_RANS_ALWAYS_INLINE uint32_t RansEncodeSymbolToBytes(
     const RansEncoderSymbol& encoder, uint32_t scale_bits,
-    uint32_t* state, std::vector<uint8_t>* output) {
+    uint32_t* state, uint8_t* output) {
+  uint32_t output_byte_ct = 0;
   while (*state >= encoder.maximum_state) {
-    output->push_back(static_cast<uint8_t>(*state));
+    output[output_byte_ct++] = static_cast<uint8_t>(*state);
     *state >>= 8;
   }
+#if PGEN_RANS_ARM64_ENCODER
+  const uint32_t quotient = *state / encoder.frequency;
+  const uint32_t remainder =
+      *state - quotient * encoder.frequency;
+  *state =
+      (quotient << scale_bits) + remainder + encoder.cumulative;
+#else
+  (void)scale_bits;
   const uint32_t quotient = static_cast<uint32_t>(
-      (encoder.division_multiplier *
+      (static_cast<uint64_t>(encoder.division_multiplier) *
        ((*state >> encoder.division_pre_shift) +
         encoder.division_increment)) >>
       encoder.division_post_shift);
-  const uint32_t remainder = *state - quotient * encoder.frequency;
-  *state = (quotient << scale_bits) + remainder + encoder.cumulative;
+  *state += quotient * encoder.frequency_complement +
+            encoder.cumulative;
+#endif
+  return output_byte_ct;
 }
 
-bool BuildInterleavedPayload(
+constexpr int kRuntimeRecordMode = -1;
+
+template <int kMode, uint32_t kStateCt>
+bool BuildInterleavedPayloadDirectMode(
+    const uint64_t* target, const uint64_t* reference1,
+    const uint64_t* reference2, uint32_t sample_ct,
+    RecordMode runtime_mode,
+    const Model& model, uint32_t scale_bits,
+    const std::array<std::array<RansEncoderSymbol, 4>, 16>& encoders,
+    std::vector<uint32_t>* states, std::vector<uint8_t>* reverse_payload,
+    std::string* error) {
+  const RecordMode mode =
+      (kMode == kRuntimeRecordMode)
+          ? runtime_mode
+          : static_cast<RecordMode>(kMode);
+  const uint32_t state_ct =
+      kStateCt ? kStateCt : static_cast<uint32_t>(states->size());
+  reverse_payload->clear();
+  reverse_payload->reserve(sample_ct / 8);
+  uint32_t first_sample =
+      ((sample_ct - 1) / state_ct) * state_ct;
+  while (true) {
+    const uint32_t round_sample_ct =
+        std::min(state_ct, sample_ct - first_sample);
+    uint64_t target_word = 0;
+    uint64_t reference1_word = 0;
+    uint64_t reference2_word = 0;
+    const bool packed_word_round =
+        kStateCt ? true : (state_ct == 32);
+    const uint32_t word_sample_offset =
+        (kStateCt == 16) ? (first_sample % 32) : 0;
+    if (packed_word_round) {
+      const uint32_t word_idx = first_sample / 32;
+      target_word = target[word_idx];
+      if (mode != RecordMode::kMarginal) {
+        reference1_word = reference1[word_idx];
+      }
+      if (mode == RecordMode::kTwoReference) {
+        reference2_word = reference2[word_idx];
+      }
+    }
+    uint32_t group_start =
+        ((round_sample_ct - 1) / 16) * 16;
+    while (true) {
+      const uint32_t group_end =
+          std::min(group_start + 16, round_sample_ct);
+      std::array<std::array<uint8_t, 4>, 16> emitted_bytes = {};
+      std::array<uint8_t, 16> emitted_byte_cts = {};
+      uint32_t maximum_emitted_byte_ct = 0;
+      uint64_t target_remaining = 0;
+      uint64_t reference1_remaining = 0;
+      uint64_t reference2_remaining = 0;
+      if constexpr ((kStateCt == 16) || (kStateCt == 32)) {
+        const uint32_t group_shift =
+            2 * (word_sample_offset + group_start);
+        target_remaining = target_word >> group_shift;
+        if (mode != RecordMode::kMarginal) {
+          reference1_remaining = reference1_word >> group_shift;
+        }
+        if (mode == RecordMode::kTwoReference) {
+          reference2_remaining = reference2_word >> group_shift;
+        }
+      }
+      for (uint32_t lane = group_start; lane != group_end;
+           ++lane) {
+        const uint32_t group_lane = lane - group_start;
+        const uint32_t sample_idx = first_sample + lane;
+        uint32_t context;
+        uint32_t symbol;
+        if (packed_word_round) {
+          if constexpr ((kStateCt == 16) || (kStateCt == 32)) {
+            symbol = static_cast<uint32_t>(
+                target_remaining & 3U);
+            target_remaining >>= 2;
+            if (mode == RecordMode::kMarginal) {
+              context = 0;
+            } else {
+              const uint32_t first_reference =
+                  static_cast<uint32_t>(
+                      reference1_remaining & 3U);
+              reference1_remaining >>= 2;
+              if (mode == RecordMode::kOneReference) {
+                context = first_reference;
+              } else {
+                context =
+                    4 * first_reference +
+                    static_cast<uint32_t>(
+                        reference2_remaining & 3U);
+                reference2_remaining >>= 2;
+              }
+            }
+          } else {
+            const uint32_t shift = 2 * lane;
+            symbol = static_cast<uint32_t>(
+                (target_word >> shift) & 3U);
+            if (mode == RecordMode::kMarginal) {
+              context = 0;
+            } else {
+              const uint32_t first_reference =
+                  static_cast<uint32_t>(
+                      (reference1_word >> shift) & 3U);
+              context =
+                  (mode == RecordMode::kOneReference)
+                      ? first_reference
+                      : (4 * first_reference +
+                         static_cast<uint32_t>(
+                             (reference2_word >> shift) & 3U));
+            }
+          }
+        } else {
+          context = ContextIndex(
+              mode, reference1, reference2, sample_idx);
+          symbol = GetPackedGenotype(target, sample_idx);
+        }
+        const uint32_t active_symbol_ct =
+            model.active_symbol_cts[context];
+        if (active_symbol_ct > 1) {
+          if (!encoders[context][symbol].frequency) {
+            SetError("Supplied rANS model counts do not match genotypes.",
+                     error);
+            return false;
+          }
+          const uint32_t emitted_byte_ct = RansEncodeSymbolToBytes(
+              encoders[context][symbol], scale_bits, &((*states)[lane]),
+              emitted_bytes[group_lane].data());
+          emitted_byte_cts[group_lane] =
+              static_cast<uint8_t>(emitted_byte_ct);
+          maximum_emitted_byte_ct =
+              std::max(maximum_emitted_byte_ct, emitted_byte_ct);
+        } else if ((!active_symbol_ct) ||
+                   (symbol != model.deterministic_symbols[context])) {
+          SetError("Supplied rANS model counts do not match genotypes.",
+                   error);
+          return false;
+        }
+      }
+
+      // The decoder consumes refill layers from low to high and lanes
+      // from low to high.  We are traversing symbols in reverse, so append
+      // the exact reverse of that order and reverse the entire payload once
+      // when it is copied to the record.
+      for (uint32_t layer_plus_one = maximum_emitted_byte_ct;
+           layer_plus_one; --layer_plus_one) {
+        const uint32_t decoder_layer = layer_plus_one - 1;
+        for (uint32_t lane = group_end; lane != group_start;) {
+          --lane;
+          const uint32_t group_lane = lane - group_start;
+          const uint32_t emitted_byte_ct =
+              emitted_byte_cts[group_lane];
+          if (emitted_byte_ct <= decoder_layer) {
+            continue;
+          }
+          reverse_payload->push_back(
+              emitted_bytes[group_lane][
+                  emitted_byte_ct - 1 - decoder_layer]);
+        }
+      }
+      if (!group_start) {
+        break;
+      }
+      group_start -= 16;
+    }
+    if (!first_sample) {
+      break;
+    }
+    first_sample -= state_ct;
+  }
+  return true;
+}
+
+template <RecordMode kMode>
+bool BuildInterleavedPayloadDirectForMode(
+    const uint64_t* target, const uint64_t* reference1,
+    const uint64_t* reference2, uint32_t sample_ct,
+    const Model& model, uint32_t scale_bits,
+    const std::array<std::array<RansEncoderSymbol, 4>, 16>& encoders,
+    std::vector<uint32_t>* states, std::vector<uint8_t>* reverse_payload,
+    std::string* error) {
+  if (states->size() == 32) {
+    return BuildInterleavedPayloadDirectMode<
+        static_cast<int>(kMode), 32>(
+        target, reference1, reference2, sample_ct, kMode, model,
+        scale_bits, encoders, states, reverse_payload, error);
+  }
+  if (states->size() == 16) {
+    return BuildInterleavedPayloadDirectMode<
+        static_cast<int>(kMode), 16>(
+        target, reference1, reference2, sample_ct, kMode, model,
+        scale_bits, encoders, states, reverse_payload, error);
+  }
+  return BuildInterleavedPayloadDirectMode<
+      static_cast<int>(kMode), 0>(
+      target, reference1, reference2, sample_ct, kMode, model,
+      scale_bits, encoders, states, reverse_payload, error);
+}
+
+bool BuildInterleavedPayloadDirect(
     const uint64_t* target, const uint64_t* reference1,
     const uint64_t* reference2, uint32_t sample_ct,
     RecordMode mode, const Model& model, uint32_t scale_bits,
-    const std::vector<uint32_t>& initial_states,
-    const std::vector<std::vector<uint8_t>>& lane_payloads,
-    std::vector<uint8_t>* payload, std::string* error) {
-  const uint32_t state_ct =
-      static_cast<uint32_t>(initial_states.size());
-  std::vector<uint32_t> states = initial_states;
-  std::vector<size_t> lane_offsets(state_ct);
-  size_t payload_byte_ct = 0;
-  for (uint32_t lane = 0; lane != state_ct; ++lane) {
-    lane_offsets[lane] = lane_payloads[lane].size();
-    payload_byte_ct += lane_offsets[lane];
+    const std::array<std::array<RansEncoderSymbol, 4>, 16>& encoders,
+    std::vector<uint32_t>* states, std::vector<uint8_t>* reverse_payload,
+    std::string* error) {
+#if PGEN_RANS_ARM64_ENCODER
+  switch (mode) {
+    case RecordMode::kMarginal:
+      return BuildInterleavedPayloadDirectForMode<
+          RecordMode::kMarginal>(
+          target, reference1, reference2, sample_ct, model, scale_bits,
+          encoders, states, reverse_payload, error);
+    case RecordMode::kOneReference:
+      return BuildInterleavedPayloadDirectForMode<
+          RecordMode::kOneReference>(
+          target, reference1, reference2, sample_ct, model, scale_bits,
+          encoders, states, reverse_payload, error);
+    case RecordMode::kTwoReference:
+      return BuildInterleavedPayloadDirectForMode<
+          RecordMode::kTwoReference>(
+          target, reference1, reference2, sample_ct, model, scale_bits,
+          encoders, states, reverse_payload, error);
   }
-  payload->clear();
-  payload->reserve(payload_byte_ct);
-  const uint32_t slot_mask = (1U << scale_bits) - 1;
-  for (uint32_t first_sample = 0; first_sample < sample_ct;
-       first_sample += state_ct) {
-    const uint32_t round_sample_ct =
-        std::min(state_ct, sample_ct - first_sample);
-    for (uint32_t group_start = 0;
-         group_start < round_sample_ct; group_start += 16) {
-      const uint32_t group_end =
-          std::min(group_start + 16, round_sample_ct);
-      uint32_t entropy_lane_mask = 0;
-      for (uint32_t lane = group_start; lane != group_end;
-           ++lane) {
-        const uint32_t sample_idx = first_sample + lane;
-        const uint32_t context = ContextIndex(
-            mode, reference1, reference2, sample_idx);
-        if (model.active_symbol_cts[context] <= 1) {
-          continue;
-        }
-        entropy_lane_mask |= 1U << (lane - group_start);
-        const ModelRow& row = model.rows[context];
-        const uint32_t symbol =
-            GetPackedGenotype(target, sample_idx);
-        const uint32_t slot = states[lane] & slot_mask;
-        states[lane] =
-            row.frequencies[symbol] *
-                (states[lane] >> scale_bits) +
-            slot - row.cumulative[symbol];
-      }
-      while (true) {
-        uint32_t refill_mask = 0;
-        for (uint32_t lane = group_start; lane != group_end;
-             ++lane) {
-          if ((entropy_lane_mask &
-               (1U << (lane - group_start))) &&
-              (states[lane] < kRansLowerBound)) {
-            refill_mask |= 1U << (lane - group_start);
-          }
-        }
-        if (!refill_mask) {
-          break;
-        }
-        for (uint32_t lane = group_start; lane != group_end;
-             ++lane) {
-          if (!(refill_mask & (1U << (lane - group_start)))) {
-            continue;
-          }
-          if (!lane_offsets[lane]) {
-            SetError(
-                "Internal rANS lane merge underflow.", error);
-            return false;
-          }
-          const uint8_t input_byte =
-              lane_payloads[lane][--lane_offsets[lane]];
-          payload->push_back(input_byte);
-          states[lane] =
-              (states[lane] << 8) | input_byte;
-        }
-      }
-    }
-  }
-  for (uint32_t lane = 0; lane != state_ct; ++lane) {
-    if (lane_offsets[lane] ||
-        (states[lane] != kRansLowerBound)) {
-      SetError("Internal rANS lane merge did not terminate.",
-               error);
-      return false;
-    }
-  }
-  return true;
+  SetError("Invalid conditional-rANS record mode.", error);
+  return false;
+#else
+  return BuildInterleavedPayloadDirectMode<
+      kRuntimeRecordMode, 0>(
+      target, reference1, reference2, sample_ct, mode, model,
+      scale_bits, encoders, states, reverse_payload, error);
+#endif
 }
 
 #if PGEN_RANS_X86_RUNTIME_DISPATCH
@@ -1696,7 +1884,6 @@ static bool EncodeRecordImpl(
 
   const uint32_t state_ct = std::min(params.state_ct, sample_ct);
   std::vector<uint32_t> states(state_ct, kRansLowerBound);
-  std::vector<std::vector<uint8_t>> lane_payloads(state_ct);
   std::array<std::array<RansEncoderSymbol, 4>, 16> encoders;
   for (uint32_t context = 0; context != model.row_ct; ++context) {
     if (model.active_symbol_cts[context] <= 1) {
@@ -1711,54 +1898,18 @@ static bool EncodeRecordImpl(
       }
     }
   }
-  for (uint32_t lane = 0; lane != state_ct; ++lane) {
-    uint32_t sample_idx =
-        lane + ((sample_ct - 1 - lane) / state_ct) * state_ct;
-    while (true) {
-      const uint32_t context =
-          ContextIndex(mode, reference1, reference2, sample_idx);
-      const uint32_t active_symbol_ct =
-          model.active_symbol_cts[context];
-      if (active_symbol_ct > 1) {
-        const uint32_t symbol = GetPackedGenotype(target, sample_idx);
-        if (!encoders[context][symbol].frequency) {
-          SetError("Supplied rANS model counts do not match genotypes.",
-                   error);
-          record->clear();
-          return false;
-        }
-        RansEncodeSymbol(encoders[context][symbol], params.scale_bits,
-                         &(states[lane]),
-                         &(lane_payloads[lane]));
-      } else if (context_symbol_counts &&
-                 ((!active_symbol_ct) ||
-                  (GetPackedGenotype(target, sample_idx) !=
-                   model.deterministic_symbols[context]))) {
-        SetError("Supplied rANS model counts do not match genotypes.",
-                 error);
-        record->clear();
-        return false;
-      }
-      if (sample_idx < state_ct) {
-        break;
-      }
-      sample_idx -= state_ct;
-    }
+  std::vector<uint8_t> reverse_payload;
+  if (!BuildInterleavedPayloadDirect(
+          target, reference1, reference2, sample_ct, mode, model,
+          params.scale_bits, encoders, &states, &reverse_payload, error)) {
+    record->clear();
+    return false;
   }
   for (const uint32_t state : states) {
     AppendU32(state, record);
   }
-  std::vector<uint8_t> interleaved_payload;
-  if (!BuildInterleavedPayload(
-          target, reference1, reference2, sample_ct, mode, model,
-          params.scale_bits, states, lane_payloads,
-          &interleaved_payload, error)) {
-    record->clear();
-    return false;
-  }
   record->insert(
-      record->end(), interleaved_payload.begin(),
-      interleaved_payload.end());
+      record->end(), reverse_payload.rbegin(), reverse_payload.rend());
   return true;
 }
 
