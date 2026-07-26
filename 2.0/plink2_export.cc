@@ -9375,7 +9375,7 @@ THREAD_FUNC_DECL DosageTransposeThread(void* raw_arg) {
 }
 
 static_assert(sizeof(Dosage) == 2, "Export012Smaj() needs to be updated.");
-PglErr Export012Smaj(const char* outname, const uintptr_t* orig_sample_include, const PedigreeIdInfo* piip, const uintptr_t* sex_nm, const uintptr_t* sex_male, const PhenoCol* pheno_cols, const uintptr_t* variant_include, const char* const* variant_ids, const uintptr_t* allele_idx_offsets, const char* const* allele_storage, const AlleleCode* export_allele, const char* const* export_allele_missing, const char* legacy_output_missing_pheno, uint32_t raw_sample_ct, uint32_t sample_ct, uint32_t pheno_ct, uint32_t raw_variant_ct, uint32_t variant_ct, uint32_t max_allele_slen, uint32_t include_dom, uint32_t include_uncounted, uint32_t max_thread_ct, uintptr_t pgr_alloc_cacheline_ct, char exportf_delim, PgenFileInfo* pgfip) {
+PglErr Export012Smaj(const char* outname, const uintptr_t* orig_sample_include, const PedigreeIdInfo* piip, const uintptr_t* sex_nm, const uintptr_t* sex_male, const PhenoCol* pheno_cols, const uintptr_t* variant_include, const char* const* variant_ids, const uintptr_t* allele_idx_offsets, const char* const* allele_storage, const AlleleCode* export_allele, const char* const* export_allele_missing, const char* legacy_output_missing_pheno, uint32_t raw_sample_ct, uint32_t sample_ct, uint32_t pheno_ct, uint32_t raw_variant_ct, uint32_t variant_ct, uint32_t max_allele_slen, uint32_t include_dom, uint32_t include_uncounted, uint32_t max_thread_ct, uintptr_t pgr_alloc_cacheline_ct, char exportf_delim, PgenFileInfo* pgfip, PgenReader* simple_pgrp) {
   unsigned char* bigstack_mark = g_bigstack_base;
   FILE* outfile = nullptr;
   PglErr reterr = kPglRetSuccess;
@@ -9603,6 +9603,13 @@ PglErr Export012Smaj(const char* outname, const uintptr_t* orig_sample_include, 
     ctx.sample_ct = read_sample_ct;
     ctx.stride = stride;
     ctx.smaj_dosagebuf = S_CAST(Dosage*, bigstack_alloc_raw_rd(read_sample_ct * S_CAST(uintptr_t, ctx.stride) * sizeof(Dosage)));
+    uintptr_t* multiallelic_genovec = nullptr;
+    if (pgfip->multiread_backend && allele_idx_offsets && export_allele) {
+      if (unlikely(bigstack_alloc_w(
+              NypCtToWordCt(read_sample_ct), &multiallelic_genovec))) {
+        goto Export012Smaj_ret_NOMEM;
+      }
+    }
     assert(g_bigstack_base <= g_bigstack_end);
     ctx.err_info = (~0LLU) << 32;
     SetThreadFuncAndData(DosageTransposeThread, &ctx, &tg);
@@ -9698,6 +9705,41 @@ PglErr Export012Smaj(const char* outname, const uintptr_t* orig_sample_include, 
       }
       if (pct > 10) {
         fputs("\b \b", stdout);
+      }
+      if (multiallelic_genovec) {
+        PgrSampleSubsetIndex pssi;
+        PgrSetSampleSubsetIndex(
+            sample_include_cumulative_popcounts, simple_pgrp, &pssi);
+        uintptr_t patch_variant_uidx_base = 0;
+        uintptr_t patch_variant_include_bits = variant_include[0];
+        for (uint32_t variant_idx = 0; variant_idx != variant_ct;
+             ++variant_idx) {
+          const uintptr_t variant_uidx =
+              BitIter1(variant_include, &patch_variant_uidx_base,
+                       &patch_variant_include_bits);
+          if ((allele_idx_offsets[variant_uidx + 1] -
+               allele_idx_offsets[variant_uidx] <= 2) ||
+              (!export_allele[variant_uidx])) {
+            continue;
+          }
+          uint32_t dosage_ct;
+          reterr = PgrGet1D(
+              sample_include, pssi, read_sample_ct, variant_uidx,
+              export_allele[variant_uidx], simple_pgrp,
+              multiallelic_genovec, nullptr, nullptr, &dosage_ct);
+          if (unlikely(reterr)) {
+            goto Export012Smaj_ret_PGR_FAIL;
+          }
+          assert(!dosage_ct);
+          Dosage* dosage_write_iter =
+              &(ctx.smaj_dosagebuf[variant_idx]);
+          for (uint32_t sample_idx = 0; sample_idx != read_sample_ct;
+               ++sample_idx) {
+            dosage_write_iter[sample_idx * ctx.stride] =
+                kGenoToDosage[GetNyparrEntry(
+                    multiallelic_genovec, sample_idx)];
+          }
+        }
       }
       fputs("\b\b\b\b\b\b\b\b\b\b\b\b\bwriting... 0%", stdout);
       fflush(stdout);
@@ -11955,7 +11997,7 @@ PglErr Exportf(const uintptr_t* sample_include, const PedigreeIdInfo* piip, cons
     if (flags & (kfExportfA | kfExportfAD)) {
       // multiallelic ok
       snprintf(outname_end, kMaxOutfnameExtBlen, ".raw");
-      reterr = Export012Smaj(outname, sample_include, piip, sex_nm, sex_male, pheno_cols, variant_include, variant_ids, allele_idx_offsets, allele_storage, export_allele, export_allele_missing, legacy_output_missing_pheno, raw_sample_ct, sample_ct, pheno_ct, raw_variant_ct, variant_ct, max_export_allele_slen, (flags / kfExportfAD) & 1, (flags / kfExportfIncludeAlt) & 1, max_thread_ct, pgr_alloc_cacheline_ct, exportf_delim, pgfip);
+      reterr = Export012Smaj(outname, sample_include, piip, sex_nm, sex_male, pheno_cols, variant_include, variant_ids, allele_idx_offsets, allele_storage, export_allele, export_allele_missing, legacy_output_missing_pheno, raw_sample_ct, sample_ct, pheno_ct, raw_variant_ct, variant_ct, max_export_allele_slen, (flags / kfExportfAD) & 1, (flags / kfExportfIncludeAlt) & 1, max_thread_ct, pgr_alloc_cacheline_ct, exportf_delim, pgfip, simple_pgrp);
       if (unlikely(reterr)) {
         goto Exportf_ret_1;
       }

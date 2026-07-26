@@ -39,6 +39,31 @@ FLAGSET_DEF_START()
   kfPgrLdcacheBasicGenocounts = (1 << 3)
 FLAGSET_DEF_END(PgrLdcacheFlags);
 
+// Optional hardcall-only backend used by alternate containers.  Keeping this
+// seam at the packed-genotype boundary lets PLINK commands reuse pgenlib's
+// allele, sample-subset, scoring, and export semantics without teaching those
+// commands about a container's physical record layout.
+typedef struct PgrHardcallBackendStruct {
+  void* context;
+  PglErr (*get)(void* context,
+                const uintptr_t* sample_include,
+                const uint32_t* sample_include_cumulative_popcounts,
+                uint32_t sample_ct, uint32_t vidx,
+                uintptr_t* genovec);
+  PglErr (*get_allele)(
+      void* context, const uintptr_t* sample_include,
+      const uint32_t* sample_include_cumulative_popcounts,
+      uint32_t sample_ct, uint32_t vidx, uint32_t allele_idx,
+      uintptr_t* allele_countvec);
+  PglErr (*get_counts)(
+      void* context, const uintptr_t* sample_include,
+      const uint32_t* sample_include_cumulative_popcounts,
+      uint32_t sample_ct, uint32_t vidx, uint32_t* genocounts);
+  PglErr (*get_packed)(void* context, uint32_t vidx,
+                       unsigned char* packed_genotypes,
+                       uint32_t packed_byte_ct);
+} PgrHardcallBackend;
+
 // PgenFileInfo and PgenReader are the main exported "classes".
 // Exported functions involving these data structure should all have
 // "pgfi"/"pgr" in their names.
@@ -108,6 +133,11 @@ typedef struct PgenFileInfoStruct {
 
   const unsigned char* block_base;  // nullptr if using per-variant fread()
   uint64_t block_offset;
+
+  // Null for ordinary PGEN input.  When non-null, PgfiMultiread()
+  // materializes raw two-bit records through this backend instead of fread().
+  // Kept at the end to minimize disruption to the upstream structure layout.
+  const PgrHardcallBackend* multiread_backend;
 } PgenFileInfo;
 
 typedef struct PgenReaderMainStruct {
@@ -179,6 +209,10 @@ typedef struct PgenReaderMainStruct {
   // phase set loading (footer track in mode 0x11) unimplemented for now;
   // should be a sequence of (sample ID, [uint32_t phase set begin, set end),
   // [set begin, set end), ...).
+
+  // Null for ordinary PGEN readers.  Alternate hardcall-only containers can
+  // install this after PreinitPgr() instead of calling PgrInit().
+  const PgrHardcallBackend* hardcall_backend;
 } PgenReaderMain;
 
 typedef struct PgenReaderStruct {
@@ -415,6 +449,10 @@ HEADER_INLINE void PgrSetBaseAndOffset0(unsigned char* block_base, uint32_t thre
 typedef uint32_t PgenHeaderCtrl;
 
 void PreinitPgfi(PgenFileInfo* pgfip);
+
+uintptr_t CountPgrAllocCachelinesRequired(
+    uint32_t raw_sample_ct, PgenGlobalFlags gflags,
+    uint32_t max_allele_ct, uint32_t fread_buf_byte_ct);
 
 // There are two modes of operation:
 // 1. fread block-load.  Block-load operations are single-threaded, while

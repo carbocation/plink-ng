@@ -4020,6 +4020,15 @@ PglErr PgenMtLoadInit(const uintptr_t* variant_include, uint32_t sample_ct, uint
 
     // shouldn't be possible for this to fail
     PgrInit(nullptr, 0, pgfip, (*pgr_pps)[tidx], pgr_alloc);
+    if (pgfip->multiread_backend) {
+      // The materialized record is the standard ALT-collapsed two-bit base
+      // stream.  Allele-specific multiallelic values are patched by the
+      // owning alternate-container reader after this parallel pass.
+      PgenReaderMain* pgrp = &GET_PRIVATE(*(*pgr_pps)[tidx], m);
+      pgrp->fi.allele_idx_offsets = nullptr;
+      pgrp->fi.max_allele_ct = 2;
+      pgrp->fi.gflags &= ~kfPgenGlobalMultiallelicHardcallFound;
+    }
   }
   if (genovecs_ptr) {
     *genovecs_ptr = S_CAST(uintptr_t**, bigstack_alloc_raw(array_of_ptrs_alloc));

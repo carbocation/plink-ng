@@ -49,6 +49,7 @@
 #include "plink2_random.h"
 #include "plink2_set.h"
 #include "pgen_rans_encode.h"
+#include "pgen_rans_plink.h"
 
 #include <assert.h>
 #include <errno.h>
@@ -58,6 +59,7 @@
 #include <string.h>
 #include <time.h>  // time()
 #include <unistd.h>  // unlink()
+#include <new>
 #include <string>
 #include <vector>
 
@@ -435,6 +437,7 @@ typedef struct Plink2CmdlineStruct {
   uint32_t splitpar_bound2;
   uint32_t new_variant_id_max_allele_slen;
   uint32_t update_sex_colm2;
+  uint32_t pgr_input;
 
   // maybe support BGEN v1.2-style variable-precision dosages later, at which
   // point these should be floating-point numbers; but let's first see what we
@@ -929,6 +932,7 @@ PglErr Plink2Core(const Plink2Cmdline* pcp, MakePlink2Flags make_plink2_flags, c
   PglErr reterr = kPglRetSuccess;
   PgenFileInfo pgfi;
   PgenReader simple_pgr;
+  pgen_rans::PlinkPgrAdapter* pgr_adapter = nullptr;
   PreinitPgfi(&pgfi);
   PreinitPgr(&simple_pgr);
   PgenExtensionLl ext_slot; // shouldn't have shorter lifetime than pgfi
@@ -1238,6 +1242,112 @@ PglErr Plink2Core(const Plink2Cmdline* pcp, MakePlink2Flags make_plink2_flags, c
     const uint32_t raw_variant_ctl = BitCtToWordCt(raw_variant_ct);
     uintptr_t pgr_alloc_cacheline_ct = 0;
     if (pgenname[0]) {
+      if (pcp->pgr_input) {
+        std::string error;
+        pgr_adapter = new (std::nothrow) pgen_rans::PlinkPgrAdapter();
+        if (unlikely(!pgr_adapter)) {
+          goto Plink2Core_ret_NOMEM;
+        }
+        if (unlikely(!pgr_adapter->Open(pgenname, pcp->max_thread_ct,
+                                        &error))) {
+          logerrprintfww("Error: Failed to open %s: %s\n", pgenname,
+                         error.c_str());
+          goto Plink2Core_ret_OPEN_FAIL;
+        }
+        if (unlikely((pgr_adapter->variant_ct() != raw_variant_ct) ||
+                     (pgr_adapter->sample_ct() != raw_sample_ct))) {
+          logerrprintfww(
+              "Error: %s contains %u variants and %u samples, while its "
+              "companion metadata contains %u variants and %u samples.\n",
+              pgenname, pgr_adapter->variant_ct(), pgr_adapter->sample_ct(),
+              raw_variant_ct, raw_sample_ct);
+          goto Plink2Core_ret_INCONSISTENT_INPUT;
+        }
+        if (unlikely(pgr_adapter->max_allele_ct() != max_allele_ct)) {
+          logerrprintfww(
+              "Error: Maximum allele count mismatch between %s (%u) and "
+              "%s (%u).\n",
+              pgenname, pgr_adapter->max_allele_ct(), pvarname,
+              max_allele_ct);
+          goto Plink2Core_ret_INCONSISTENT_INPUT;
+        }
+        if (unlikely((max_allele_ct > 2) &&
+                     (((pcp->command_flags1 & kfCommand1Score) &&
+                      (!pcp->read_freq_fname)) ||
+                      (pcp->command_flags1 & kfCommand1AlleleFreq) ||
+                      (pcp->command_flags1 & (kfCommand1LdPrune |
+                                              kfCommand1Clump)) ||
+                      (pcp->geno_thresh != 1.0) ||
+                      (pcp->mind_thresh != 1.0) ||
+                      (pcp->hwe_ln_thresh != -DBL_MAX) ||
+                      (pcp->min_maf != 0.0) ||
+                      (pcp->max_maf != 1.0) ||
+                      pcp->min_allele_ddosage ||
+                      (pcp->max_allele_ddosage != (~0LLU)) ||
+                      (pcp->mach_r2_max != 0.0) ||
+                      (pcp->minimac3_r2_max != 0.0) ||
+                      (pcp->filter_flags & kfFilterMendel)))) {
+          logerrputs(
+              "Error: This --pgr operation requires an allele-frequency scan "
+              "which is currently\nlimited to biallelic PGR filesets.  For "
+              "multiallelic scoring, provide --read-freq;\notherwise apply "
+              "genotype-frequency filters while creating the PGR fileset.\n");
+          goto Plink2Core_ret_INCONSISTENT_INPUT;
+        }
+
+        const uint32_t pvar_nonref_flags_loaded = (nonref_flags != nullptr);
+        if (pvar_nonref_flags_loaded) {
+          for (uint32_t variant_uidx = 0; variant_uidx != raw_variant_ct;
+               ++variant_uidx) {
+            if (unlikely(IsSet(nonref_flags, variant_uidx) !=
+                         pgr_adapter->variant_is_nonref(variant_uidx))) {
+              logerrprintfww(
+                  "Error: Provisional-REF metadata mismatch between %s and "
+                  "%s at variant index %u.\n",
+                  pgenname, pvarname, variant_uidx);
+              goto Plink2Core_ret_INCONSISTENT_INPUT;
+            }
+          }
+        } else if (pgr_adapter->has_mixed_nonref_flags()) {
+          if (unlikely(bigstack_calloc_w(raw_variant_ctl, &nonref_flags))) {
+            goto Plink2Core_ret_NOMEM;
+          }
+          for (uint32_t variant_uidx = 0; variant_uidx != raw_variant_ct;
+               ++variant_uidx) {
+            if (pgr_adapter->variant_is_nonref(variant_uidx)) {
+              SetBit(variant_uidx, nonref_flags);
+            }
+          }
+        }
+
+        pgfi.raw_variant_ct = raw_variant_ct;
+        pgfi.raw_sample_ct = raw_sample_ct;
+        pgfi.const_fpos_offset = 0;
+        pgfi.const_vrec_width = DivUp(raw_sample_ct, 4);
+        pgfi.const_vrtype = 0;
+        pgfi.var_fpos = nullptr;
+        pgfi.vrtypes = nullptr;
+        pgfi.allele_idx_offsets = allele_idx_offsets;
+        pgfi.nonref_flags = nonref_flags;
+        pgfi.gflags = (max_allele_ct > 2)
+                          ? kfPgenGlobalMultiallelicHardcallFound
+                          : kfPgenGlobal0;
+        if (pgr_adapter->all_nonref()) {
+          pgfi.gflags |= kfPgenGlobalAllNonref;
+        }
+        pgfi.max_allele_ct = max_allele_ct;
+        pgfi.extensions_present = 0;
+        pgfi.shared_ff = nullptr;
+        pgfi.pgi_ff = nullptr;
+        pgfi.block_base = nullptr;
+        pgfi.block_offset = 0;
+        pgr_alloc_cacheline_ct =
+            CountPgrAllocCachelinesRequired(
+                raw_sample_ct, pgfi.gflags, max_allele_ct, 0);
+        pgr_adapter->Install(&pgfi, &simple_pgr);
+        logprintfww("%u variants and %u samples loaded from %s.\n",
+                    raw_variant_ct, raw_sample_ct, pgenname);
+      } else {
       PgenHeaderCtrl header_ctrl;
       uintptr_t cur_alloc_cacheline_ct;
       while (1) {
@@ -1396,7 +1506,7 @@ PglErr Plink2Core(const Plink2Cmdline* pcp, MakePlink2Flags make_plink2_flags, c
           goto Plink2Core_ret_1;
         }
       }
-
+      }
     } else {
       // bugfix (10-11 Feb 2018): these variables may still be accessed
       pgfi.gflags = S_CAST(PgenGlobalFlags, ((info_flags / kfInfoPrNonrefDefault) & 1) * kfPgenGlobalAllNonref);
@@ -3134,9 +3244,14 @@ PglErr Plink2Core(const Plink2Cmdline* pcp, MakePlink2Flags make_plink2_flags, c
   CleanupPhenoCols(pheno_ct, pheno_cols);
   free_cond(covar_names);
   free_cond(pheno_names);
-  CleanupPgr2(".pgen file", &simple_pgr, &reterr);
+  CleanupPgr2(pcp->pgr_input? ".pgr file" : ".pgen file", &simple_pgr,
+              &reterr);
+  if (pcp->pgr_input) {
+    pgfi.block_base = nullptr;
+  }
+  delete pgr_adapter;
   free_cond(ext_slot.contents);
-  CleanupPgfi2(".pgen file", &pgfi, &reterr);
+  CleanupPgfi2(pcp->pgr_input? ".pgr file" : ".pgen file", &pgfi, &reterr);
   assert(pgfi.block_base == nullptr);
   // no BigstackReset() needed?
   return reterr;
@@ -4109,6 +4224,7 @@ int main(int argc, char** argv) {
     pc.new_variant_id_max_allele_slen = 23;
     pc.splitpar_bound1 = 0;
     pc.splitpar_bound2 = 0;
+    pc.pgr_input = 0;
     pc.missing_pheno = -9;
     pc.from_bp = -1;
     pc.to_bp = -1;
@@ -8319,8 +8435,10 @@ int main(int argc, char** argv) {
           if (unlikely(EnforceParamCtRange(argvk[arg_idx], param_ct, 0, 0))) {
             goto main_ret_INVALID_CMDLINE_2A;
           }
-          pc.command_flags1 |= kfCommand1MakePgr;
+          pc.command_flags1 |= kfCommand1MakePgr | kfCommand1MakePlink2;
           pc.dependency_flags |= kfFilterAllReq;
+          pc.pvar_psam_flags |= kfPvarColDefault | kfPsamColDefault;
+          make_plink2_flags |= kfMakePvar | kfMakePsam;
           goto main_param_zero;
         } else if (strequal_k_unsafe(flagname_p2, "ake-pgen")) {
           if (unlikely(make_plink2_flags & (kfMakeBed | kfMakePgen))) {
@@ -10079,7 +10197,25 @@ int main(int argc, char** argv) {
         break;
 
       case 'p':
-        if (strequal_k_unsafe(flagname_p2, "file")) {
+        if (strequal_k_unsafe(flagname_p2, "gr")) {
+          if (unlikely(load_params || xload)) {
+            goto main_ret_INVALID_CMDLINE_INPUT_CONFLICT;
+          }
+          if (unlikely(EnforceParamCtRange(argvk[arg_idx], param_ct, 1, 1))) {
+            goto main_ret_INVALID_CMDLINE_2A;
+          }
+          const char* fname_prefix = argvk[arg_idx + 1];
+          const uint32_t slen = strlen(fname_prefix);
+          if (unlikely(slen > (kPglFnamesize - 10))) {
+            logerrputs("Error: --pgr argument too long.\n");
+            goto main_ret_OPEN_FAIL;
+          }
+          snprintf(memcpya(pgenname, fname_prefix, slen), 10, ".pgr");
+          snprintf(memcpya(psamname, fname_prefix, slen), 10, ".psam");
+          snprintf(memcpya(pvarname, fname_prefix, slen), 10, ".pvar");
+          load_params |= kfLoadParamsPfileAll;
+          pc.pgr_input = 1;
+        } else if (strequal_k_unsafe(flagname_p2, "file")) {
           if (unlikely(load_params || xload)) {
             // currently only possible with --bcf, --bfile, --pfile
             goto main_ret_INVALID_CMDLINE_INPUT_CONFLICT;
@@ -12927,9 +13063,43 @@ int main(int argc, char** argv) {
       goto main_ret_INVALID_CMDLINE_A;
     }
     if (unlikely((pc.command_flags1 & kfCommand1MakePgr) &&
-                 (pc.command_flags1 & kfCommand1MakePlink2))) {
-      logerrputs("Error: --make-pgr cannot currently be combined with another fileset creation\ncommand.\n");
+                 (make_plink2_flags & (~(kfMakePvar | kfMakePsam))))) {
+      logerrputs("Error: --make-pgr cannot be combined with another genotype fileset creation\ncommand.\n");
       goto main_ret_INVALID_CMDLINE_A;
+    }
+    if (pc.pgr_input) {
+      const Command1Flags pgr_supported_commands =
+          S_CAST(Command1Flags, kfCommand1Exportf | kfCommand1AlleleFreq |
+                                  kfCommand1LdPrune | kfCommand1Score |
+                                  kfCommand1WriteSnplist |
+                                  kfCommand1WriteSamples |
+                                  kfCommand1Clump | kfCommand1Vcor);
+      if (unlikely(pc.command_flags1 & (~pgr_supported_commands))) {
+        logerrputs(
+            "Error: --pgr currently supports --score[-list], --freq, "
+            "--export A/Av,\n--indep-pairwise, --r-unphased, --clump, "
+            "--write-snplist, and\n--write-samples.  Use the matching .pgen "
+            "for other PLINK operations.\n");
+        goto main_ret_INVALID_CMDLINE_A;
+      }
+      if (pc.command_flags1 & kfCommand1Exportf) {
+        const ExportfFlags export_type =
+            pc.exportf_info.flags & kfExportfTypemask;
+        if (unlikely((export_type != kfExportfA) &&
+                     (export_type != kfExportfAv))) {
+          logerrputs(
+              "Error: --pgr currently supports only --export A and "
+              "--export Av.\n");
+          goto main_ret_INVALID_CMDLINE_A;
+        }
+      }
+      if (unlikely((pc.ld_info.prune_flags & kfLdPrunePairphase) ||
+                   (pc.vcor_info.flags & kfVcorPhased))) {
+        logerrputs(
+            "Error: PGR stores unphased hardcalls; use --indep-pairwise or "
+            "--r-unphased\ninstead of a phased LD command.\n");
+        goto main_ret_INVALID_CMDLINE_A;
+      }
     }
     if (unlikely((xload & kfXloadMap) && (!(xload & (kfXloadPed | kfXloadPlink1Dosage))))) {
       logerrputs("Error: --map must be used with --import-dosage or --ped.\n");

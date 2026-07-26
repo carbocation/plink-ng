@@ -279,6 +279,31 @@ uint32_t PackedVariantReader::variant_ct() const {
   return impl_->reader.params().variant_ct;
 }
 
+uint32_t PackedVariantReader::max_allele_ct() const {
+  return impl_->reader.params().max_allele_ct;
+}
+
+bool PackedVariantReader::all_nonref() const {
+  return impl_->reader.metadata().all_nonref;
+}
+
+bool PackedVariantReader::has_mixed_nonref_flags() const {
+  return !impl_->reader.metadata().nonref_flags.empty();
+}
+
+bool PackedVariantReader::variant_is_nonref(uint32_t variant) const {
+  if (variant >= impl_->reader.params().variant_ct) {
+    return false;
+  }
+  if (impl_->reader.metadata().all_nonref) {
+    return true;
+  }
+  const std::vector<uint8_t>& flags =
+      impl_->reader.metadata().nonref_flags;
+  return !flags.empty() &&
+         ((flags[variant / 8] >> (variant % 8)) & 1U);
+}
+
 size_t PackedVariantReader::packed_variant_byte_ct() const {
   return impl_->packed_byte_ct;
 }

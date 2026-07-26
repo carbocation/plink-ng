@@ -444,12 +444,50 @@ PglErr EncodePgr(const std::string& output_path, const EncodeInput& input,
   stats->block_ct = static_cast<uint32_t>(blocks.size());
   const CodecParams codec_params = {
       params.rans_state_ct, params.rans_scale_bits};
+  uint32_t max_allele_ct = 2;
+  if (input.variant_metadata) {
+    for (uint32_t variant_idx = 0; variant_idx != input.variant_ct;
+         ++variant_idx) {
+      max_allele_ct =
+          std::max<uint32_t>(
+              max_allele_ct,
+              input.variant_metadata[variant_idx].allele_ct);
+    }
+  }
   const ContainerParams container_params = {
       input.sample_ct, input.variant_ct, params.block_variant_ct,
       params.anchor_ct, params.rans_state_ct, params.rans_scale_bits,
-      params.restart_variant_ct, static_cast<uint32_t>(blocks.size())};
+      params.restart_variant_ct, static_cast<uint32_t>(blocks.size()),
+      max_allele_ct};
+  ContainerMetadata container_metadata;
+  const uintptr_t* input_nonref_flags = input.pgfi->nonref_flags;
+  if (input_nonref_flags) {
+    container_metadata.nonref_flags.assign(
+        (static_cast<size_t>(input.variant_ct) + 7) / 8, 0);
+    uint32_t nonref_ct = 0;
+    for (uint32_t variant_idx = 0; variant_idx != input.variant_ct;
+         ++variant_idx) {
+      const uint32_t variant_uidx =
+          input.variant_uidxs ? input.variant_uidxs[variant_idx]
+                              : variant_idx;
+      if (IsSet(input_nonref_flags, variant_uidx)) {
+        container_metadata.nonref_flags[variant_idx / 8] |=
+            static_cast<uint8_t>(1U << (variant_idx % 8));
+        ++nonref_ct;
+      }
+    }
+    if (!nonref_ct) {
+      container_metadata.nonref_flags.clear();
+    } else if (nonref_ct == input.variant_ct) {
+      container_metadata.nonref_flags.clear();
+      container_metadata.all_nonref = true;
+    }
+  } else if (input.pgfi->gflags & kfPgenGlobalAllNonref) {
+    container_metadata.all_nonref = true;
+  }
   ContainerWriter writer;
-  if (!writer.Open(output_path, container_params, error)) {
+  if (!writer.Open(
+          output_path, container_params, container_metadata, error)) {
     return kPglRetOpenFail;
   }
 

@@ -19,6 +19,7 @@ namespace {
 using pgen_rans::CodecParams;
 using pgen_rans::AppendMultiallelicPatches;
 using pgen_rans::ContainerParams;
+using pgen_rans::ContainerMetadata;
 using pgen_rans::ContainerReader;
 using pgen_rans::ContainerWriter;
 using pgen_rans::CpuBlockDecoder;
@@ -132,7 +133,11 @@ int main() {
   const CodecParams codec_params;
   const ContainerParams container_params = {
       kSampleCt, kVariantCt, kBlockVariantCt, kAnchorCt,
-      codec_params.state_ct, codec_params.scale_bits, 4, 2};
+      codec_params.state_ct, codec_params.scale_bits, 4, 2, 5};
+  ContainerMetadata container_metadata;
+  container_metadata.nonref_flags.assign((kVariantCt + 7) / 8, 0);
+  container_metadata.nonref_flags[0] = (1U << 1) | (1U << 4);
+  container_metadata.nonref_flags[1] = (1U << (12 - 8));
   std::vector<std::vector<uint64_t>> source;
   for (uint32_t variant_idx = 0; variant_idx != kVariantCt; ++variant_idx) {
     source.push_back(MakeVariant(variant_idx, kSampleCt));
@@ -152,7 +157,8 @@ int main() {
   const std::string path = TemporaryPath();
   std::string error;
   ContainerWriter writer;
-  Expect(writer.Open(path, container_params, &error),
+  Expect(writer.Open(
+             path, container_params, container_metadata, &error),
          "writer open failed: " + error);
   uint32_t first_variant = 0;
   for (uint32_t block_idx = 0; block_idx != 2; ++block_idx) {
@@ -213,6 +219,13 @@ int main() {
          "container sample count mismatch");
   Expect(reader.params().variant_ct == kVariantCt,
          "container variant count mismatch");
+  Expect(reader.params().max_allele_ct == 5,
+         "container maximum allele count mismatch");
+  Expect(reader.metadata().nonref_flags ==
+             container_metadata.nonref_flags,
+         "container nonreference flags mismatch");
+  Expect(!reader.metadata().all_nonref,
+         "container unexpectedly marked all variants provisional");
   for (uint32_t variant_idx = 0; variant_idx != kVariantCt; ++variant_idx) {
     uint32_t block_idx;
     Expect(reader.FindBlock(variant_idx, &block_idx, &error),
@@ -363,6 +376,18 @@ int main() {
          "packed reader sample count mismatch");
   Expect(packed_reader.variant_ct() == kVariantCt,
          "packed reader variant count mismatch");
+  Expect(packed_reader.max_allele_ct() == 5,
+         "packed reader maximum allele count mismatch");
+  Expect(packed_reader.has_mixed_nonref_flags(),
+         "packed reader lost mixed nonreference flags");
+  Expect(!packed_reader.all_nonref(),
+         "packed reader unexpectedly marked all variants provisional");
+  Expect(packed_reader.variant_is_nonref(1) &&
+             packed_reader.variant_is_nonref(4) &&
+             packed_reader.variant_is_nonref(12) &&
+             !packed_reader.variant_is_nonref(0) &&
+             !packed_reader.variant_is_nonref(kVariantCt),
+         "packed reader nonreference lookup mismatch");
   const size_t packed_byte_ct = (kSampleCt + 3) / 4;
   const size_t output_stride = packed_byte_ct + 5;
   std::vector<uint8_t> packed_output(7 * output_stride, 0xa5);

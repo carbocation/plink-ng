@@ -32,7 +32,7 @@ The first byte contains:
 - bits 4-7: reserved and zero.
 
 One-reference records next store one byte containing the anchor ordinal.
-Two-reference records store two distinct anchor ordinals. Version 3 therefore
+Two-reference records store two distinct anchor ordinals. Version 4 therefore
 supports at most 256 anchors per block.
 
 The probability model follows:
@@ -125,16 +125,25 @@ A conforming decoder rejects:
 
 The reference implementation wraps records in an experimental `.pgr` file.
 This is deliberately separate from PGEN storage-mode assignment.
-Version 3 files begin with `PGRANS3\0` and carry format version 3 in the
+Version 4 files begin with `PGRANS4\0` and carry format version 4 in the
 container header. Earlier experimental container identities are not supported.
 
-The 64-byte file header stores the version, sample and variant counts, block
-and anchor sizes, rANS parameters, restart interval, block count, and offsets
-of the block table and block-data region. It is followed by a fixed 32-byte
-entry for every block containing the first variant, variant count, file
-offset, and byte count. This permits a client to issue one bounded ranged read
-for a block without scanning earlier variant records. Each entry also stores a
-CRC32C checksum of the complete serialized block.
+The 96-byte file header stores the version, sample and variant counts, block
+and anchor sizes, rANS parameters, restart interval, block count, maximum
+allele count, metadata flags, and offsets of the block table, metadata, and
+block-data regions. It is followed by a fixed 32-byte entry for every block
+containing the first variant, variant count, file offset, and byte count. This
+permits a client to issue one bounded ranged read for a block without scanning
+earlier variant records. Each entry also stores a CRC32C checksum of the
+complete serialized block.
+
+Version 4 preserves PGEN's provisional/nonreference REF status. Uniform
+trusted and uniform provisional files consume only a header flag. Mixed files
+store one bit per variant between the block table and block data. The bitmap is
+small enough to fetch with the block table during open, so ranged readers still
+need only two initial requests. PVAR/PSAM remain the authoritative variant and
+sample metadata; the container's counts, maximum allele count, and REF-status
+summary let readers reject mismatched companion files.
 
 Each block starts with a 16-byte header followed by:
 
@@ -146,7 +155,7 @@ To find a record, a reader starts from the closest preceding cumulative
 restart and sums at most `restart_interval - 1` 24-bit lengths. The default
 restart interval is 64 variants.
 
-Version 3 readers validate that block-table entries cover the variants and
+Version 4 readers validate that block-table entries cover the variants and
 file exactly, blocks are contiguous, restart offsets agree with record
 lengths, record lengths span each block payload, and the block CRC32C matches.
 
@@ -200,8 +209,8 @@ CPU consumers can instead build `bin/libpgen_rans.a`:
 make -f Makefile.pgen_rans libpgen_rans
 ```
 
-The main PLINK 2 binary can encode the remaining variants and samples with
-its standard filtering and threading options:
+The main PLINK 2 binary can encode the remaining variants and samples with its
+standard filtering and threading options:
 
 ```sh
 plink2 --pfile cohort \
@@ -211,11 +220,29 @@ plink2 --pfile cohort \
   --out cohort-chr22
 ```
 
-This writes `cohort-chr22.pgr`. The command intentionally has no
-benchmark-only limit options; use normal PLINK selectors such as `--chr`,
-`--from-bp`/`--to-bp`, and `--extract` to bound an encoding run. If filters
-change the sample or variant set, generate or retain `.psam` and `.pvar`
-metadata with the same selection.
+This writes a complete `cohort-chr22.pgr/.pvar/.psam` fileset. The command
+intentionally has no benchmark-only limit options; use normal PLINK selectors
+such as `--chr`, `--from-bp`/`--to-bp`, and `--extract` to bound an encoding
+run.
+
+The main binary can read that fileset through the existing packed-hardcall
+analysis seam:
+
+```sh
+plink2 --pgr cohort-chr22 \
+  --score weights.txt \
+  --out scores
+```
+
+The initial production surface includes `--score[-list]`, `--freq`,
+`--export A/Av`, `--indep-pairwise`, `--r-unphased`, `--clump`,
+`--write-snplist`, and `--write-samples`. Sample, position, ID, and
+genotype-frequency filters can be applied with these commands. PGR filesets
+with more than two alleles at any variant currently require `--read-freq` for
+scoring; multiallelic `--r-unphased` and allele-aware A/Av exports are exact,
+while frequency scans, LD pruning, clumping, and genotype-frequency filters
+are currently limited to biallelic PGR filesets. Construction and merge
+commands continue to use PGEN as their working format.
 
 Encode an unphased hardcall PGEN, including exact multiallelic calls:
 

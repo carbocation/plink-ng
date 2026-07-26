@@ -822,7 +822,7 @@ bool RansDecodeGroup16Avx512(
   __m512i threshold0;
   __m512i threshold1;
   __m512i threshold2;
-  if constexpr (kMode == RecordMode::kMarginal) {
+  if (kMode == RecordMode::kMarginal) {
     threshold0 = _mm512_set1_epi32(
         static_cast<int>(decode_model.thresholds[0][0]));
     threshold1 = _mm512_set1_epi32(
@@ -850,8 +850,7 @@ bool RansDecodeGroup16Avx512(
   const __mmask16 above2 = _mm512_cmp_epu32_mask(
       slots, threshold2, _MM_CMPINT_GE);
   __mmask16 entropy_mask = 0xffffU;
-  if constexpr (
-      (kMode != RecordMode::kMarginal) && !kAllEntropy) {
+  if ((kMode != RecordMode::kMarginal) && !kAllEntropy) {
     const __m512i context_flags =
         _mm512_permutexvar_epi32(
             contexts,
@@ -1141,11 +1140,11 @@ bool DecodeEntropyInterleaved(
            ++lane) {
         const uint32_t sample_idx = first_sample + lane;
         uint32_t context = 0;
-        if constexpr (kMode != RecordMode::kMarginal) {
+        if (kMode != RecordMode::kMarginal) {
           context =
               GetPackedGenotype(reference1, sample_idx);
         }
-        if constexpr (kMode == RecordMode::kTwoReference) {
+        if (kMode == RecordMode::kTwoReference) {
           context =
               4 * context +
               GetPackedGenotype(reference2, sample_idx);

@@ -28,13 +28,17 @@ namespace pgen_rans {
 namespace {
 
 constexpr std::array<uint8_t, 8> kFileMagic = {
-    'P', 'G', 'R', 'A', 'N', 'S', '3', '\0'};
-constexpr uint32_t kFormatVersion = 3;
-constexpr uint32_t kFileHeaderByteCt = 64;
+    'P', 'G', 'R', 'A', 'N', 'S', '4', '\0'};
+constexpr uint32_t kFormatVersion = 4;
+constexpr uint32_t kFileHeaderByteCt = 96;
 constexpr uint32_t kBlockIndexByteCt = 32;
 constexpr uint32_t kBlockHeaderByteCt = 16;
 constexpr uint32_t kBlockMagic = 0x314b4c42U;
 constexpr uint32_t kMaximumRecordByteCt = 0xffffffU;
+constexpr uint32_t kContainerFlagNonrefBitmap = 1U << 0;
+constexpr uint32_t kContainerFlagAllNonref = 1U << 1;
+constexpr uint32_t kContainerKnownFlags =
+    kContainerFlagNonrefBitmap | kContainerFlagAllNonref;
 #if !PGEN_RANS_ARM_CRC32C
 constexpr uint32_t kCrc32cPolynomial = 0x82f63b78U;
 #endif
@@ -246,8 +250,22 @@ bool ReadBytes(FILE* file, uint8_t* data, size_t byte_ct,
   return true;
 }
 
-std::vector<uint8_t> SerializeHeader(const ContainerParams& params) {
+std::vector<uint8_t> SerializeHeader(const ContainerParams& params,
+                                     const ContainerMetadata& metadata) {
   std::vector<uint8_t> output;
+  uint32_t flags = 0;
+  if (!metadata.nonref_flags.empty()) {
+    flags |= kContainerFlagNonrefBitmap;
+  }
+  if (metadata.all_nonref) {
+    flags |= kContainerFlagAllNonref;
+  }
+  const uint64_t block_table_offset = kFileHeaderByteCt;
+  const uint64_t metadata_offset =
+      block_table_offset +
+      static_cast<uint64_t>(params.block_ct) * kBlockIndexByteCt;
+  const uint64_t metadata_byte_ct = metadata.nonref_flags.size();
+  const uint64_t data_offset = metadata_offset + metadata_byte_ct;
   output.insert(output.end(), kFileMagic.begin(), kFileMagic.end());
   AppendU32(kFormatVersion, &output);
   AppendU32(kFileHeaderByteCt, &output);
@@ -259,10 +277,13 @@ std::vector<uint8_t> SerializeHeader(const ContainerParams& params) {
   AppendU32(params.scale_bits, &output);
   AppendU32(params.restart_variant_ct, &output);
   AppendU32(params.block_ct, &output);
-  AppendU64(kFileHeaderByteCt, &output);
-  AppendU64(kFileHeaderByteCt +
-            static_cast<uint64_t>(params.block_ct) * kBlockIndexByteCt,
-            &output);
+  AppendU32(flags, &output);
+  AppendU32(params.max_allele_ct, &output);
+  AppendU64(block_table_offset, &output);
+  AppendU64(metadata_offset, &output);
+  AppendU64(metadata_byte_ct, &output);
+  AppendU64(data_offset, &output);
+  AppendU64(0, &output);
   return output;
 }
 
@@ -289,9 +310,38 @@ bool ValidateParams(const ContainerParams& params, std::string* error) {
       (params.state_ct > 256) || (params.scale_bits < 8) ||
       (params.scale_bits > 16) || (!params.restart_variant_ct) ||
       (params.restart_variant_ct > UINT16_MAX) || (!params.block_ct) ||
-      (params.block_ct > params.variant_ct)) {
+      (params.block_ct > params.variant_ct) ||
+      (params.max_allele_ct < 2) || (params.max_allele_ct > 255)) {
     SetError("Invalid conditional-rANS container parameters.", error);
     return false;
+  }
+  return true;
+}
+
+bool ValidateMetadata(const ContainerParams& params,
+                      const ContainerMetadata& metadata,
+                      std::string* error) {
+  const size_t expected_byte_ct =
+      (static_cast<size_t>(params.variant_ct) + 7) / 8;
+  if (metadata.all_nonref && !metadata.nonref_flags.empty()) {
+    SetError("Conditional-rANS nonreference metadata is contradictory.",
+             error);
+    return false;
+  }
+  if (!metadata.nonref_flags.empty()) {
+    if (metadata.nonref_flags.size() != expected_byte_ct) {
+      SetError("Conditional-rANS nonreference bitmap has the wrong size.",
+               error);
+      return false;
+    }
+    const uint32_t trailing_bit_ct = params.variant_ct % 8;
+    if (trailing_bit_ct &&
+        (metadata.nonref_flags.back() &
+         static_cast<uint8_t>(0xffU << trailing_bit_ct))) {
+      SetError("Conditional-rANS nonreference bitmap has nonzero padding.",
+               error);
+      return false;
+    }
   }
   return true;
 }
@@ -321,12 +371,14 @@ ContainerWriter::~ContainerWriter() {
 
 bool ContainerWriter::Open(const std::string& path,
                            const ContainerParams& params,
+                           const ContainerMetadata& metadata,
                            std::string* error) {
   if (file_) {
     SetError("Container writer is already open.", error);
     return false;
   }
-  if (!ValidateParams(params, error)) {
+  if (!ValidateParams(params, error) ||
+      !ValidateMetadata(params, metadata, error)) {
     return false;
   }
   file_ = fopen(path.c_str(), "w+b");
@@ -336,10 +388,12 @@ bool ContainerWriter::Open(const std::string& path,
     return false;
   }
   params_ = params;
+  metadata_ = metadata;
   block_index_.reserve(params.block_ct);
   const uint64_t data_offset =
       kFileHeaderByteCt +
-      static_cast<uint64_t>(params.block_ct) * kBlockIndexByteCt;
+      static_cast<uint64_t>(params.block_ct) * kBlockIndexByteCt +
+      metadata_.nonref_flags.size();
   if (!Seek(file_, data_offset, error)) {
     failed_ = true;
     return false;
@@ -448,13 +502,16 @@ bool ContainerWriter::Close(std::string* error) {
     file_ = nullptr;
     return false;
   }
-  const std::vector<uint8_t> header = SerializeHeader(params_);
+  const std::vector<uint8_t> header =
+      SerializeHeader(params_, metadata_);
   const std::vector<uint8_t> block_index =
       SerializeBlockIndex(block_index_);
   bool success = Seek(file_, 0, error) &&
                  WriteBytes(file_, header.data(), header.size(), error) &&
                  WriteBytes(file_, block_index.data(), block_index.size(),
-                            error);
+                            error) &&
+                 WriteBytes(file_, metadata_.nonref_flags.data(),
+                            metadata_.nonref_flags.size(), error);
   if (success && fflush(file_)) {
     SetError(std::string("File flush failed: ") + strerror(errno), error);
     success = false;
@@ -535,8 +592,12 @@ bool ContainerReader::OpenIndex(std::string* error) {
   size_t offset = kFileMagic.size();
   uint32_t version;
   uint32_t header_byte_ct;
+  uint32_t flags;
   uint64_t block_table_offset;
+  uint64_t metadata_offset;
+  uint64_t metadata_byte_ct;
   uint64_t data_offset;
+  uint64_t reserved;
   if ((!ReadU32(header.data(), header.size(), &offset, &version)) ||
       (!ReadU32(header.data(), header.size(), &offset, &header_byte_ct)) ||
       (!ReadU32(header.data(), header.size(), &offset, &params_.sample_ct)) ||
@@ -549,20 +610,43 @@ bool ContainerReader::OpenIndex(std::string* error) {
       (!ReadU32(header.data(), header.size(), &offset,
                 &params_.restart_variant_ct)) ||
       (!ReadU32(header.data(), header.size(), &offset, &params_.block_ct)) ||
+      (!ReadU32(header.data(), header.size(), &offset, &flags)) ||
+      (!ReadU32(header.data(), header.size(), &offset,
+                &params_.max_allele_ct)) ||
       (!ReadU64(header.data(), header.size(), &offset,
                 &block_table_offset)) ||
-      (!ReadU64(header.data(), header.size(), &offset, &data_offset))) {
+      (!ReadU64(header.data(), header.size(), &offset,
+                &metadata_offset)) ||
+      (!ReadU64(header.data(), header.size(), &offset,
+                &metadata_byte_ct)) ||
+      (!ReadU64(header.data(), header.size(), &offset, &data_offset)) ||
+      (!ReadU64(header.data(), header.size(), &offset, &reserved))) {
     SetError("Truncated conditional-rANS container header.", error);
     Close();
     return false;
   }
   const uint64_t expected_data_offset =
       kFileHeaderByteCt +
+      static_cast<uint64_t>(params_.block_ct) * kBlockIndexByteCt +
+      metadata_byte_ct;
+  const uint64_t expected_metadata_offset =
+      kFileHeaderByteCt +
       static_cast<uint64_t>(params_.block_ct) * kBlockIndexByteCt;
+  const uint64_t expected_nonref_byte_ct =
+      (static_cast<uint64_t>(params_.variant_ct) + 7) / 8;
   if ((version != kFormatVersion) ||
       (header_byte_ct != kFileHeaderByteCt) ||
       (block_table_offset != kFileHeaderByteCt) ||
+      (flags & ~kContainerKnownFlags) ||
+      ((flags & kContainerFlagNonrefBitmap) &&
+       (flags & kContainerFlagAllNonref)) ||
+      (metadata_offset != expected_metadata_offset) ||
+      (metadata_byte_ct !=
+       ((flags & kContainerFlagNonrefBitmap)
+            ? expected_nonref_byte_ct
+            : 0)) ||
       (data_offset != expected_data_offset) || (data_offset > file_size_) ||
+      reserved ||
       (!ValidateParams(params_, error))) {
     if (error && error->empty()) {
       *error = "Invalid conditional-rANS container header.";
@@ -570,33 +654,46 @@ bool ContainerReader::OpenIndex(std::string* error) {
     Close();
     return false;
   }
-  std::vector<uint8_t> serialized_index(
-      static_cast<size_t>(params_.block_ct) * kBlockIndexByteCt);
-  if (!ReadAt(kFileHeaderByteCt, serialized_index.data(),
-              serialized_index.size(), error)) {
+  metadata_.all_nonref = (flags & kContainerFlagAllNonref) != 0;
+  const size_t serialized_index_byte_ct =
+      static_cast<size_t>(params_.block_ct) * kBlockIndexByteCt;
+  std::vector<uint8_t> serialized_index_and_metadata(
+      serialized_index_byte_ct + static_cast<size_t>(metadata_byte_ct));
+  if (!ReadAt(kFileHeaderByteCt, serialized_index_and_metadata.data(),
+              serialized_index_and_metadata.size(), error)) {
     Close();
     return false;
   }
+  metadata_.nonref_flags.assign(
+      serialized_index_and_metadata.begin() +
+          static_cast<std::ptrdiff_t>(serialized_index_byte_ct),
+      serialized_index_and_metadata.end());
+  if (!ValidateMetadata(params_, metadata_, error)) {
+    Close();
+    return false;
+  }
+  const uint8_t* serialized_index =
+      serialized_index_and_metadata.data();
   block_index_.resize(params_.block_ct);
   offset = 0;
   uint32_t next_variant = 0;
   uint64_t next_file_offset = data_offset;
   for (BlockIndexEntry& entry : block_index_) {
     uint32_t checksum;
-    uint32_t reserved;
-    if ((!ReadU32(serialized_index.data(), serialized_index.size(), &offset,
+    uint32_t entry_reserved;
+    if ((!ReadU32(serialized_index, serialized_index_byte_ct, &offset,
                   &entry.first_variant)) ||
-        (!ReadU32(serialized_index.data(), serialized_index.size(), &offset,
+        (!ReadU32(serialized_index, serialized_index_byte_ct, &offset,
                   &entry.variant_ct)) ||
-        (!ReadU64(serialized_index.data(), serialized_index.size(), &offset,
+        (!ReadU64(serialized_index, serialized_index_byte_ct, &offset,
                   &entry.file_offset)) ||
-        (!ReadU64(serialized_index.data(), serialized_index.size(), &offset,
+        (!ReadU64(serialized_index, serialized_index_byte_ct, &offset,
                   &entry.byte_ct)) ||
-        (!ReadU32(serialized_index.data(), serialized_index.size(), &offset,
+        (!ReadU32(serialized_index, serialized_index_byte_ct, &offset,
                   &checksum)) ||
-        (!ReadU32(serialized_index.data(), serialized_index.size(), &offset,
-                  &reserved)) ||
-        reserved || (entry.first_variant != next_variant) ||
+        (!ReadU32(serialized_index, serialized_index_byte_ct, &offset,
+                  &entry_reserved)) ||
+        entry_reserved || (entry.first_variant != next_variant) ||
         (!entry.variant_ct) ||
         (entry.variant_ct > params_.block_variant_ct) ||
         (entry.file_offset != next_file_offset) ||
@@ -628,6 +725,7 @@ void ContainerReader::Close() {
   read_at_ = nullptr;
   read_at_context_ = nullptr;
   params_ = {};
+  metadata_ = {};
   block_index_.clear();
   file_size_ = 0;
 }

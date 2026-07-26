@@ -80,7 +80,7 @@ jobs:
           2.0/build_dynamic/plink2 --version | tee /tmp/plink2-version.txt
           grep -q AVX2 /tmp/plink2-version.txt
           grep -q Intel /tmp/plink2-version.txt
-          2.0/build_dynamic/plink2 --help make-pgr | grep -q -- --make-pgr
+          2.0/build_dynamic/plink2 --help pgr make-pgr | grep -q -- --make-pgr
           2.0/bin/pgen_rans --help
           smoke_prefix="$RUNNER_TEMP/pgr-smoke"
           2.0/build_dynamic/plink2 \
@@ -94,7 +94,18 @@ jobs:
             --out "$smoke_prefix"
           2.0/bin/pgen_rans verify \
             "$smoke_prefix-input.pgen" "$smoke_prefix.pgr" \
-            --pvar "$smoke_prefix-input.pvar"
+            --pvar "$smoke_prefix.pvar"
+          test -s "$smoke_prefix.pvar"
+          test -s "$smoke_prefix.psam"
+          2.0/build_dynamic/plink2 \
+            --pfile "$smoke_prefix-input" \
+            --export A \
+            --out "$smoke_prefix-pgen-export"
+          2.0/build_dynamic/plink2 \
+            --pgr "$smoke_prefix" \
+            --export A \
+            --out "$smoke_prefix-pgr-export"
+          cmp "$smoke_prefix-pgen-export.raw" "$smoke_prefix-pgr-export.raw"
           if ldd 2.0/build_dynamic/plink2 | grep -Eq 'mkl|iomp'; then
             echo "PLINK has an unexpected dynamic oneMKL dependency." >&2
             exit 1
@@ -210,7 +221,7 @@ jobs:
             grep -q M1 /tmp/plink2-version.txt
           fi
           otool -L 2.0/build_dynamic/plink2 | grep -q Accelerate
-          2.0/build_dynamic/plink2 --help make-pgr | grep -q -- --make-pgr
+          2.0/build_dynamic/plink2 --help pgr make-pgr | grep -q -- --make-pgr
           2.0/bin/pgen_rans --help
           smoke_prefix="$RUNNER_TEMP/pgr-smoke"
           2.0/build_dynamic/plink2 \
@@ -224,7 +235,18 @@ jobs:
             --out "$smoke_prefix"
           2.0/bin/pgen_rans verify \
             "$smoke_prefix-input.pgen" "$smoke_prefix.pgr" \
-            --pvar "$smoke_prefix-input.pvar"
+            --pvar "$smoke_prefix.pvar"
+          test -s "$smoke_prefix.pvar"
+          test -s "$smoke_prefix.psam"
+          2.0/build_dynamic/plink2 \
+            --pfile "$smoke_prefix-input" \
+            --export A \
+            --out "$smoke_prefix-pgen-export"
+          2.0/build_dynamic/plink2 \
+            --pgr "$smoke_prefix" \
+            --export A \
+            --out "$smoke_prefix-pgr-export"
+          cmp "$smoke_prefix-pgen-export.raw" "$smoke_prefix-pgr-export.raw"
 
       - name: Package macOS artifact
         shell: bash

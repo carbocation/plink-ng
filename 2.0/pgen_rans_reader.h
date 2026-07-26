@@ -36,6 +36,10 @@ class PackedVariantReader {
   uint32_t raw_sample_ct() const;
   uint32_t sample_ct() const;
   uint32_t variant_ct() const;
+  uint32_t max_allele_ct() const;
+  bool all_nonref() const;
+  bool has_mixed_nonref_flags() const;
+  bool variant_is_nonref(uint32_t variant) const;
   size_t packed_variant_byte_ct() const;
 
   // Indices are zero-based positions in the stored sample order and must be

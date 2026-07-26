@@ -118,9 +118,13 @@ PglErr DispHelp(const char* const* argvk, uint32_t param_ct) {
     // explicit gzipped .pvar/.bim support was tried, and then rejected since
     // decompression was too slow
     // Zstd should have the necessary x86 performance characteristics, though
-    HelpPrint("pfile\0pgen\0pgi\0bfile\0bed\0", &help_ctrl, 1,
+    HelpPrint("pfile\0pgr\0pgen\0pgi\0bfile\0bed\0", &help_ctrl, 1,
 "  --pfile <prefix> ['vzs']  : Specify .pgen[ + .pgen.pgi] + .pvar[.zst] +\n"
 "                              .psam prefix.\n"
+"  --pgr <prefix>            : Specify .pgr + .pvar + .psam prefix.  This\n"
+"                              supports --score[-list], --freq, --export A/Av,\n"
+"                              --indep-pairwise, --r-unphased, --clump,\n"
+"                              --write-snplist, and --write-samples.\n"
 "  --pgen <filename>         : Specify full name of .pgen/.bed file.\n"
 "  --pgi <filename>          : Specify full name of .pgen.pgi file.\n"
                );
@@ -311,10 +315,11 @@ PglErr DispHelp(const char* const* argvk, uint32_t param_ct) {
               );
     HelpPrint("make-pgr\0", &help_ctrl, 1,
 "  --make-pgr\n"
-"    Write filtered unphased hardcalls to <output prefix>.pgr with\n"
+"    Write filtered unphased hardcalls and matching .pvar/.psam metadata to\n"
+"    <output prefix>.pgr/.pvar/.psam with\n"
 "    block-local conditional-rANS compression.  The experimental .pgr container\n"
 "    is separate from the PGEN format; exact multiallelic calls are retained in\n"
-"    sparse patches.  Keep the matching .pvar and .psam metadata.\n"
+"    sparse patches.\n"
 "    Existing sample and variant filters determine the hardcalls written.\n"
 "    Encoding uses the existing --threads setting, which defaults to all\n"
 "    available logical CPUs.\n\n"
