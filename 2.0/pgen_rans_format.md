@@ -165,6 +165,23 @@ CPU consumers can instead build `bin/libpgen_rans.a`:
 make -f Makefile.pgen_rans libpgen_rans
 ```
 
+The main PLINK 2 binary can encode the remaining variants and samples with
+its standard filtering and threading options:
+
+```sh
+plink2 --pfile cohort \
+  --chr 22 \
+  --make-pgr \
+  --threads 16 \
+  --out cohort-chr22
+```
+
+This writes `cohort-chr22.pgr`. The command intentionally has no
+benchmark-only limit options; use normal PLINK selectors such as `--chr`,
+`--from-bp`/`--to-bp`, and `--extract` to bound an encoding run. If filters
+change the sample or variant set, generate or retain `.psam` and `.pvar`
+metadata with the same selection.
+
 Encode an unphased, biallelic hardcall PGEN:
 
 ```sh

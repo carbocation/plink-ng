@@ -309,6 +309,15 @@ PglErr DispHelp(const char* const* argvk, uint32_t param_ct) {
 "    * 'force-first' causes only the first instance of duplicate-ID variants to\n"
 "      be kept, under all circumstances.\n\n"
               );
+    HelpPrint("make-pgr\0", &help_ctrl, 1,
+"  --make-pgr\n"
+"    Write filtered unphased biallelic hardcalls to <output prefix>.pgr with\n"
+"    block-local conditional-rANS compression.  The experimental .pgr container\n"
+"    is separate from the PGEN format; retain matching .pvar and .psam metadata.\n"
+"    Existing sample and variant filters determine the hardcalls written.\n"
+"    Encoding uses the existing --threads setting, which defaults to all\n"
+"    available logical CPUs.\n\n"
+              );
     HelpPrint("make-pgen\0make-bpgen\0make-bed\0make-just-pvar\0make-just-psam\0make-pfile\0make-bpfile\0make-bfile\0", &help_ctrl, 1,
 "  --make-pgen ['vzs'] ['format='<code>] ['trim-alts'] ['erase-phase']\n"
 "              ['erase-dosage'] ['fill-missing-from-dosage'] ['writer-ver']\n"

@@ -80,7 +80,21 @@ jobs:
           2.0/build_dynamic/plink2 --version | tee /tmp/plink2-version.txt
           grep -q AVX2 /tmp/plink2-version.txt
           grep -q Intel /tmp/plink2-version.txt
+          2.0/build_dynamic/plink2 --help make-pgr | grep -q -- --make-pgr
           2.0/bin/pgen_rans --help
+          smoke_prefix="$RUNNER_TEMP/pgr-smoke"
+          2.0/build_dynamic/plink2 \
+            --pfile 2.0/pgenlibr/inst/extdata/chr21_phase3_start vzs \
+            --max-alleles 2 \
+            --make-pgen erase-phase erase-dosage \
+            --out "$smoke_prefix-input"
+          2.0/build_dynamic/plink2 \
+            --pfile "$smoke_prefix-input" \
+            --make-pgr \
+            --threads 2 \
+            --out "$smoke_prefix"
+          2.0/bin/pgen_rans verify \
+            "$smoke_prefix-input.pgen" "$smoke_prefix.pgr"
           if ldd 2.0/build_dynamic/plink2 | grep -Eq 'mkl|iomp'; then
             echo "PLINK has an unexpected dynamic oneMKL dependency." >&2
             exit 1
@@ -105,6 +119,7 @@ jobs:
             2.0/pgen_rans_codec.h \
             2.0/pgen_rans_container.h \
             2.0/pgen_rans_cpu.h \
+            2.0/pgen_rans_encode.h \
             2.0/pgen_rans_reader.h \
             "$artifact_dir/include/"
           install -m 644 1.9/LICENSE "$artifact_dir/LICENSE"
@@ -195,7 +210,21 @@ jobs:
             grep -q M1 /tmp/plink2-version.txt
           fi
           otool -L 2.0/build_dynamic/plink2 | grep -q Accelerate
+          2.0/build_dynamic/plink2 --help make-pgr | grep -q -- --make-pgr
           2.0/bin/pgen_rans --help
+          smoke_prefix="$RUNNER_TEMP/pgr-smoke"
+          2.0/build_dynamic/plink2 \
+            --pfile 2.0/pgenlibr/inst/extdata/chr21_phase3_start vzs \
+            --max-alleles 2 \
+            --make-pgen erase-phase erase-dosage \
+            --out "$smoke_prefix-input"
+          2.0/build_dynamic/plink2 \
+            --pfile "$smoke_prefix-input" \
+            --make-pgr \
+            --threads 2 \
+            --out "$smoke_prefix"
+          2.0/bin/pgen_rans verify \
+            "$smoke_prefix-input.pgen" "$smoke_prefix.pgr"
 
       - name: Package macOS artifact
         shell: bash
@@ -216,6 +245,7 @@ jobs:
             2.0/pgen_rans_codec.h \
             2.0/pgen_rans_container.h \
             2.0/pgen_rans_cpu.h \
+            2.0/pgen_rans_encode.h \
             2.0/pgen_rans_reader.h \
             "$artifact_dir/include/"
           install -m 644 1.9/LICENSE "$artifact_dir/LICENSE"

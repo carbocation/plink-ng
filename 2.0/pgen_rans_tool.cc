@@ -1,8 +1,6 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 
 #include <algorithm>
-#include <array>
-#include <atomic>
 #include <cerrno>
 #include <chrono>
 #include <cstdint>
@@ -10,8 +8,6 @@
 #include <cstdlib>
 #include <cstring>
 #include <fstream>
-#include <limits>
-#include <mutex>
 #include <sstream>
 #include <string>
 #include <sys/stat.h>
@@ -26,6 +22,7 @@
 #include "pgen_rans_codec.h"
 #include "pgen_rans_container.h"
 #include "pgen_rans_cpu.h"
+#include "pgen_rans_encode.h"
 
 namespace {
 
@@ -33,17 +30,19 @@ using namespace plink2;
 using pgen_rans::CodecParams;
 using pgen_rans::ContainerParams;
 using pgen_rans::ContainerReader;
-using pgen_rans::ContainerWriter;
 using pgen_rans::CpuBlockDecoder;
 using pgen_rans::DecodeRecord;
-using pgen_rans::EncodeRecord;
+using pgen_rans::EncodeInput;
+using pgen_rans::EncodeParams;
+using pgen_rans::EncodePgr;
+using pgen_rans::EncodeStats;
 using pgen_rans::EncodedBlock;
 using pgen_rans::EncodedBlockView;
-using pgen_rans::EstimateRecordBytes;
 using pgen_rans::ParseRecordMetadata;
 using pgen_rans::RecordMetadata;
 using pgen_rans::RecordMode;
 using pgen_rans::ScheduledAnchorOffsets;
+using pgen_rans::VariantMetadata;
 
 static_assert(sizeof(uintptr_t) == sizeof(uint64_t),
               "The experimental codec currently requires 64-bit words.");
@@ -66,34 +65,9 @@ struct Options {
   uint32_t benchmark_iteration_ct = 1;
 };
 
-struct VariantMeta {
-  uint32_t chrom_code = 0;
-  uint64_t bp = 0;
-  bool multiallelic = false;
-};
-
 struct PvarData {
-  std::vector<VariantMeta> variants;
+  std::vector<VariantMetadata> variants;
   uint32_t multiallelic_ct = 0;
-};
-
-struct VariantBlock {
-  uint32_t start = 0;
-  uint32_t len = 0;
-};
-
-struct AnchorCandidate {
-  uint64_t estimated_bytes = 0;
-  uint32_t ordinal = 0;
-  uint32_t offset = 0;
-};
-
-struct EncodeTotals {
-  uint64_t pgen_payload_bytes = 0;
-  uint64_t marginal_ct = 0;
-  uint64_t one_reference_ct = 0;
-  uint64_t two_reference_ct = 0;
-  uint64_t anchor_ct = 0;
 };
 
 void PrintUsage(FILE* out) {
@@ -381,13 +355,13 @@ bool LoadPvar(const std::string& fname, uint32_t expected_variant_ct,
     const std::string& chrom = fields[chrom_col];
     const auto inserted = chrom_codes.emplace(
         chrom, static_cast<uint32_t>(chrom_codes.size()));
-    VariantMeta meta;
+    VariantMetadata meta;
     meta.chrom_code = inserted.first->second;
     meta.bp = bp;
-    meta.multiallelic =
+    const bool multiallelic =
         (alt_col >= 0) &&
         (fields[alt_col].find(',') != std::string::npos);
-    pvar->multiallelic_ct += meta.multiallelic;
+    pvar->multiallelic_ct += multiallelic;
     pvar->variants.push_back(meta);
     if (pvar->variants.size() > expected_variant_ct) {
       *error = "PVAR has more variants than the PGEN header.";
@@ -399,49 +373,6 @@ bool LoadPvar(const std::string& fname, uint32_t expected_variant_ct,
     return false;
   }
   return true;
-}
-
-std::vector<VariantBlock> BuildBlocks(
-    uint32_t variant_ct, uint32_t maximum_block_variant_ct,
-    const std::vector<VariantMeta>* metadata) {
-  std::vector<VariantBlock> blocks;
-  uint32_t block_start = 0;
-  while (block_start != variant_ct) {
-    uint32_t block_len =
-        std::min(maximum_block_variant_ct, variant_ct - block_start);
-    if (metadata) {
-      const uint32_t chrom_code = (*metadata)[block_start].chrom_code;
-      for (uint32_t offset = 1; offset != block_len; ++offset) {
-        if ((*metadata)[block_start + offset].chrom_code != chrom_code) {
-          block_len = offset;
-          break;
-        }
-      }
-    }
-    blocks.push_back({block_start, block_len});
-    block_start += block_len;
-  }
-  return blocks;
-}
-
-bool AnchorEligible(uint32_t target_vidx, uint32_t anchor_vidx,
-                    const std::vector<VariantMeta>* metadata,
-                    uint64_t maximum_distance) {
-  if (!metadata) {
-    return true;
-  }
-  const VariantMeta& target = (*metadata)[target_vidx];
-  const VariantMeta& anchor = (*metadata)[anchor_vidx];
-  if (target.chrom_code != anchor.chrom_code) {
-    return false;
-  }
-  if (!maximum_distance) {
-    return true;
-  }
-  const uint64_t distance = (target.bp >= anchor.bp)
-                                ? (target.bp - anchor.bp)
-                                : (anchor.bp - target.bp);
-  return distance <= maximum_distance;
 }
 
 uint64_t FileSize(const std::string& fname) {
@@ -556,6 +487,8 @@ class PgenInput {
   uint32_t record_byte_ct(uint32_t variant_idx) const {
     return GetPgfiVrecWidth(&pgfi_, variant_idx);
   }
+  PgenFileInfo* pgfi() { return &pgfi_; }
+  PgenReader* pgr() { return &pgr_; }
 
  private:
   PgenFileInfo pgfi_;
@@ -565,233 +498,6 @@ class PgenInput {
   unsigned char* pgr_alloc_ = nullptr;
   bool open_ = false;
 };
-
-void CountJointGenotypes(const uintptr_t* anchor, const uintptr_t* target,
-                         uint32_t sample_ct, const uint32_t* anchor_counts,
-                         const uint32_t* target_counts,
-                         uint32_t* joint_counts) {
-  std::fill(joint_counts, &(joint_counts[16]), 0U);
-  const uint32_t word_ct = NypCtToWordCt(sample_ct);
-  const uint32_t trailing_sample_ct = sample_ct % kBitsPerWordD2;
-  for (uint32_t word_idx = 0; word_idx != word_ct; ++word_idx) {
-    uintptr_t valid_mask = kMask5555;
-    if (trailing_sample_ct && (word_idx + 1 == word_ct)) {
-      valid_mask = bzhi(kMask5555, 2 * trailing_sample_ct);
-    }
-    const uintptr_t anchor_word = anchor[word_idx];
-    const uintptr_t target_word = target[word_idx];
-    const uintptr_t anchor_low = anchor_word & valid_mask;
-    const uintptr_t anchor_high = (anchor_word >> 1) & valid_mask;
-    const uintptr_t target_low = target_word & valid_mask;
-    const uintptr_t target_high = (target_word >> 1) & valid_mask;
-    const uintptr_t anchor_masks[3] = {
-        (~(anchor_low | anchor_high)) & valid_mask,
-        anchor_low & (~anchor_high) & valid_mask,
-        (~anchor_low) & anchor_high & valid_mask};
-    const uintptr_t target_masks[3] = {
-        (~(target_low | target_high)) & valid_mask,
-        target_low & (~target_high) & valid_mask,
-        (~target_low) & target_high & valid_mask};
-    for (uint32_t anchor_genotype = 0; anchor_genotype != 3;
-         ++anchor_genotype) {
-      for (uint32_t target_genotype = 0; target_genotype != 3;
-           ++target_genotype) {
-        joint_counts[4 * anchor_genotype + target_genotype] +=
-            PopcountWord(anchor_masks[anchor_genotype] &
-                         target_masks[target_genotype]);
-      }
-    }
-  }
-  for (uint32_t anchor_genotype = 0; anchor_genotype != 3;
-       ++anchor_genotype) {
-    uint32_t known = 0;
-    for (uint32_t target_genotype = 0; target_genotype != 3;
-         ++target_genotype) {
-      known += joint_counts[4 * anchor_genotype + target_genotype];
-    }
-    joint_counts[4 * anchor_genotype + 3] =
-        anchor_counts[anchor_genotype] - known;
-  }
-  for (uint32_t target_genotype = 0; target_genotype != 3;
-       ++target_genotype) {
-    uint32_t known = 0;
-    for (uint32_t anchor_genotype = 0; anchor_genotype != 3;
-         ++anchor_genotype) {
-      known += joint_counts[4 * anchor_genotype + target_genotype];
-    }
-    joint_counts[12 + target_genotype] =
-        target_counts[target_genotype] - known;
-  }
-  joint_counts[15] =
-      anchor_counts[3] - joint_counts[12] - joint_counts[13] -
-      joint_counts[14];
-}
-
-void CountTripleGenotypes(const uintptr_t* anchor1,
-                          const uintptr_t* anchor2,
-                          const uintptr_t* target, uint32_t sample_ct,
-                          uint32_t* triple_counts) {
-  std::fill(triple_counts, &(triple_counts[64]), 0U);
-  const uint32_t word_ct = NypCtToWordCt(sample_ct);
-  const uint32_t trailing_sample_ct = sample_ct % kBitsPerWordD2;
-  for (uint32_t word_idx = 0; word_idx != word_ct; ++word_idx) {
-    uintptr_t valid_mask = kMask5555;
-    if (trailing_sample_ct && (word_idx + 1 == word_ct)) {
-      valid_mask = bzhi(kMask5555, 2 * trailing_sample_ct);
-    }
-    const uintptr_t words[3] = {
-        anchor1[word_idx], anchor2[word_idx], target[word_idx]};
-    uintptr_t masks[3][4];
-    for (uint32_t variant_idx = 0; variant_idx != 3; ++variant_idx) {
-      const uintptr_t low = words[variant_idx] & valid_mask;
-      const uintptr_t high = (words[variant_idx] >> 1) & valid_mask;
-      masks[variant_idx][0] = (~(low | high)) & valid_mask;
-      masks[variant_idx][1] = low & (~high) & valid_mask;
-      masks[variant_idx][2] = (~low) & high & valid_mask;
-      masks[variant_idx][3] = low & high & valid_mask;
-    }
-    for (uint32_t genotype1 = 0; genotype1 != 4; ++genotype1) {
-      for (uint32_t genotype2 = 0; genotype2 != 4; ++genotype2) {
-        const uintptr_t references =
-            masks[0][genotype1] & masks[1][genotype2];
-        for (uint32_t target_genotype = 0; target_genotype != 4;
-             ++target_genotype) {
-          triple_counts[16 * genotype1 + 4 * genotype2 + target_genotype] +=
-              PopcountWord(references & masks[2][target_genotype]);
-        }
-      }
-    }
-  }
-}
-
-bool EncodeVariant(const uintptr_t* target,
-                   const std::array<uint32_t, 4>& target_counts,
-                   uint32_t target_vidx, uint32_t block_start,
-                   const uintptr_t* block_genovecs,
-                   uint32_t genovec_word_stride, uint32_t sample_ct,
-                   const std::vector<uint32_t>& anchor_offsets,
-                   const std::vector<std::array<uint32_t, 4>>& counts,
-                   const std::vector<VariantMeta>* metadata,
-                   const Options& opts, const CodecParams& codec_params,
-                   bool is_anchor, std::vector<uint8_t>* output,
-                   std::string* error) {
-  const auto* target64 = reinterpret_cast<const uint64_t*>(target);
-  if (!EncodeRecord(target64, nullptr, nullptr, sample_ct,
-                    RecordMode::kMarginal, 0, 0, codec_params, output,
-                    error)) {
-    return false;
-  }
-  if (is_anchor) {
-    return true;
-  }
-  std::vector<AnchorCandidate> candidates;
-  candidates.reserve(anchor_offsets.size());
-  for (uint32_t anchor_ordinal = 0;
-       anchor_ordinal != anchor_offsets.size(); ++anchor_ordinal) {
-    const uint32_t anchor_offset = anchor_offsets[anchor_ordinal];
-    const uint32_t anchor_vidx = block_start + anchor_offset;
-    if (!AnchorEligible(target_vidx, anchor_vidx, metadata,
-                        opts.max_anchor_bp)) {
-      continue;
-    }
-    const uintptr_t* anchor =
-        &(block_genovecs[static_cast<uintptr_t>(anchor_offset) *
-                          genovec_word_stride]);
-    uint32_t joint_counts[16];
-    CountJointGenotypes(anchor, target, sample_ct,
-                        counts[anchor_offset].data(), target_counts.data(),
-                        joint_counts);
-    uint64_t estimated_bytes;
-    if (!EstimateRecordBytes(joint_counts, RecordMode::kOneReference,
-                             codec_params, &estimated_bytes, error)) {
-      return false;
-    }
-    candidates.push_back({estimated_bytes, anchor_ordinal, anchor_offset});
-  }
-  if (candidates.empty()) {
-    return true;
-  }
-  std::sort(candidates.begin(), candidates.end(),
-            [](const AnchorCandidate& lhs, const AnchorCandidate& rhs) {
-              if (lhs.estimated_bytes != rhs.estimated_bytes) {
-                return lhs.estimated_bytes < rhs.estimated_bytes;
-              }
-              return lhs.ordinal < rhs.ordinal;
-            });
-  const AnchorCandidate& best_single = candidates[0];
-  const uintptr_t* single_anchor =
-      &(block_genovecs[static_cast<uintptr_t>(best_single.offset) *
-                        genovec_word_stride]);
-  std::vector<uint8_t> single_record;
-  if (!EncodeRecord(
-          target64, reinterpret_cast<const uint64_t*>(single_anchor), nullptr,
-          sample_ct, RecordMode::kOneReference,
-          static_cast<uint8_t>(best_single.ordinal), 0, codec_params,
-          &single_record, error)) {
-    return false;
-  }
-  if (single_record.size() < output->size()) {
-    *output = std::move(single_record);
-  }
-
-  if ((!opts.two_ref_shortlist) || (candidates.size() < 2)) {
-    return true;
-  }
-  if (candidates.size() > opts.two_ref_shortlist) {
-    candidates.resize(opts.two_ref_shortlist);
-  }
-  uint64_t best_pair_estimate = UINT64_MAX;
-  uint32_t best_first_idx = 0;
-  uint32_t best_second_idx = 0;
-  for (uint32_t first_idx = 0; first_idx + 1 != candidates.size();
-       ++first_idx) {
-    const uintptr_t* anchor1 =
-        &(block_genovecs[static_cast<uintptr_t>(
-                              candidates[first_idx].offset) *
-                          genovec_word_stride]);
-    for (uint32_t second_idx = first_idx + 1;
-         second_idx != candidates.size(); ++second_idx) {
-      const uintptr_t* anchor2 =
-          &(block_genovecs[static_cast<uintptr_t>(
-                                candidates[second_idx].offset) *
-                            genovec_word_stride]);
-      uint32_t triple_counts[64];
-      CountTripleGenotypes(anchor1, anchor2, target, sample_ct,
-                           triple_counts);
-      uint64_t estimated_bytes;
-      if (!EstimateRecordBytes(triple_counts, RecordMode::kTwoReference,
-                               codec_params, &estimated_bytes, error)) {
-        return false;
-      }
-      if (estimated_bytes < best_pair_estimate) {
-        best_pair_estimate = estimated_bytes;
-        best_first_idx = first_idx;
-        best_second_idx = second_idx;
-      }
-    }
-  }
-  const AnchorCandidate& first = candidates[best_first_idx];
-  const AnchorCandidate& second = candidates[best_second_idx];
-  const uintptr_t* anchor1 =
-      &(block_genovecs[static_cast<uintptr_t>(first.offset) *
-                        genovec_word_stride]);
-  const uintptr_t* anchor2 =
-      &(block_genovecs[static_cast<uintptr_t>(second.offset) *
-                        genovec_word_stride]);
-  std::vector<uint8_t> pair_record;
-  if (!EncodeRecord(
-          target64, reinterpret_cast<const uint64_t*>(anchor1),
-          reinterpret_cast<const uint64_t*>(anchor2), sample_ct,
-          RecordMode::kTwoReference, static_cast<uint8_t>(first.ordinal),
-          static_cast<uint8_t>(second.ordinal), codec_params, &pair_record,
-          error)) {
-    return false;
-  }
-  if (pair_record.size() < output->size()) {
-    *output = std::move(pair_record);
-  }
-  return true;
-}
 
 int Encode(const Options& opts) {
   PgenInput pgen;
@@ -803,7 +509,7 @@ int Encode(const Options& opts) {
   const uint32_t variant_ct =
       std::min(pgen.variant_ct(), opts.variant_limit);
   PvarData pvar;
-  const std::vector<VariantMeta>* metadata = nullptr;
+  const VariantMetadata* metadata = nullptr;
   if (!opts.pvar_fname.empty()) {
     if (!LoadPvar(opts.pvar_fname, pgen.variant_ct(), &pvar, &error)) {
       fprintf(stderr, "Error: %s\n", error.c_str());
@@ -814,172 +520,60 @@ int Encode(const Options& opts) {
               pvar.multiallelic_ct);
       return 1;
     }
-    metadata = &pvar.variants;
+    metadata = pvar.variants.data();
   } else {
     fputs(
         "Warning: No PVAR supplied; chromosome and distance bounds are "
         "not enforced.\n",
         stderr);
   }
-  const std::vector<VariantBlock> blocks =
-      BuildBlocks(variant_ct, opts.block_variant_ct, metadata);
-  const CodecParams codec_params = {
-      opts.rans_state_ct, opts.rans_scale_bits};
-  const ContainerParams container_params = {
-      pgen.sample_ct(), variant_ct, opts.block_variant_ct, opts.anchor_ct,
-      opts.rans_state_ct, opts.rans_scale_bits, opts.restart_variant_ct,
-      static_cast<uint32_t>(blocks.size())};
-  ContainerWriter writer;
-  if (!writer.Open(opts.output_fname, container_params, &error)) {
-    fprintf(stderr, "Error: %s\n", error.c_str());
-    return 1;
-  }
-  const uint32_t genovec_word_stride =
-      NypCtToVecCt(pgen.sample_ct()) * kWordsPerVec;
-  uintptr_t* block_genovecs = nullptr;
-  if (cachealigned_malloc(
-          static_cast<uintptr_t>(opts.block_variant_ct) *
-              genovec_word_stride * sizeof(uintptr_t),
-          &block_genovecs)) {
-    fputs("Error: Out of memory allocating the genotype block.\n", stderr);
-    return 1;
-  }
 
-  EncodeTotals totals;
-  uint32_t processed_variant_ct = 0;
-  const auto start_time = std::chrono::steady_clock::now();
-  int return_code = 1;
-  for (const VariantBlock& block_range : blocks) {
-    std::vector<std::array<uint32_t, 4>> counts(block_range.len);
-    for (uint32_t offset = 0; offset != block_range.len; ++offset) {
-      uintptr_t* genovec =
-          &(block_genovecs[static_cast<uintptr_t>(offset) *
-                            genovec_word_stride]);
-      const uint32_t variant_idx = block_range.start + offset;
-      if (!pgen.Read(variant_idx, genovec, &error)) {
-        fprintf(stderr, "\nError: %s\n", error.c_str());
-        goto cleanup;
-      }
-      GenoarrCountFreqsUnsafe(genovec, pgen.sample_ct(), counts[offset]);
-      totals.pgen_payload_bytes += pgen.record_byte_ct(variant_idx);
-    }
-    const std::vector<uint32_t> anchor_offsets =
-        ScheduledAnchorOffsets(block_range.len, opts.anchor_ct);
-    std::vector<uint8_t> is_anchor(block_range.len, 0);
-    for (const uint32_t anchor_offset : anchor_offsets) {
-      is_anchor[anchor_offset] = 1;
-    }
-    EncodedBlock block;
-    block.first_variant = block_range.start;
-    block.records.resize(block_range.len);
-    std::atomic<uint32_t> next_offset(0);
-    std::atomic<bool> failed(false);
-    std::mutex error_mutex;
-    std::string worker_error;
-    const uint32_t worker_ct =
-        std::min(opts.thread_ct, block_range.len);
-    std::vector<std::thread> workers;
-    workers.reserve(worker_ct);
-    for (uint32_t worker_idx = 0; worker_idx != worker_ct; ++worker_idx) {
-      workers.emplace_back([&]() {
-        uint32_t offset;
-        while ((!failed.load(std::memory_order_relaxed)) &&
-               ((offset = next_offset.fetch_add(
-                     1, std::memory_order_relaxed)) < block_range.len)) {
-          const uintptr_t* target =
-              &(block_genovecs[static_cast<uintptr_t>(offset) *
-                                genovec_word_stride]);
-          std::string local_error;
-          if (!EncodeVariant(
-                  target, counts[offset], block_range.start + offset,
-                  block_range.start, block_genovecs, genovec_word_stride,
-                  pgen.sample_ct(), anchor_offsets, counts, metadata, opts,
-                  codec_params, is_anchor[offset], &(block.records[offset]),
-                  &local_error)) {
-            failed.store(true, std::memory_order_relaxed);
-            std::lock_guard<std::mutex> lock(error_mutex);
-            if (worker_error.empty()) {
-              worker_error = local_error;
-            }
-          }
-        }
-      });
-    }
-    for (std::thread& worker : workers) {
-      worker.join();
-    }
-    if (failed) {
-      fprintf(stderr, "\nError: %s\n", worker_error.c_str());
-      goto cleanup;
-    }
-    for (uint32_t offset = 0; offset != block_range.len; ++offset) {
-      RecordMetadata record_metadata;
-      if (!ParseRecordMetadata(block.records[offset].data(),
-                               block.records[offset].size(),
-                               &record_metadata, &error)) {
-        fprintf(stderr, "\nError: %s\n", error.c_str());
-        goto cleanup;
-      }
-      totals.anchor_ct += is_anchor[offset];
-      if (record_metadata.mode == RecordMode::kMarginal) {
-        ++totals.marginal_ct;
-      } else if (record_metadata.mode == RecordMode::kOneReference) {
-        ++totals.one_reference_ct;
-      } else {
-        ++totals.two_reference_ct;
-      }
-    }
-    if (!writer.WriteBlock(block, &error)) {
-      fprintf(stderr, "\nError: %s\n", error.c_str());
-      goto cleanup;
-    }
-    processed_variant_ct += block_range.len;
-    if (!(processed_variant_ct % 10000) ||
-        (processed_variant_ct == variant_ct)) {
-      fprintf(stderr, "\rEncoded %u/%u variants (%.1f%%).",
-              processed_variant_ct, variant_ct,
-              100.0 * processed_variant_ct / variant_ct);
-      fflush(stderr);
-    }
-  }
-  if (!writer.Close(&error)) {
+  EncodeInput input;
+  input.raw_sample_ct = pgen.sample_ct();
+  input.sample_ct = pgen.sample_ct();
+  input.raw_variant_ct = pgen.variant_ct();
+  input.variant_ct = variant_ct;
+  input.variants_are_biallelic = true;
+  input.variant_metadata = metadata;
+  input.pgfi = pgen.pgfi();
+  input.pgr = pgen.pgr();
+  EncodeParams params;
+  params.block_variant_ct = opts.block_variant_ct;
+  params.anchor_ct = opts.anchor_ct;
+  params.two_ref_shortlist = opts.two_ref_shortlist;
+  params.max_anchor_bp = opts.max_anchor_bp;
+  params.restart_variant_ct = opts.restart_variant_ct;
+  params.rans_state_ct = opts.rans_state_ct;
+  params.rans_scale_bits = opts.rans_scale_bits;
+  params.thread_ct = opts.thread_ct;
+  EncodeStats stats;
+  if (EncodePgr(opts.output_fname, input, params, &stats, &error)) {
     fprintf(stderr, "\nError: %s\n", error.c_str());
-    goto cleanup;
+    return 1;
   }
-  {
-    const double elapsed_seconds =
-        std::chrono::duration<double>(
-            std::chrono::steady_clock::now() - start_time)
-            .count();
-    const uint64_t output_bytes = FileSize(opts.output_fname);
-    printf("\nConditional-rANS encode complete\n");
-    printf("  samples:                 %u\n", pgen.sample_ct());
-    printf("  variants:                %u\n", variant_ct);
-    printf("  blocks:                  %zu\n", blocks.size());
-    printf("  anchors:                 %llu\n",
-           static_cast<unsigned long long>(totals.anchor_ct));
-    printf("  marginal records:        %llu\n",
-           static_cast<unsigned long long>(totals.marginal_ct));
-    printf("  one-reference records:   %llu\n",
-           static_cast<unsigned long long>(totals.one_reference_ct));
-    printf("  two-reference records:   %llu\n",
-           static_cast<unsigned long long>(totals.two_reference_ct));
-    printf("  PGEN payload bytes:      %llu\n",
-           static_cast<unsigned long long>(totals.pgen_payload_bytes));
-    printf("  output bytes:            %llu\n",
-           static_cast<unsigned long long>(output_bytes));
-    printf("  payload/output ratio:    %.3f\n",
-           output_bytes
-               ? static_cast<double>(totals.pgen_payload_bytes) /
-                     output_bytes
-               : 0.0);
-    printf("  elapsed seconds:         %.3f\n", elapsed_seconds);
-  }
-  return_code = 0;
-
-cleanup:
-  aligned_free(block_genovecs);
-  return return_code;
+  printf("\nConditional-rANS encode complete\n");
+  printf("  samples:                 %u\n", pgen.sample_ct());
+  printf("  variants:                %u\n", stats.variant_ct);
+  printf("  blocks:                  %u\n", stats.block_ct);
+  printf("  anchors:                 %llu\n",
+         static_cast<unsigned long long>(stats.anchor_ct));
+  printf("  marginal records:        %llu\n",
+         static_cast<unsigned long long>(stats.marginal_ct));
+  printf("  one-reference records:   %llu\n",
+         static_cast<unsigned long long>(stats.one_reference_ct));
+  printf("  two-reference records:   %llu\n",
+         static_cast<unsigned long long>(stats.two_reference_ct));
+  printf("  PGEN payload bytes:      %llu\n",
+         static_cast<unsigned long long>(stats.pgen_payload_bytes));
+  printf("  output bytes:            %llu\n",
+         static_cast<unsigned long long>(stats.output_bytes));
+  printf("  payload/output ratio:    %.3f\n",
+         stats.output_bytes
+             ? static_cast<double>(stats.pgen_payload_bytes) /
+                   stats.output_bytes
+             : 0.0);
+  printf("  elapsed seconds:         %.3f\n", stats.elapsed_seconds);
+  return 0;
 }
 
 bool GenotypesEqual(const uintptr_t* expected,

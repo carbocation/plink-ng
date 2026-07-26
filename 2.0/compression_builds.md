@@ -2,7 +2,8 @@
 
 The `Build compression artifacts` GitHub Actions workflow packages optimized
 PLINK 2 and conditional-rANS tools without changing upstream's default build
-configuration. It runs manually or when a `compression-v*` tag is pushed.
+configuration. It runs on pushes to `feature/compression`, manually, or when a
+`compression-v*` tag is pushed.
 
 ## Artifacts
 
@@ -30,7 +31,9 @@ instead be created by pushing a tag such as `compression-v0.1`.
 The workflow performs these checks before uploading:
 
 - conditional-rANS codec and container tests;
-- `plink2 --version` and `pgen_rans --help` smoke tests;
+- `plink2 --version`, `plink2 --help make-pgr`, and `pgen_rans --help` smoke
+  tests;
+- an exact PGEN-to-PGR round-trip through `plink2 --make-pgr`;
 - expected AVX2/MKL or Accelerate build identification;
 - absence of dynamic oneMKL dependencies in the Linux artifact;
 - presence of both `sm_75` and `sm_80` CUDA images.

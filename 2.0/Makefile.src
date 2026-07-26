@@ -80,6 +80,9 @@ TEXTLIB_CCSRC = include/plink2_base.cc \
                 include/plink2_zstfile.cc
 
 CCSRC = $(PLINK2LIB_CCSRC) \
+        pgen_rans_codec.cc \
+        pgen_rans_container.cc \
+        pgen_rans_encode.cc \
         plink2.cc \
         plink2_adjust.cc \
         plink2_cmdline.cc \

@@ -1,0 +1,559 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+
+#include "pgen_rans_encode.h"
+
+#include <algorithm>
+#include <array>
+#include <atomic>
+#include <chrono>
+#include <cstdio>
+#include <cstring>
+#include <limits>
+#include <mutex>
+#include <string>
+#include <sys/stat.h>
+#include <thread>
+#include <vector>
+
+#include "include/plink2_base.h"
+#include "include/plink2_bits.h"
+#include "pgen_rans_codec.h"
+#include "pgen_rans_container.h"
+
+namespace pgen_rans {
+namespace {
+
+using namespace plink2;
+
+static_assert(sizeof(uintptr_t) == sizeof(uint64_t),
+              "The experimental codec currently requires 64-bit words.");
+
+struct VariantBlock {
+  uint32_t start = 0;
+  uint32_t len = 0;
+};
+
+struct AnchorCandidate {
+  uint64_t estimated_bytes = 0;
+  uint32_t ordinal = 0;
+  uint32_t offset = 0;
+};
+
+std::vector<VariantBlock> BuildBlocks(
+    uint32_t variant_ct, uint32_t maximum_block_variant_ct,
+    const VariantMetadata* metadata) {
+  std::vector<VariantBlock> blocks;
+  uint32_t block_start = 0;
+  while (block_start != variant_ct) {
+    uint32_t block_len =
+        std::min(maximum_block_variant_ct, variant_ct - block_start);
+    if (metadata) {
+      const uint32_t chrom_code = metadata[block_start].chrom_code;
+      for (uint32_t offset = 1; offset != block_len; ++offset) {
+        if (metadata[block_start + offset].chrom_code != chrom_code) {
+          block_len = offset;
+          break;
+        }
+      }
+    }
+    blocks.push_back({block_start, block_len});
+    block_start += block_len;
+  }
+  return blocks;
+}
+
+bool AnchorEligible(uint32_t target_vidx, uint32_t anchor_vidx,
+                    const VariantMetadata* metadata,
+                    uint64_t maximum_distance) {
+  if (!metadata) {
+    return true;
+  }
+  const VariantMetadata& target = metadata[target_vidx];
+  const VariantMetadata& anchor = metadata[anchor_vidx];
+  if (target.chrom_code != anchor.chrom_code) {
+    return false;
+  }
+  if (!maximum_distance) {
+    return true;
+  }
+  const uint64_t distance = (target.bp >= anchor.bp)
+                                ? (target.bp - anchor.bp)
+                                : (anchor.bp - target.bp);
+  return distance <= maximum_distance;
+}
+
+uint64_t FileSize(const std::string& fname) {
+  struct stat stat_buf;
+  if (stat(fname.c_str(), &stat_buf)) {
+    return 0;
+  }
+  return static_cast<uint64_t>(stat_buf.st_size);
+}
+
+void CountJointGenotypes(const uintptr_t* anchor, const uintptr_t* target,
+                         uint32_t sample_ct, const uint32_t* anchor_counts,
+                         const uint32_t* target_counts,
+                         uint32_t* joint_counts) {
+  std::fill(joint_counts, &(joint_counts[16]), 0U);
+  const uint32_t word_ct = NypCtToWordCt(sample_ct);
+  const uint32_t trailing_sample_ct = sample_ct % kBitsPerWordD2;
+  for (uint32_t word_idx = 0; word_idx != word_ct; ++word_idx) {
+    uintptr_t valid_mask = kMask5555;
+    if (trailing_sample_ct && (word_idx + 1 == word_ct)) {
+      valid_mask = bzhi(kMask5555, 2 * trailing_sample_ct);
+    }
+    const uintptr_t anchor_word = anchor[word_idx];
+    const uintptr_t target_word = target[word_idx];
+    const uintptr_t anchor_low = anchor_word & valid_mask;
+    const uintptr_t anchor_high = (anchor_word >> 1) & valid_mask;
+    const uintptr_t target_low = target_word & valid_mask;
+    const uintptr_t target_high = (target_word >> 1) & valid_mask;
+    const uintptr_t anchor_masks[3] = {
+        (~(anchor_low | anchor_high)) & valid_mask,
+        anchor_low & (~anchor_high) & valid_mask,
+        (~anchor_low) & anchor_high & valid_mask};
+    const uintptr_t target_masks[3] = {
+        (~(target_low | target_high)) & valid_mask,
+        target_low & (~target_high) & valid_mask,
+        (~target_low) & target_high & valid_mask};
+    for (uint32_t anchor_genotype = 0; anchor_genotype != 3;
+         ++anchor_genotype) {
+      for (uint32_t target_genotype = 0; target_genotype != 3;
+           ++target_genotype) {
+        joint_counts[4 * anchor_genotype + target_genotype] +=
+            PopcountWord(anchor_masks[anchor_genotype] &
+                         target_masks[target_genotype]);
+      }
+    }
+  }
+  for (uint32_t anchor_genotype = 0; anchor_genotype != 3;
+       ++anchor_genotype) {
+    uint32_t known = 0;
+    for (uint32_t target_genotype = 0; target_genotype != 3;
+         ++target_genotype) {
+      known += joint_counts[4 * anchor_genotype + target_genotype];
+    }
+    joint_counts[4 * anchor_genotype + 3] =
+        anchor_counts[anchor_genotype] - known;
+  }
+  for (uint32_t target_genotype = 0; target_genotype != 3;
+       ++target_genotype) {
+    uint32_t known = 0;
+    for (uint32_t anchor_genotype = 0; anchor_genotype != 3;
+         ++anchor_genotype) {
+      known += joint_counts[4 * anchor_genotype + target_genotype];
+    }
+    joint_counts[12 + target_genotype] =
+        target_counts[target_genotype] - known;
+  }
+  joint_counts[15] =
+      anchor_counts[3] - joint_counts[12] - joint_counts[13] -
+      joint_counts[14];
+}
+
+void CountTripleGenotypes(const uintptr_t* anchor1,
+                          const uintptr_t* anchor2,
+                          const uintptr_t* target, uint32_t sample_ct,
+                          uint32_t* triple_counts) {
+  std::fill(triple_counts, &(triple_counts[64]), 0U);
+  const uint32_t word_ct = NypCtToWordCt(sample_ct);
+  const uint32_t trailing_sample_ct = sample_ct % kBitsPerWordD2;
+  for (uint32_t word_idx = 0; word_idx != word_ct; ++word_idx) {
+    uintptr_t valid_mask = kMask5555;
+    if (trailing_sample_ct && (word_idx + 1 == word_ct)) {
+      valid_mask = bzhi(kMask5555, 2 * trailing_sample_ct);
+    }
+    const uintptr_t words[3] = {
+        anchor1[word_idx], anchor2[word_idx], target[word_idx]};
+    uintptr_t masks[3][4];
+    for (uint32_t variant_idx = 0; variant_idx != 3; ++variant_idx) {
+      const uintptr_t low = words[variant_idx] & valid_mask;
+      const uintptr_t high = (words[variant_idx] >> 1) & valid_mask;
+      masks[variant_idx][0] = (~(low | high)) & valid_mask;
+      masks[variant_idx][1] = low & (~high) & valid_mask;
+      masks[variant_idx][2] = (~low) & high & valid_mask;
+      masks[variant_idx][3] = low & high & valid_mask;
+    }
+    for (uint32_t genotype1 = 0; genotype1 != 4; ++genotype1) {
+      for (uint32_t genotype2 = 0; genotype2 != 4; ++genotype2) {
+        const uintptr_t references =
+            masks[0][genotype1] & masks[1][genotype2];
+        for (uint32_t target_genotype = 0; target_genotype != 4;
+             ++target_genotype) {
+          triple_counts[16 * genotype1 + 4 * genotype2 + target_genotype] +=
+              PopcountWord(references & masks[2][target_genotype]);
+        }
+      }
+    }
+  }
+}
+
+bool EncodeVariant(const uintptr_t* target,
+                   const std::array<uint32_t, 4>& target_counts,
+                   uint32_t target_vidx, uint32_t block_start,
+                   const uintptr_t* block_genovecs,
+                   uint32_t genovec_word_stride, uint32_t sample_ct,
+                   const std::vector<uint32_t>& anchor_offsets,
+                   const std::vector<std::array<uint32_t, 4>>& counts,
+                   const VariantMetadata* metadata,
+                   const EncodeParams& params,
+                   const CodecParams& codec_params, bool is_anchor,
+                   std::vector<uint8_t>* output, std::string* error) {
+  const auto* target64 = reinterpret_cast<const uint64_t*>(target);
+  if (!EncodeRecord(target64, nullptr, nullptr, sample_ct,
+                    RecordMode::kMarginal, 0, 0, codec_params, output,
+                    error)) {
+    return false;
+  }
+  if (is_anchor) {
+    return true;
+  }
+  std::vector<AnchorCandidate> candidates;
+  candidates.reserve(anchor_offsets.size());
+  for (uint32_t anchor_ordinal = 0;
+       anchor_ordinal != anchor_offsets.size(); ++anchor_ordinal) {
+    const uint32_t anchor_offset = anchor_offsets[anchor_ordinal];
+    const uint32_t anchor_vidx = block_start + anchor_offset;
+    if (!AnchorEligible(target_vidx, anchor_vidx, metadata,
+                        params.max_anchor_bp)) {
+      continue;
+    }
+    const uintptr_t* anchor =
+        &(block_genovecs[static_cast<uintptr_t>(anchor_offset) *
+                          genovec_word_stride]);
+    uint32_t joint_counts[16];
+    CountJointGenotypes(anchor, target, sample_ct,
+                        counts[anchor_offset].data(), target_counts.data(),
+                        joint_counts);
+    uint64_t estimated_bytes;
+    if (!EstimateRecordBytes(joint_counts, RecordMode::kOneReference,
+                             codec_params, &estimated_bytes, error)) {
+      return false;
+    }
+    candidates.push_back({estimated_bytes, anchor_ordinal, anchor_offset});
+  }
+  if (candidates.empty()) {
+    return true;
+  }
+  std::sort(candidates.begin(), candidates.end(),
+            [](const AnchorCandidate& lhs, const AnchorCandidate& rhs) {
+              if (lhs.estimated_bytes != rhs.estimated_bytes) {
+                return lhs.estimated_bytes < rhs.estimated_bytes;
+              }
+              return lhs.ordinal < rhs.ordinal;
+            });
+  const AnchorCandidate& best_single = candidates[0];
+  const uintptr_t* single_anchor =
+      &(block_genovecs[static_cast<uintptr_t>(best_single.offset) *
+                        genovec_word_stride]);
+  std::vector<uint8_t> single_record;
+  if (!EncodeRecord(
+          target64, reinterpret_cast<const uint64_t*>(single_anchor), nullptr,
+          sample_ct, RecordMode::kOneReference,
+          static_cast<uint8_t>(best_single.ordinal), 0, codec_params,
+          &single_record, error)) {
+    return false;
+  }
+  if (single_record.size() < output->size()) {
+    *output = std::move(single_record);
+  }
+
+  if ((!params.two_ref_shortlist) || (candidates.size() < 2)) {
+    return true;
+  }
+  if (candidates.size() > params.two_ref_shortlist) {
+    candidates.resize(params.two_ref_shortlist);
+  }
+  uint64_t best_pair_estimate = std::numeric_limits<uint64_t>::max();
+  uint32_t best_first_idx = 0;
+  uint32_t best_second_idx = 0;
+  for (uint32_t first_idx = 0; first_idx + 1 != candidates.size();
+       ++first_idx) {
+    const uintptr_t* anchor1 =
+        &(block_genovecs[static_cast<uintptr_t>(
+                              candidates[first_idx].offset) *
+                          genovec_word_stride]);
+    for (uint32_t second_idx = first_idx + 1;
+         second_idx != candidates.size(); ++second_idx) {
+      const uintptr_t* anchor2 =
+          &(block_genovecs[static_cast<uintptr_t>(
+                                candidates[second_idx].offset) *
+                            genovec_word_stride]);
+      uint32_t triple_counts[64];
+      CountTripleGenotypes(anchor1, anchor2, target, sample_ct,
+                           triple_counts);
+      uint64_t estimated_bytes;
+      if (!EstimateRecordBytes(triple_counts, RecordMode::kTwoReference,
+                               codec_params, &estimated_bytes, error)) {
+        return false;
+      }
+      if (estimated_bytes < best_pair_estimate) {
+        best_pair_estimate = estimated_bytes;
+        best_first_idx = first_idx;
+        best_second_idx = second_idx;
+      }
+    }
+  }
+  const AnchorCandidate& first = candidates[best_first_idx];
+  const AnchorCandidate& second = candidates[best_second_idx];
+  const uintptr_t* anchor1 =
+      &(block_genovecs[static_cast<uintptr_t>(first.offset) *
+                        genovec_word_stride]);
+  const uintptr_t* anchor2 =
+      &(block_genovecs[static_cast<uintptr_t>(second.offset) *
+                        genovec_word_stride]);
+  std::vector<uint8_t> pair_record;
+  if (!EncodeRecord(
+          target64, reinterpret_cast<const uint64_t*>(anchor1),
+          reinterpret_cast<const uint64_t*>(anchor2), sample_ct,
+          RecordMode::kTwoReference, static_cast<uint8_t>(first.ordinal),
+          static_cast<uint8_t>(second.ordinal), codec_params, &pair_record,
+          error)) {
+    return false;
+  }
+  if (pair_record.size() < output->size()) {
+    *output = std::move(pair_record);
+  }
+  return true;
+}
+
+bool ValidateInputs(const EncodeInput& input, EncodeParams* params,
+                    std::string* error) {
+  if ((!input.sample_ct) || (!input.variant_ct) || (!input.pgfi) ||
+      (!input.pgr)) {
+    *error = "Invalid conditional-rANS encoder input.";
+    return false;
+  }
+  if ((input.sample_ct > input.raw_sample_ct) ||
+      (input.variant_ct > input.raw_variant_ct)) {
+    *error = "Conditional-rANS subset counts exceed raw input counts.";
+    return false;
+  }
+  if ((input.pgfi->raw_sample_ct != input.raw_sample_ct) ||
+      (input.pgfi->raw_variant_ct != input.raw_variant_ct)) {
+    *error = "Conditional-rANS input dimensions do not match the PGEN reader.";
+    return false;
+  }
+  if ((input.sample_ct != input.raw_sample_ct) && (!input.sample_include)) {
+    *error = "Conditional-rANS sample subset mask is missing.";
+    return false;
+  }
+  if (input.variant_uidxs) {
+    uint32_t previous_uidx = 0;
+    for (uint32_t variant_idx = 0; variant_idx != input.variant_ct;
+         ++variant_idx) {
+      const uint32_t variant_uidx = input.variant_uidxs[variant_idx];
+      if ((variant_uidx >= input.raw_variant_ct) ||
+          (variant_idx && (variant_uidx <= previous_uidx))) {
+        *error =
+            "Conditional-rANS variant subset indices are invalid or unsorted.";
+        return false;
+      }
+      previous_uidx = variant_uidx;
+    }
+  }
+  if ((params->block_variant_ct < 2) ||
+      (params->block_variant_ct > UINT16_MAX) || (!params->anchor_ct) ||
+      (params->anchor_ct > 256) || (!params->thread_ct) ||
+      (params->restart_variant_ct == 0) ||
+      (params->restart_variant_ct > UINT16_MAX) ||
+      (params->two_ref_shortlist == 1)) {
+    *error = "Invalid conditional-rANS encoder parameters.";
+    return false;
+  }
+  params->anchor_ct =
+      std::min(params->anchor_ct, params->block_variant_ct);
+  params->two_ref_shortlist =
+      std::min(params->two_ref_shortlist, params->anchor_ct);
+  if (params->anchor_ct < 2) {
+    params->two_ref_shortlist = 0;
+  }
+  if (input.pgfi->gflags &
+      (kfPgenGlobalHardcallPhasePresent | kfPgenGlobalDosagePresent |
+       kfPgenGlobalDosagePhasePresent)) {
+    *error =
+        "Conditional-rANS output requires unphased hardcalls without dosage.";
+    return false;
+  }
+  if (!input.variants_are_biallelic) {
+    *error = "Conditional-rANS output currently requires biallelic variants.";
+    return false;
+  }
+  return true;
+}
+
+}  // namespace
+
+PglErr EncodePgr(const std::string& output_path, const EncodeInput& input,
+                 const EncodeParams& requested_params, EncodeStats* stats,
+                 std::string* error) {
+  EncodeParams params = requested_params;
+  if (!ValidateInputs(input, &params, error)) {
+    return kPglRetInconsistentInput;
+  }
+  *stats = EncodeStats();
+  stats->variant_ct = input.variant_ct;
+  const std::vector<VariantBlock> blocks =
+      BuildBlocks(input.variant_ct, params.block_variant_ct,
+                  input.variant_metadata);
+  stats->block_ct = static_cast<uint32_t>(blocks.size());
+  const CodecParams codec_params = {
+      params.rans_state_ct, params.rans_scale_bits};
+  const ContainerParams container_params = {
+      input.sample_ct, input.variant_ct, params.block_variant_ct,
+      params.anchor_ct, params.rans_state_ct, params.rans_scale_bits,
+      params.restart_variant_ct, static_cast<uint32_t>(blocks.size())};
+  ContainerWriter writer;
+  if (!writer.Open(output_path, container_params, error)) {
+    return kPglRetOpenFail;
+  }
+
+  PgrSampleSubsetIndex pssi;
+  std::vector<uint32_t> sample_include_cumulative_popcounts;
+  if (input.sample_include) {
+    sample_include_cumulative_popcounts.resize(
+        BitCtToWordCt(input.raw_sample_ct));
+    FillCumulativePopcounts(input.sample_include,
+                            BitCtToWordCt(input.raw_sample_ct),
+                            sample_include_cumulative_popcounts.data());
+    PgrSetSampleSubsetIndex(sample_include_cumulative_popcounts.data(),
+                            input.pgr, &pssi);
+  } else {
+    PgrClearSampleSubsetIndex(input.pgr, &pssi);
+  }
+
+  const uint32_t genovec_word_stride =
+      NypCtToVecCt(input.sample_ct) * kWordsPerVec;
+  uintptr_t* block_genovecs = nullptr;
+  if (cachealigned_malloc(
+          static_cast<uintptr_t>(params.block_variant_ct) *
+              genovec_word_stride * sizeof(uintptr_t),
+          &block_genovecs)) {
+    *error = "Out of memory allocating the conditional-rANS genotype block.";
+    return kPglRetNomem;
+  }
+
+  uint32_t processed_variant_ct = 0;
+  const auto start_time = std::chrono::steady_clock::now();
+  PglErr reterr = kPglRetSuccess;
+  for (const VariantBlock& block_range : blocks) {
+    std::vector<std::array<uint32_t, 4>> counts(block_range.len);
+    for (uint32_t offset = 0; offset != block_range.len; ++offset) {
+      uintptr_t* genovec =
+          &(block_genovecs[static_cast<uintptr_t>(offset) *
+                            genovec_word_stride]);
+      const uint32_t variant_idx = block_range.start + offset;
+      const uint32_t variant_uidx =
+          input.variant_uidxs ? input.variant_uidxs[variant_idx] : variant_idx;
+      const PglErr pgl_error =
+          PgrGet(input.sample_include, pssi, input.sample_ct, variant_uidx,
+                 input.pgr, genovec);
+      if (pgl_error) {
+        *error = "PgrGet failed at variant " +
+                 std::to_string(variant_uidx) + " with code " +
+                 std::to_string(static_cast<uint32_t>(pgl_error)) + ".";
+        reterr = pgl_error;
+        goto cleanup;
+      }
+      ZeroTrailingNyps(input.sample_ct, genovec);
+      GenoarrCountFreqsUnsafe(genovec, input.sample_ct, counts[offset]);
+      stats->pgen_payload_bytes +=
+          GetPgfiVrecWidth(input.pgfi, variant_uidx);
+    }
+    const std::vector<uint32_t> anchor_offsets =
+        ScheduledAnchorOffsets(block_range.len, params.anchor_ct);
+    std::vector<uint8_t> is_anchor(block_range.len, 0);
+    for (const uint32_t anchor_offset : anchor_offsets) {
+      is_anchor[anchor_offset] = 1;
+    }
+    EncodedBlock block;
+    block.first_variant = block_range.start;
+    block.records.resize(block_range.len);
+    std::atomic<uint32_t> next_offset(0);
+    std::atomic<bool> failed(false);
+    std::mutex error_mutex;
+    std::string worker_error;
+    const uint32_t worker_ct =
+        std::min(params.thread_ct, block_range.len);
+    std::vector<std::thread> workers;
+    workers.reserve(worker_ct);
+    for (uint32_t worker_idx = 0; worker_idx != worker_ct; ++worker_idx) {
+      workers.emplace_back([&]() {
+        uint32_t offset;
+        while ((!failed.load(std::memory_order_relaxed)) &&
+               ((offset = next_offset.fetch_add(
+                     1, std::memory_order_relaxed)) < block_range.len)) {
+          const uintptr_t* target =
+              &(block_genovecs[static_cast<uintptr_t>(offset) *
+                                genovec_word_stride]);
+          std::string local_error;
+          if (!EncodeVariant(
+                  target, counts[offset], block_range.start + offset,
+                  block_range.start, block_genovecs, genovec_word_stride,
+                  input.sample_ct, anchor_offsets, counts,
+                  input.variant_metadata, params, codec_params,
+                  is_anchor[offset], &(block.records[offset]),
+                  &local_error)) {
+            failed.store(true, std::memory_order_relaxed);
+            std::lock_guard<std::mutex> lock(error_mutex);
+            if (worker_error.empty()) {
+              worker_error = local_error;
+            }
+          }
+        }
+      });
+    }
+    for (std::thread& worker : workers) {
+      worker.join();
+    }
+    if (failed) {
+      *error = worker_error;
+      reterr = kPglRetInconsistentInput;
+      goto cleanup;
+    }
+    for (uint32_t offset = 0; offset != block_range.len; ++offset) {
+      RecordMetadata record_metadata;
+      if (!ParseRecordMetadata(block.records[offset].data(),
+                               block.records[offset].size(),
+                               &record_metadata, error)) {
+        reterr = kPglRetMalformedInput;
+        goto cleanup;
+      }
+      stats->anchor_ct += is_anchor[offset];
+      if (record_metadata.mode == RecordMode::kMarginal) {
+        ++stats->marginal_ct;
+      } else if (record_metadata.mode == RecordMode::kOneReference) {
+        ++stats->one_reference_ct;
+      } else {
+        ++stats->two_reference_ct;
+      }
+    }
+    if (!writer.WriteBlock(block, error)) {
+      reterr = kPglRetWriteFail;
+      goto cleanup;
+    }
+    processed_variant_ct += block_range.len;
+    if (!(processed_variant_ct % 10000) ||
+        (processed_variant_ct == input.variant_ct)) {
+      fprintf(stderr, "\rEncoded %u/%u variants (%.1f%%).",
+              processed_variant_ct, input.variant_ct,
+              100.0 * processed_variant_ct / input.variant_ct);
+      fflush(stderr);
+    }
+  }
+  if (!writer.Close(error)) {
+    reterr = kPglRetWriteFail;
+    goto cleanup;
+  }
+  stats->elapsed_seconds =
+      std::chrono::duration<double>(
+          std::chrono::steady_clock::now() - start_time)
+          .count();
+  stats->output_bytes = FileSize(output_path);
+
+cleanup:
+  aligned_free(block_genovecs);
+  return reterr;
+}
+
+}  // namespace pgen_rans
