@@ -49,9 +49,10 @@ struct DeviceWarpModel {
   uint16_t context_mask;
   uint8_t mode;
   uint8_t has_entropy;
+  uint8_t has_interleaved_payload;
   uint8_t reference1;
   uint8_t reference2;
-  uint8_t padding[2];
+  uint8_t padding[1];
   uint32_t error;
 };
 
@@ -170,6 +171,7 @@ __device__ void ParseDeviceModel(const uint8_t* record,
   model->error = kDeviceDecodeSuccess;
   model->context_mask = 0;
   model->has_entropy = 0;
+  model->has_interleaved_payload = 0;
   model->reference1 = 0;
   model->reference2 = 0;
   for (uint32_t context = 0; context != 16; ++context) {
@@ -188,7 +190,9 @@ __device__ void ParseDeviceModel(const uint8_t* record,
   const uint8_t flags = record[0];
   model->mode = flags & 3U;
   model->has_entropy = (flags >> 2) & 1U;
-  if ((flags & 0xf8U) || (model->mode > 2)) {
+  model->has_interleaved_payload = (flags >> 3) & 1U;
+  if ((flags & 0xf0U) || (model->mode > 2) ||
+      (model->has_interleaved_payload && !model->has_entropy)) {
     model->error = kDeviceDecodeInvalidRecord;
     return;
   }
@@ -367,14 +371,14 @@ __global__ void DecodeRecordsKernel(
   uint32_t state = kRansLowerBound;
   const uint8_t* lane_start = nullptr;
   const uint8_t* lane_iter = nullptr;
+  uint32_t interleaved_offset = 0;
+  uint32_t interleaved_end_offset = 0;
   bool lane_error = false;
   if (model->has_entropy) {
     const uint32_t state_offset = model->entropy_offset;
-    const uint32_t boundary_offset =
+    const uint32_t state_end_offset =
         state_offset + kWarpSize * sizeof(uint32_t);
-    const uint32_t payload_offset =
-        boundary_offset + (kWarpSize - 1) * sizeof(uint32_t);
-    if (payload_offset > descriptor.record_size) {
+    if (state_end_offset > descriptor.record_size) {
       lane_error = true;
     } else {
       state = ReadDeviceU32(record + state_offset +
@@ -382,22 +386,49 @@ __global__ void DecodeRecordsKernel(
       if (state < kRansLowerBound) {
         lane_error = true;
       }
-      const uint32_t payload_size =
-          descriptor.record_size - payload_offset;
-      const uint32_t lane_begin =
-          lane ? ReadDeviceU32(record + boundary_offset +
-                               (lane - 1) * sizeof(uint32_t))
-               : 0;
-      const uint32_t lane_end =
-          (lane + 1 == kWarpSize)
-              ? payload_size
-              : ReadDeviceU32(record + boundary_offset +
-                              lane * sizeof(uint32_t));
-      if ((lane_begin > lane_end) || (lane_end > payload_size)) {
-        lane_error = true;
+      if (model->has_interleaved_payload) {
+        constexpr uint32_t kPaddingByteCt = kWarpSize / 2 - 1;
+        if (descriptor.record_size <
+            state_end_offset + kPaddingByteCt) {
+          lane_error = true;
+        } else {
+          interleaved_offset = state_end_offset;
+          interleaved_end_offset =
+              descriptor.record_size - kPaddingByteCt;
+          if ((lane < kPaddingByteCt) &&
+              record[interleaved_end_offset + lane]) {
+            lane_error = true;
+          }
+        }
       } else {
-        lane_start = record + payload_offset + lane_begin;
-        lane_iter = record + payload_offset + lane_end;
+        const uint32_t boundary_offset = state_end_offset;
+        const uint32_t payload_offset =
+            boundary_offset +
+            (kWarpSize - 1) * sizeof(uint32_t);
+        if (payload_offset > descriptor.record_size) {
+          lane_error = true;
+        } else {
+          const uint32_t payload_size =
+              descriptor.record_size - payload_offset;
+          const uint32_t lane_begin =
+              lane ? ReadDeviceU32(
+                         record + boundary_offset +
+                         (lane - 1) * sizeof(uint32_t))
+                   : 0;
+          const uint32_t lane_end =
+              (lane + 1 == kWarpSize)
+                  ? payload_size
+                  : ReadDeviceU32(
+                        record + boundary_offset +
+                        lane * sizeof(uint32_t));
+          if ((lane_begin > lane_end) ||
+              (lane_end > payload_size)) {
+            lane_error = true;
+          } else {
+            lane_start = record + payload_offset + lane_begin;
+            lane_iter = record + payload_offset + lane_end;
+          }
+        }
       }
     }
   }
@@ -435,12 +466,44 @@ __global__ void DecodeRecordsKernel(
         const uint32_t frequency = row.frequencies[symbol];
         state = frequency * (state >> scale_bits) + slot -
                 row.cumulative[symbol];
-        while (state < kRansLowerBound) {
-          if (lane_iter == lane_start) {
-            lane_error = true;
+        if (!model->has_interleaved_payload) {
+          while (state < kRansLowerBound) {
+            if (lane_iter == lane_start) {
+              lane_error = true;
+              break;
+            }
+            state = (state << 8) | *--lane_iter;
+          }
+        }
+      }
+    }
+    if (model->has_interleaved_payload) {
+      for (uint32_t group = 0; group != 2; ++group) {
+        const bool lane_in_group = (lane / 16) == group;
+        while (true) {
+          const uint32_t refill_mask = __ballot_sync(
+              0xffffffffU,
+              lane_in_group && (sample_idx < sample_ct) &&
+                  (!lane_error) && (state < kRansLowerBound));
+          if (!refill_mask) {
             break;
           }
-          state = (state << 8) | *--lane_iter;
+          const uint32_t lower_lane_mask =
+              (1U << lane) - 1U;
+          const uint32_t refill_rank =
+              __popc(refill_mask & lower_lane_mask);
+          const uint32_t refill_byte_ct = __popc(refill_mask);
+          if (refill_mask & (1U << lane)) {
+            if (interleaved_offset + refill_rank >=
+                interleaved_end_offset) {
+              lane_error = true;
+            } else {
+              state =
+                  (state << 8) |
+                  record[interleaved_offset + refill_rank];
+            }
+          }
+          interleaved_offset += refill_byte_ct;
         }
       }
     }
@@ -455,9 +518,17 @@ __global__ void DecodeRecordsKernel(
           SpreadBits32(low_bits) | (SpreadBits32(high_bits) << 1);
     }
   }
-  if (model->has_entropy &&
-      ((lane_iter != lane_start) || (state != kRansLowerBound))) {
-    lane_error = true;
+  if (model->has_entropy) {
+    if (model->has_interleaved_payload) {
+      if ((state != kRansLowerBound) ||
+          ((!lane) &&
+           (interleaved_offset != interleaved_end_offset))) {
+        lane_error = true;
+      }
+    } else if ((lane_iter != lane_start) ||
+               (state != kRansLowerBound)) {
+      lane_error = true;
+    }
   }
   const uint32_t error_mask =
       __ballot_sync(0xffffffffU, lane_error);

@@ -26,7 +26,10 @@ namespace {
 constexpr uint32_t kRansLowerBound = 1U << 23;
 constexpr uint8_t kModeMask = 3;
 constexpr uint8_t kEntropyPayloadFlag = 1U << 2;
-constexpr uint8_t kKnownFlagMask = kModeMask | kEntropyPayloadFlag;
+constexpr uint8_t kInterleavedPayloadFlag = 1U << 3;
+constexpr uint8_t kKnownFlagMask =
+    kModeMask | kEntropyPayloadFlag | kInterleavedPayloadFlag;
+constexpr uint32_t kInterleavedPaddingByteCt = 15;
 constexpr uint32_t kDefaultScaleBits = 12;
 #if PGEN_RANS_X86_RUNTIME_DISPATCH
 constexpr uint32_t kDefaultSlotCt = 1U << kDefaultScaleBits;
@@ -382,6 +385,95 @@ void RansEncodeSymbol(uint32_t cumulative, uint32_t frequency,
            (*state % frequency) + cumulative;
 }
 
+bool BuildInterleavedPayload(
+    const uint64_t* target, const uint64_t* reference1,
+    const uint64_t* reference2, uint32_t sample_ct,
+    RecordMode mode, const Model& model, uint32_t scale_bits,
+    const std::vector<uint32_t>& initial_states,
+    const std::vector<std::vector<uint8_t>>& lane_payloads,
+    std::vector<uint8_t>* payload, std::string* error) {
+  const uint32_t state_ct =
+      static_cast<uint32_t>(initial_states.size());
+  std::vector<uint32_t> states = initial_states;
+  std::vector<size_t> lane_offsets(state_ct);
+  size_t payload_byte_ct = 0;
+  for (uint32_t lane = 0; lane != state_ct; ++lane) {
+    lane_offsets[lane] = lane_payloads[lane].size();
+    payload_byte_ct += lane_offsets[lane];
+  }
+  payload->clear();
+  payload->reserve(payload_byte_ct);
+  const uint32_t slot_mask = (1U << scale_bits) - 1;
+  for (uint32_t first_sample = 0; first_sample < sample_ct;
+       first_sample += state_ct) {
+    const uint32_t round_sample_ct =
+        std::min(state_ct, sample_ct - first_sample);
+    for (uint32_t group_start = 0;
+         group_start < round_sample_ct; group_start += 16) {
+      const uint32_t group_end =
+          std::min(group_start + 16, round_sample_ct);
+      uint32_t entropy_lane_mask = 0;
+      for (uint32_t lane = group_start; lane != group_end;
+           ++lane) {
+        const uint32_t sample_idx = first_sample + lane;
+        const uint32_t context = ContextIndex(
+            mode, reference1, reference2, sample_idx);
+        if (model.active_symbol_cts[context] <= 1) {
+          continue;
+        }
+        entropy_lane_mask |= 1U << (lane - group_start);
+        const ModelRow& row = model.rows[context];
+        const uint32_t symbol =
+            GetPackedGenotype(target, sample_idx);
+        const uint32_t slot = states[lane] & slot_mask;
+        states[lane] =
+            row.frequencies[symbol] *
+                (states[lane] >> scale_bits) +
+            slot - row.cumulative[symbol];
+      }
+      while (true) {
+        uint32_t refill_mask = 0;
+        for (uint32_t lane = group_start; lane != group_end;
+             ++lane) {
+          if ((entropy_lane_mask &
+               (1U << (lane - group_start))) &&
+              (states[lane] < kRansLowerBound)) {
+            refill_mask |= 1U << (lane - group_start);
+          }
+        }
+        if (!refill_mask) {
+          break;
+        }
+        for (uint32_t lane = group_start; lane != group_end;
+             ++lane) {
+          if (!(refill_mask & (1U << (lane - group_start)))) {
+            continue;
+          }
+          if (!lane_offsets[lane]) {
+            SetError(
+                "Internal rANS lane merge underflow.", error);
+            return false;
+          }
+          const uint8_t input_byte =
+              lane_payloads[lane][--lane_offsets[lane]];
+          payload->push_back(input_byte);
+          states[lane] =
+              (states[lane] << 8) | input_byte;
+        }
+      }
+    }
+  }
+  for (uint32_t lane = 0; lane != state_ct; ++lane) {
+    if (lane_offsets[lane] ||
+        (states[lane] != kRansLowerBound)) {
+      SetError("Internal rANS lane merge did not terminate.",
+               error);
+      return false;
+    }
+  }
+  return true;
+}
+
 template <uint32_t kScaleBits>
 PGEN_RANS_ALWAYS_INLINE bool RansDecodeSymbol(
     const ModelRow& row, uint32_t runtime_scale_bits,
@@ -418,11 +510,12 @@ constexpr uint32_t kDecodeTableDeterministicFlag = 1U << 31;
 
 struct alignas(64) Avx512DecodeModel12 {
   // The three cumulative boundaries for all 16 contexts fit in three
-  // zmm registers.  Entries are indexed by 4 * context + symbol and
-  // fit in four more.  Keeping the complete model in registers avoids
-  // a random gather from a 256 KiB slot-to-symbol table.
+  // zmm registers, and context flags fit in one more.  The selected
+  // interval's cumulative and frequency are derived directly from
+  // adjacent boundaries, avoiding both a random gather and a second
+  // symbol-indexed lookup.
   std::array<std::array<uint32_t, 16>, 3> thresholds = {};
-  std::array<uint32_t, 64> entries = {};
+  std::array<uint32_t, 16> context_flags = {};
 };
 
 bool HasAvx512Decoder() {
@@ -449,11 +542,9 @@ void BuildAvx512DecodeModel12(
         decode_model->thresholds[boundary][context] =
             kDefaultSlotCt;
       }
-      for (uint32_t symbol = 0; symbol != 4; ++symbol) {
-        decode_model->entries[4 * context + symbol] =
-            kDecodeTableAbsentFlag |
-            kDecodeTableDeterministicFlag;
-      }
+      decode_model->context_flags[context] =
+          kDecodeTableAbsentFlag |
+          kDecodeTableDeterministicFlag;
       continue;
     }
     if (active_symbol_ct == 1) {
@@ -465,10 +556,8 @@ void BuildAvx512DecodeModel12(
                 ? 0
                 : kDefaultSlotCt;
       }
-      for (uint32_t symbol = 0; symbol != 4; ++symbol) {
-        decode_model->entries[4 * context + symbol] =
-            kDecodeTableDeterministicFlag;
-      }
+      decode_model->context_flags[context] =
+          kDecodeTableDeterministicFlag;
       continue;
     }
     const ModelRow& row = model.rows[context];
@@ -476,15 +565,12 @@ void BuildAvx512DecodeModel12(
       decode_model->thresholds[boundary - 1][context] =
           row.cumulative[boundary];
     }
-    for (uint32_t symbol = 0; symbol != 4; ++symbol) {
-      decode_model->entries[4 * context + symbol] =
-          row.frequencies[symbol] |
-          (row.cumulative[symbol] << kDefaultScaleBits);
-    }
+    decode_model->context_flags[context] = 0;
   }
 }
 
-template <RecordMode kMode, uint32_t kGroup>
+template <RecordMode kMode, uint32_t kGroup, bool kInterleaved,
+          bool kAllEntropy>
 PGEN_RANS_TARGET_AVX512 PGEN_RANS_ALWAYS_INLINE
 bool RansDecodeGroup16Avx512(
     const Avx512DecodeModel12& decode_model,
@@ -493,6 +579,8 @@ bool RansDecodeGroup16Avx512(
     const uint8_t* lane_base, uint32_t lane_payload_size,
     const __m512i& lane_start_offsets,
     __m512i* lane_iter_offsets, __m512i* state,
+    const uint8_t** interleaved_iter,
+    const uint8_t* interleaved_end,
     uint32_t* packed_symbols, uint32_t* absent_context_mask,
     std::string* error) {
   const __m512i shifts = _mm512_setr_epi32(
@@ -554,52 +642,36 @@ bool RansDecodeGroup16Avx512(
       slots, threshold1, _MM_CMPINT_GE);
   const __mmask16 above2 = _mm512_cmp_epu32_mask(
       slots, threshold2, _MM_CMPINT_GE);
-  const __m512i selected_symbols = _mm512_add_epi32(
-      _mm512_add_epi32(
-          _mm512_maskz_set1_epi32(above0, 1),
-          _mm512_maskz_set1_epi32(above1, 1)),
-      _mm512_maskz_set1_epi32(above2, 1));
-  const __m512i entry_indices = _mm512_add_epi32(
-      _mm512_slli_epi32(contexts, 2), selected_symbols);
-  __m512i entries;
-  if constexpr (kMode == RecordMode::kTwoReference) {
-    const __m512i entries01 = _mm512_permutex2var_epi32(
-        _mm512_load_si512(decode_model.entries.data()),
-        entry_indices,
-        _mm512_load_si512(
-            decode_model.entries.data() + 16));
-    const __m512i entries23 = _mm512_permutex2var_epi32(
-        _mm512_load_si512(
-            decode_model.entries.data() + 32),
-        entry_indices,
-        _mm512_load_si512(
-            decode_model.entries.data() + 48));
-    const __mmask16 high_entry_mask =
-        _mm512_cmp_epu32_mask(
-            entry_indices, _mm512_set1_epi32(32),
-            _MM_CMPINT_GE);
-    entries = _mm512_mask_mov_epi32(
-        entries01, high_entry_mask, entries23);
-  } else {
-    entries = _mm512_permutexvar_epi32(
-        entry_indices,
-        _mm512_load_si512(decode_model.entries.data()));
-  }
   __mmask16 entropy_mask = 0xffffU;
-  if constexpr (kMode != RecordMode::kMarginal) {
+  if constexpr (
+      (kMode != RecordMode::kMarginal) && !kAllEntropy) {
+    const __m512i context_flags =
+        _mm512_permutexvar_epi32(
+            contexts,
+            _mm512_load_si512(
+                decode_model.context_flags.data()));
     *absent_context_mask |= static_cast<uint32_t>(
         _mm512_movepi32_mask(
-            _mm512_slli_epi32(entries, 1)));
+            _mm512_slli_epi32(context_flags, 1)));
     const __mmask16 deterministic_mask =
-        _mm512_movepi32_mask(entries);
+        _mm512_movepi32_mask(context_flags);
     entropy_mask =
         static_cast<__mmask16>(~deterministic_mask);
   }
-  const __m512i frequencies = _mm512_and_si512(
-      entries, _mm512_set1_epi32(kDefaultSlotCt - 1));
-  const __m512i cumulatives = _mm512_and_si512(
-      _mm512_srli_epi32(entries, kDefaultScaleBits),
-      _mm512_set1_epi32(kDefaultSlotCt - 1));
+  __m512i cumulatives = _mm512_maskz_mov_epi32(
+      above0, threshold0);
+  cumulatives = _mm512_mask_mov_epi32(
+      cumulatives, above1, threshold1);
+  cumulatives = _mm512_mask_mov_epi32(
+      cumulatives, above2, threshold2);
+  __m512i upper_bounds = _mm512_mask_mov_epi32(
+      threshold0, above0, threshold1);
+  upper_bounds = _mm512_mask_mov_epi32(
+      upper_bounds, above1, threshold2);
+  upper_bounds = _mm512_mask_set1_epi32(
+      upper_bounds, above2, kDefaultSlotCt);
+  const __m512i frequencies =
+      _mm512_sub_epi32(upper_bounds, cumulatives);
   const __m512i updated_states = _mm512_add_epi32(
       _mm512_mullo_epi32(
           frequencies,
@@ -613,84 +685,119 @@ bool RansDecodeGroup16Avx512(
       _mm512_cmp_epu32_mask(
           *state, _mm512_set1_epi32(kRansLowerBound),
           _MM_CMPINT_LT);
-  // AVX-512 has no byte gather, but a dword gather whose low byte is
-  // the requested byte is still substantially cheaper than spilling
-  // every state and chasing individual lane pointers.  Mask the rare
-  // lane whose dword would cross the end of the record and refill it
-  // scalarly to preserve strict input bounds.
-  while (renormalization_mask) {
-    const __mmask16 available_mask =
-        _mm512_cmp_epu32_mask(
-            *lane_iter_offsets, lane_start_offsets,
-            _MM_CMPINT_GT);
-    if (renormalization_mask &
-        static_cast<__mmask16>(~available_mask)) {
-      SetError("Truncated rANS lane payload.", error);
-      return false;
-    }
-    const __m512i next_offsets = _mm512_mask_sub_epi32(
-        *lane_iter_offsets, renormalization_mask,
-        *lane_iter_offsets, _mm512_set1_epi32(1));
-    __mmask16 gather_mask = 0;
-    if (lane_payload_size >= sizeof(uint32_t)) {
-      gather_mask =
-          renormalization_mask &
-          _mm512_cmp_epu32_mask(
-              next_offsets,
-              _mm512_set1_epi32(
-                  static_cast<int>(
-                      lane_payload_size - sizeof(uint32_t))),
-              _MM_CMPINT_LE);
-    }
-    const __m512i input_dwords = _mm512_mask_i32gather_epi32(
-        _mm512_setzero_si512(), gather_mask,
-        next_offsets, lane_base, 1);
-    const __m512i renormalized_states = _mm512_or_si512(
-        _mm512_slli_epi32(*state, 8),
-        _mm512_and_si512(
-            input_dwords, _mm512_set1_epi32(255)));
-    *state = _mm512_mask_mov_epi32(
-        *state, gather_mask,
-        renormalized_states);
-    *lane_iter_offsets = _mm512_mask_mov_epi32(
-        *lane_iter_offsets, renormalization_mask,
-        next_offsets);
-    __mmask16 scalar_mask =
-        renormalization_mask &
-        static_cast<__mmask16>(~gather_mask);
-    if (scalar_mask) {
-      alignas(64) uint32_t state_lanes[16];
-      alignas(64) uint32_t iter_offsets[16];
-      _mm512_store_si512(state_lanes, *state);
-      _mm512_store_si512(iter_offsets, *lane_iter_offsets);
-      while (scalar_mask) {
-        const uint32_t lane = static_cast<uint32_t>(
-            __builtin_ctz(
-                static_cast<uint32_t>(scalar_mask)));
-        scalar_mask = static_cast<__mmask16>(
-            scalar_mask & (scalar_mask - 1));
-        state_lanes[lane] =
-            (state_lanes[lane] << 8) |
-            lane_base[iter_offsets[lane]];
+  if constexpr (kInterleaved) {
+    while (renormalization_mask) {
+      const uint32_t refill_byte_ct =
+          static_cast<uint32_t>(__builtin_popcount(
+              static_cast<uint32_t>(renormalization_mask)));
+      if (static_cast<size_t>(
+              interleaved_end - *interleaved_iter) <
+          refill_byte_ct) {
+        SetError("Truncated interleaved rANS payload.", error);
+        return false;
       }
-      *state = _mm512_load_si512(state_lanes);
+      // Fifteen zero padding bytes at the end of an interleaved
+      // record make this 16-byte load safe even for the final refill.
+      const __m128i packed_bytes = _mm_loadu_si128(
+          reinterpret_cast<const __m128i*>(*interleaved_iter));
+      const __m512i refill_values =
+          _mm512_cvtepu8_epi32(packed_bytes);
+      const __m512i expanded_values =
+          _mm512_maskz_expand_epi32(
+              renormalization_mask, refill_values);
+      const __m512i renormalized_states = _mm512_or_si512(
+          _mm512_slli_epi32(*state, 8), expanded_values);
+      *state = _mm512_mask_mov_epi32(
+          *state, renormalization_mask,
+          renormalized_states);
+      *interleaved_iter += refill_byte_ct;
+      renormalization_mask =
+          entropy_mask &
+          _mm512_cmp_epu32_mask(
+              *state, _mm512_set1_epi32(kRansLowerBound),
+              _MM_CMPINT_LT);
     }
-    renormalization_mask =
-        entropy_mask &
-        _mm512_cmp_epu32_mask(
-            *state, _mm512_set1_epi32(kRansLowerBound),
-            _MM_CMPINT_LT);
+  } else {
+    // AVX-512 has no byte gather, but a dword gather whose low byte is
+    // still substantially cheaper than spilling every state and
+    // chasing individual lane pointers.
+    while (renormalization_mask) {
+      const __mmask16 available_mask =
+          _mm512_cmp_epu32_mask(
+              *lane_iter_offsets, lane_start_offsets,
+              _MM_CMPINT_GT);
+      if (renormalization_mask &
+          static_cast<__mmask16>(~available_mask)) {
+        SetError("Truncated rANS lane payload.", error);
+        return false;
+      }
+      const __m512i next_offsets = _mm512_mask_sub_epi32(
+          *lane_iter_offsets, renormalization_mask,
+          *lane_iter_offsets, _mm512_set1_epi32(1));
+      __mmask16 gather_mask = 0;
+      if (lane_payload_size >= sizeof(uint32_t)) {
+        gather_mask =
+            renormalization_mask &
+            _mm512_cmp_epu32_mask(
+                next_offsets,
+                _mm512_set1_epi32(
+                    static_cast<int>(
+                        lane_payload_size - sizeof(uint32_t))),
+                _MM_CMPINT_LE);
+      }
+      const __m512i input_dwords = _mm512_mask_i32gather_epi32(
+          _mm512_setzero_si512(), gather_mask,
+          next_offsets, lane_base, 1);
+      const __m512i renormalized_states = _mm512_or_si512(
+          _mm512_slli_epi32(*state, 8),
+          _mm512_and_si512(
+              input_dwords, _mm512_set1_epi32(255)));
+      *state = _mm512_mask_mov_epi32(
+          *state, gather_mask,
+          renormalized_states);
+      *lane_iter_offsets = _mm512_mask_mov_epi32(
+          *lane_iter_offsets, renormalization_mask,
+          next_offsets);
+      __mmask16 scalar_mask =
+          renormalization_mask &
+          static_cast<__mmask16>(~gather_mask);
+      if (scalar_mask) {
+        alignas(64) uint32_t state_lanes[16];
+        alignas(64) uint32_t iter_offsets[16];
+        _mm512_store_si512(state_lanes, *state);
+        _mm512_store_si512(
+            iter_offsets, *lane_iter_offsets);
+        while (scalar_mask) {
+          const uint32_t lane = static_cast<uint32_t>(
+              __builtin_ctz(
+                  static_cast<uint32_t>(scalar_mask)));
+          scalar_mask = static_cast<__mmask16>(
+              scalar_mask & (scalar_mask - 1));
+          state_lanes[lane] =
+              (state_lanes[lane] << 8) |
+              lane_base[iter_offsets[lane]];
+        }
+        *state = _mm512_load_si512(state_lanes);
+      }
+      renormalization_mask =
+          entropy_mask &
+          _mm512_cmp_epu32_mask(
+              *state, _mm512_set1_epi32(kRansLowerBound),
+              _MM_CMPINT_LT);
+    }
   }
 
+  // With monotonic threshold masks, symbol = above0 + above1 +
+  // above2.  Its high bit is therefore above1 and its low bit is the
+  // parity of the three masks.  Pack those bits directly, without
+  // constructing a vector of symbols first.
   const uint32_t low_bits = static_cast<uint32_t>(
-      _mm512_movepi32_mask(_mm512_slli_epi32(
-          selected_symbols, 31)));
-  const uint32_t high_bits = static_cast<uint32_t>(
-      _mm512_movepi32_mask(_mm512_slli_epi32(
-          selected_symbols, 30)));
+      above0 ^ above1 ^ above2);
   *packed_symbols = static_cast<uint32_t>(
       _pdep_u64(low_bits, 0x55555555ULL) |
-      (_pdep_u64(high_bits, 0x55555555ULL) << 1));
+      (_pdep_u64(
+           static_cast<uint32_t>(above1), 0x55555555ULL)
+       << 1));
   return true;
 }
 
@@ -735,15 +842,17 @@ bool DecodeEntropyWords32Avx512(
         (kMode == RecordMode::kTwoReference) ? reference2[word_idx] : 0;
     uint32_t packed0;
     uint32_t packed1;
-    if (!RansDecodeGroup16Avx512<kMode, 0>(
+    if (!RansDecodeGroup16Avx512<kMode, 0, false, false>(
             decode_model, reference1_word, reference2_word,
             lane_base, lane_payload_size, lane_start_offsets0,
-            &lane_iter_offsets0, &state0, &packed0,
+            &lane_iter_offsets0, &state0, nullptr, nullptr,
+            &packed0,
             &absent_context_mask, error) ||
-        !RansDecodeGroup16Avx512<kMode, 1>(
+        !RansDecodeGroup16Avx512<kMode, 1, false, false>(
             decode_model, reference1_word, reference2_word,
             lane_base, lane_payload_size, lane_start_offsets1,
-            &lane_iter_offsets1, &state1, &packed1,
+            &lane_iter_offsets1, &state1, nullptr, nullptr,
+            &packed1,
             &absent_context_mask, error)) {
       return false;
     }
@@ -826,6 +935,151 @@ bool DecodeEntropyWords32Avx512(
   return true;
 }
 
+template <RecordMode kMode, bool kAllEntropy>
+PGEN_RANS_TARGET_AVX512
+bool DecodeEntropyWords32InterleavedAvx512(
+    const Model& model, const uint64_t* reference1,
+    const uint64_t* reference2, uint32_t sample_ct,
+    const uint8_t* payload_begin, const uint8_t* payload_end,
+    std::array<uint32_t, 256>* states, uint64_t* target,
+    const uint8_t** payload_iter_out, std::string* error) {
+  Avx512DecodeModel12 decode_model;
+  BuildAvx512DecodeModel12(model, &decode_model);
+  __m512i state0 = _mm512_loadu_si512(&(states->at(0)));
+  __m512i state1 = _mm512_loadu_si512(&(states->at(16)));
+  const __m512i unused_offsets = _mm512_setzero_si512();
+  __m512i unused_iter_offsets = _mm512_setzero_si512();
+  const uint8_t* payload_iter = payload_begin;
+  uint32_t absent_context_mask = 0;
+  const uint32_t full_word_ct = sample_ct / 32;
+  for (uint32_t word_idx = 0; word_idx != full_word_ct;
+       ++word_idx) {
+    const uint64_t reference1_word =
+        (kMode == RecordMode::kMarginal)
+            ? 0
+            : reference1[word_idx];
+    const uint64_t reference2_word =
+        (kMode == RecordMode::kTwoReference)
+            ? reference2[word_idx]
+            : 0;
+    uint32_t packed0;
+    uint32_t packed1;
+    if (!RansDecodeGroup16Avx512<
+            kMode, 0, true, kAllEntropy>(
+            decode_model, reference1_word, reference2_word,
+            nullptr, 0, unused_offsets, &unused_iter_offsets,
+            &state0, &payload_iter, payload_end, &packed0,
+            &absent_context_mask, error) ||
+        !RansDecodeGroup16Avx512<
+            kMode, 1, true, kAllEntropy>(
+            decode_model, reference1_word, reference2_word,
+            nullptr, 0, unused_offsets, &unused_iter_offsets,
+            &state1, &payload_iter, payload_end, &packed1,
+            &absent_context_mask, error)) {
+      return false;
+    }
+    target[word_idx] =
+        static_cast<uint64_t>(packed0) |
+        (static_cast<uint64_t>(packed1) << 32);
+  }
+  _mm512_storeu_si512(&(states->at(0)), state0);
+  _mm512_storeu_si512(&(states->at(16)), state1);
+
+  const uint32_t tail_sample_ct = sample_ct % 32;
+  if (tail_sample_ct) {
+    const uint32_t word_idx = full_word_ct;
+    const uint64_t reference1_word =
+        (kMode == RecordMode::kMarginal)
+            ? 0
+            : reference1[word_idx];
+    const uint64_t reference2_word =
+        (kMode == RecordMode::kTwoReference)
+            ? reference2[word_idx]
+            : 0;
+    uint64_t packed_word = 0;
+    for (uint32_t group_start = 0;
+         group_start < tail_sample_ct; group_start += 16) {
+      const uint32_t group_end =
+          std::min(group_start + 16, tail_sample_ct);
+      uint32_t entropy_lane_mask = 0;
+      for (uint32_t lane = group_start; lane != group_end;
+           ++lane) {
+        uint32_t context = 0;
+        if (kMode != RecordMode::kMarginal) {
+          context = static_cast<uint32_t>(
+              (reference1_word >> (2 * lane)) & 3U);
+        }
+        if (kMode == RecordMode::kTwoReference) {
+          context =
+              4 * context +
+              static_cast<uint32_t>(
+                  (reference2_word >> (2 * lane)) & 3U);
+        }
+        const uint32_t active_symbol_ct =
+            model.active_symbol_cts[context];
+        if (!active_symbol_ct) {
+          absent_context_mask = 1;
+          continue;
+        }
+        uint8_t symbol = model.deterministic_symbols[context];
+        if (active_symbol_ct > 1) {
+          entropy_lane_mask |= 1U << (lane - group_start);
+          const ModelRow& row = model.rows[context];
+          const uint32_t slot =
+              (*states)[lane] & (kDefaultSlotCt - 1);
+          symbol = static_cast<uint8_t>(
+              static_cast<uint32_t>(
+                  slot >= row.cumulative[1]) +
+              static_cast<uint32_t>(
+                  slot >= row.cumulative[2]) +
+              static_cast<uint32_t>(
+                  slot >= row.cumulative[3]));
+          (*states)[lane] =
+              row.frequencies[symbol] *
+                  ((*states)[lane] >> kDefaultScaleBits) +
+              slot - row.cumulative[symbol];
+        }
+        packed_word |=
+            static_cast<uint64_t>(symbol) << (2 * lane);
+      }
+      while (true) {
+        uint32_t refill_mask = 0;
+        for (uint32_t lane = group_start; lane != group_end;
+             ++lane) {
+          if ((entropy_lane_mask &
+               (1U << (lane - group_start))) &&
+              ((*states)[lane] < kRansLowerBound)) {
+            refill_mask |= 1U << (lane - group_start);
+          }
+        }
+        if (!refill_mask) {
+          break;
+        }
+        for (uint32_t lane = group_start; lane != group_end;
+             ++lane) {
+          if (!(refill_mask & (1U << (lane - group_start)))) {
+            continue;
+          }
+          if (payload_iter == payload_end) {
+            SetError(
+                "Truncated interleaved rANS payload.", error);
+            return false;
+          }
+          (*states)[lane] =
+              ((*states)[lane] << 8) | *payload_iter++;
+        }
+      }
+    }
+    target[word_idx] = packed_word;
+  }
+  if (absent_context_mask) {
+    SetError("Reference selects an absent model context.", error);
+    return false;
+  }
+  *payload_iter_out = payload_iter;
+  return true;
+}
+
 PGEN_RANS_TARGET_AVX512
 bool DecodeEntropyRecord32Avx512(
     RecordMode mode, const Model& model, const uint64_t* reference1,
@@ -851,7 +1105,168 @@ bool DecodeEntropyRecord32Avx512(
   SetError("Unknown rANS record mode.", error);
   return false;
 }
+
+template <bool kAllEntropy>
+PGEN_RANS_TARGET_AVX512
+bool DecodeEntropyRecordInterleavedAvx512(
+    RecordMode mode, const Model& model, const uint64_t* reference1,
+    const uint64_t* reference2, uint32_t sample_ct,
+    const uint8_t* payload_begin, const uint8_t* payload_end,
+    std::array<uint32_t, 256>* states, uint64_t* target,
+    const uint8_t** payload_iter_out, std::string* error) {
+  switch (mode) {
+    case RecordMode::kMarginal:
+      return DecodeEntropyWords32InterleavedAvx512<
+          RecordMode::kMarginal, kAllEntropy>(
+          model, reference1, reference2, sample_ct,
+          payload_begin, payload_end, states, target,
+          payload_iter_out, error);
+    case RecordMode::kOneReference:
+      return DecodeEntropyWords32InterleavedAvx512<
+          RecordMode::kOneReference, kAllEntropy>(
+          model, reference1, reference2, sample_ct,
+          payload_begin, payload_end, states, target,
+          payload_iter_out, error);
+    case RecordMode::kTwoReference:
+      return DecodeEntropyWords32InterleavedAvx512<
+          RecordMode::kTwoReference, kAllEntropy>(
+          model, reference1, reference2, sample_ct,
+          payload_begin, payload_end, states, target,
+          payload_iter_out, error);
+  }
+  SetError("Unknown rANS record mode.", error);
+  return false;
+}
 #endif
+
+template <RecordMode kMode, uint32_t kScaleBits>
+bool DecodeEntropyInterleaved(
+    const Model& model, const uint64_t* reference1,
+    const uint64_t* reference2, uint32_t sample_ct,
+    uint32_t state_ct, uint32_t runtime_scale_bits,
+    const uint8_t* payload_begin, const uint8_t* payload_end,
+    std::array<uint32_t, 256>* states, uint64_t* target,
+    const uint8_t** payload_iter_out, std::string* error) {
+  const uint32_t scale_bits =
+      kScaleBits ? kScaleBits : runtime_scale_bits;
+  const uint32_t slot_mask = (1U << scale_bits) - 1;
+  memset(
+      target, 0,
+      static_cast<size_t>((sample_ct + 31) / 32) *
+          sizeof(uint64_t));
+  const uint8_t* payload_iter = payload_begin;
+  for (uint32_t first_sample = 0; first_sample < sample_ct;
+       first_sample += state_ct) {
+    const uint32_t round_sample_ct =
+        std::min(state_ct, sample_ct - first_sample);
+    for (uint32_t group_start = 0;
+         group_start < round_sample_ct; group_start += 16) {
+      const uint32_t group_end =
+          std::min(group_start + 16, round_sample_ct);
+      uint32_t entropy_lane_mask = 0;
+      for (uint32_t lane = group_start; lane != group_end;
+           ++lane) {
+        const uint32_t sample_idx = first_sample + lane;
+        uint32_t context = 0;
+        if constexpr (kMode != RecordMode::kMarginal) {
+          context =
+              GetPackedGenotype(reference1, sample_idx);
+        }
+        if constexpr (kMode == RecordMode::kTwoReference) {
+          context =
+              4 * context +
+              GetPackedGenotype(reference2, sample_idx);
+        }
+        const uint32_t active_symbol_ct =
+            model.active_symbol_cts[context];
+        if (!active_symbol_ct) {
+          SetError("Reference selects an absent model context.",
+                   error);
+          return false;
+        }
+        uint8_t symbol = model.deterministic_symbols[context];
+        if (active_symbol_ct > 1) {
+          entropy_lane_mask |= 1U << (lane - group_start);
+          const ModelRow& row = model.rows[context];
+          const uint32_t slot = (*states)[lane] & slot_mask;
+          symbol = static_cast<uint8_t>(
+              static_cast<uint32_t>(
+                  slot >= row.cumulative[1]) +
+              static_cast<uint32_t>(
+                  slot >= row.cumulative[2]) +
+              static_cast<uint32_t>(
+                  slot >= row.cumulative[3]));
+          (*states)[lane] =
+              row.frequencies[symbol] *
+                  ((*states)[lane] >> scale_bits) +
+              slot - row.cumulative[symbol];
+        }
+        SetPackedGenotype(target, sample_idx, symbol);
+      }
+      while (true) {
+        uint32_t refill_mask = 0;
+        for (uint32_t lane = group_start; lane != group_end;
+             ++lane) {
+          if ((entropy_lane_mask &
+               (1U << (lane - group_start))) &&
+              ((*states)[lane] < kRansLowerBound)) {
+            refill_mask |= 1U << (lane - group_start);
+          }
+        }
+        if (!refill_mask) {
+          break;
+        }
+        for (uint32_t lane = group_start; lane != group_end;
+             ++lane) {
+          if (!(refill_mask & (1U << (lane - group_start)))) {
+            continue;
+          }
+          if (payload_iter == payload_end) {
+            SetError(
+                "Truncated interleaved rANS payload.", error);
+            return false;
+          }
+          (*states)[lane] =
+              ((*states)[lane] << 8) | *payload_iter++;
+        }
+      }
+    }
+  }
+  *payload_iter_out = payload_iter;
+  return true;
+}
+
+template <uint32_t kScaleBits>
+bool DecodeEntropyRecordInterleaved(
+    RecordMode mode, const Model& model, const uint64_t* reference1,
+    const uint64_t* reference2, uint32_t sample_ct,
+    uint32_t state_ct, uint32_t runtime_scale_bits,
+    const uint8_t* payload_begin, const uint8_t* payload_end,
+    std::array<uint32_t, 256>* states, uint64_t* target,
+    const uint8_t** payload_iter_out, std::string* error) {
+  switch (mode) {
+    case RecordMode::kMarginal:
+      return DecodeEntropyInterleaved<
+          RecordMode::kMarginal, kScaleBits>(
+          model, reference1, reference2, sample_ct, state_ct,
+          runtime_scale_bits, payload_begin, payload_end, states,
+          target, payload_iter_out, error);
+    case RecordMode::kOneReference:
+      return DecodeEntropyInterleaved<
+          RecordMode::kOneReference, kScaleBits>(
+          model, reference1, reference2, sample_ct, state_ct,
+          runtime_scale_bits, payload_begin, payload_end, states,
+          target, payload_iter_out, error);
+    case RecordMode::kTwoReference:
+      return DecodeEntropyInterleaved<
+          RecordMode::kTwoReference, kScaleBits>(
+          model, reference1, reference2, sample_ct, state_ct,
+          runtime_scale_bits, payload_begin, payload_end, states,
+          target, payload_iter_out, error);
+  }
+  SetError("Unknown rANS record mode.", error);
+  return false;
+}
 
 template <RecordMode kMode, uint32_t kScaleBits, bool kAllEntropy>
 bool DecodeEntropyWords32(
@@ -1002,6 +1417,15 @@ bool ParsePrefix(const uint8_t* record, size_t record_size,
   }
   metadata->mode = static_cast<RecordMode>(mode_code);
   metadata->has_entropy_payload = (flags & kEntropyPayloadFlag);
+  metadata->has_interleaved_payload =
+      (flags & kInterleavedPayloadFlag);
+  if (metadata->has_interleaved_payload &&
+      !metadata->has_entropy_payload) {
+    SetError(
+        "Interleaved record is missing the entropy-payload flag.",
+        error);
+    return false;
+  }
   *offset = 1;
   if (metadata->mode != RecordMode::kMarginal) {
     if (*offset == record_size) {
@@ -1075,7 +1499,7 @@ bool EncodeRecord(const uint64_t* target, const uint64_t* reference1,
   }
   uint8_t flags = static_cast<uint8_t>(mode);
   if (model.has_entropy) {
-    flags |= kEntropyPayloadFlag;
+    flags |= kEntropyPayloadFlag | kInterleavedPayloadFlag;
   }
   record->push_back(flags);
   if (mode != RecordMode::kMarginal) {
@@ -1114,19 +1538,19 @@ bool EncodeRecord(const uint64_t* target, const uint64_t* reference1,
   for (const uint32_t state : states) {
     AppendU32(state, record);
   }
-  uint64_t cumulative_payload_size = 0;
-  for (uint32_t lane = 0; lane + 1 != state_ct; ++lane) {
-    cumulative_payload_size += lane_payloads[lane].size();
-    if (cumulative_payload_size > UINT32_MAX) {
-      SetError("rANS lane payload exceeds the v1 record limit.", error);
-      record->clear();
-      return false;
-    }
-    AppendU32(static_cast<uint32_t>(cumulative_payload_size), record);
+  std::vector<uint8_t> interleaved_payload;
+  if (!BuildInterleavedPayload(
+          target, reference1, reference2, sample_ct, mode, model,
+          params.scale_bits, states, lane_payloads,
+          &interleaved_payload, error)) {
+    record->clear();
+    return false;
   }
-  for (const std::vector<uint8_t>& lane_payload : lane_payloads) {
-    record->insert(record->end(), lane_payload.begin(), lane_payload.end());
-  }
+  record->insert(
+      record->end(), interleaved_payload.begin(),
+      interleaved_payload.end());
+  record->insert(
+      record->end(), kInterleavedPaddingByteCt, 0);
   return true;
 }
 
@@ -1175,7 +1599,8 @@ bool EstimateRecordBytes(const uint32_t* context_symbol_counts,
   if (model.has_entropy) {
     const uint32_t state_ct = static_cast<uint32_t>(
         std::min<uint64_t>(params.state_ct, sample_ct));
-    result += 4LLU * state_ct + 4LLU * (state_ct - 1);
+    result +=
+        4LLU * state_ct + kInterleavedPaddingByteCt;
     result += static_cast<uint64_t>(std::ceil(quantized_bits / 8.0L));
   }
   *record_bytes = result;
@@ -1188,12 +1613,13 @@ bool ParseRecordMetadata(const uint8_t* record, size_t record_size,
   return ParsePrefix(record, record_size, metadata, &offset, error);
 }
 
-bool DecodeRecordToBuffer(const uint8_t* record, size_t record_size,
-                          const uint64_t* const* anchors,
-                          uint32_t anchor_ct, uint32_t sample_ct,
-                          const CodecParams& params, uint64_t* target,
-                          size_t target_word_ct, RecordMetadata* metadata,
-                          std::string* error) {
+bool DecodeRecordToBufferImpl(
+    const uint8_t* record, size_t record_size,
+    const uint64_t* const* anchors, uint32_t anchor_ct,
+    uint32_t sample_ct, const CodecParams& params, uint64_t* target,
+    size_t target_word_ct, bool validated_contexts,
+    RecordMetadata* metadata, std::string* error) {
+  (void)validated_contexts;
   const uint32_t packed_word_ct = PackedWordCt(sample_ct);
   if ((!record) || (!sample_ct) || (!params.state_ct) ||
       (params.state_ct > 256) || (params.scale_bits < 8) ||
@@ -1284,6 +1710,83 @@ bool DecodeRecordToBuffer(const uint8_t* record, size_t record_size,
       SetError("Invalid or truncated rANS initial state.", error);
       return false;
     }
+  }
+  if (parsed_metadata.has_interleaved_payload) {
+    if (record_size - offset < kInterleavedPaddingByteCt) {
+      SetError("Truncated interleaved rANS padding.", error);
+      return false;
+    }
+    const uint8_t* const payload_begin = record + offset;
+    const uint8_t* const payload_end =
+        record + record_size - kInterleavedPaddingByteCt;
+    for (const uint8_t* padding_iter = payload_end;
+         padding_iter != record + record_size; ++padding_iter) {
+      if (*padding_iter) {
+        SetError("Interleaved rANS padding is nonzero.", error);
+        return false;
+      }
+    }
+    const uint8_t* payload_iter = payload_begin;
+    bool decode_ok = false;
+    bool used_vector_decoder = false;
+#if PGEN_RANS_X86_RUNTIME_DISPATCH
+    if ((state_ct == 32) &&
+        (params.scale_bits == kDefaultScaleBits) &&
+        (sample_ct >= kAvx512MinimumSampleCt) &&
+        HasAvx512Decoder()) {
+      used_vector_decoder = true;
+      const uint16_t full_context_mask = static_cast<uint16_t>(
+          (1U << model.row_ct) - 1);
+      decode_ok =
+          (validated_contexts ||
+           (model.entropy_context_mask == full_context_mask))
+              ? DecodeEntropyRecordInterleavedAvx512<true>(
+                    parsed_metadata.mode, model, reference1,
+                    reference2, sample_ct, payload_begin,
+                    payload_end, &states, target, &payload_iter,
+                    error)
+              : DecodeEntropyRecordInterleavedAvx512<false>(
+                    parsed_metadata.mode, model, reference1,
+                    reference2, sample_ct, payload_begin,
+                    payload_end, &states, target, &payload_iter,
+                    error);
+    }
+#endif
+    if (!used_vector_decoder) {
+      decode_ok =
+          (params.scale_bits == kDefaultScaleBits)
+              ? DecodeEntropyRecordInterleaved<
+                    kDefaultScaleBits>(
+                    parsed_metadata.mode, model, reference1,
+                    reference2, sample_ct, state_ct,
+                    params.scale_bits, payload_begin, payload_end,
+                    &states, target, &payload_iter, error)
+              : DecodeEntropyRecordInterleaved<0>(
+                    parsed_metadata.mode, model, reference1,
+                    reference2, sample_ct, state_ct,
+                    params.scale_bits, payload_begin, payload_end,
+                    &states, target, &payload_iter, error);
+    }
+    if (!decode_ok) {
+      return false;
+    }
+    if (payload_iter != payload_end) {
+      SetError(
+          "Interleaved rANS payload has trailing bytes.", error);
+      return false;
+    }
+    for (uint32_t lane = 0; lane != state_ct; ++lane) {
+      if (states[lane] != kRansLowerBound) {
+        SetError(
+            "Interleaved rANS state did not terminate canonically.",
+            error);
+        return false;
+      }
+    }
+    if (metadata) {
+      *metadata = parsed_metadata;
+    }
+    return true;
   }
   std::array<uint32_t, 257> lane_boundaries = {};
   for (uint32_t lane = 0; lane + 1 != state_ct; ++lane) {
@@ -1399,6 +1902,28 @@ bool DecodeRecordToBuffer(const uint8_t* record, size_t record_size,
     *metadata = parsed_metadata;
   }
   return true;
+}
+
+bool DecodeRecordToBuffer(const uint8_t* record, size_t record_size,
+                          const uint64_t* const* anchors,
+                          uint32_t anchor_ct, uint32_t sample_ct,
+                          const CodecParams& params, uint64_t* target,
+                          size_t target_word_ct, RecordMetadata* metadata,
+                          std::string* error) {
+  return DecodeRecordToBufferImpl(
+      record, record_size, anchors, anchor_ct, sample_ct, params,
+      target, target_word_ct, false, metadata, error);
+}
+
+bool DecodeRecordToBufferFromValidatedBlock(
+    const uint8_t* record, size_t record_size,
+    const uint64_t* const* anchors, uint32_t anchor_ct,
+    uint32_t sample_ct, const CodecParams& params, uint64_t* target,
+    size_t target_word_ct, RecordMetadata* metadata,
+    std::string* error) {
+  return DecodeRecordToBufferImpl(
+      record, record_size, anchors, anchor_ct, sample_ct, params,
+      target, target_word_ct, true, metadata, error);
 }
 
 bool DecodeRecord(const uint8_t* record, size_t record_size,

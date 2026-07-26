@@ -13,6 +13,7 @@ namespace {
 using pgen_rans::CodecParams;
 using pgen_rans::DecodeRecord;
 using pgen_rans::DecodeRecordToBuffer;
+using pgen_rans::DecodeRecordToBufferFromValidatedBlock;
 using pgen_rans::EncodeRecord;
 using pgen_rans::EstimateRecordBytes;
 using pgen_rans::GetPackedGenotype;
@@ -115,6 +116,9 @@ void RoundTrip(const std::vector<uint8_t>& target,
                       params, &decoded, &metadata, &error),
          "decode failed: " + error);
   Expect(metadata.mode == mode, "decoded mode mismatch");
+  Expect(metadata.has_interleaved_payload ==
+             metadata.has_entropy_payload,
+         "interleaved-payload flag mismatch");
   ExpectEqual(decoded, target, "round-trip");
 
   const uint32_t packed_word_ct = PackedWordCt(sample_ct);
@@ -127,6 +131,12 @@ void RoundTrip(const std::vector<uint8_t>& target,
   ExpectEqual(decoded_buffer, target, "buffer round-trip");
   Expect(decoded_buffer.back() == 0xdec0dedec0dedULL,
          "buffer decoder wrote past its declared output");
+  Expect(DecodeRecordToBufferFromValidatedBlock(
+             record.data(), record.size(), anchors, 8, sample_ct,
+             params, decoded_buffer.data(), packed_word_ct, &metadata,
+             &error),
+         "validated-block decode failed: " + error);
+  ExpectEqual(decoded_buffer, target, "validated-block round-trip");
   if (packed_word_ct > 1) {
     Expect(!DecodeRecordToBuffer(
                record.data(), record.size(), anchors, 8, sample_ct, params,
@@ -144,6 +154,14 @@ void RoundTrip(const std::vector<uint8_t>& target,
   Expect(!DecodeRecord(invalid_flags.data(), invalid_flags.size(), anchors, 8,
                        sample_ct, params, &decoded, nullptr, &error),
          "unknown record flag was accepted");
+  if (metadata.has_interleaved_payload) {
+    std::vector<uint8_t> invalid_padding = record;
+    invalid_padding.back() = 1;
+    Expect(!DecodeRecord(invalid_padding.data(), invalid_padding.size(),
+                         anchors, 8, sample_ct, params, &decoded,
+                         nullptr, &error),
+           "nonzero interleaved padding was accepted");
+  }
 }
 
 void TestRandomRoundTrips() {

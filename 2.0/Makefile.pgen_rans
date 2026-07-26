@@ -14,6 +14,10 @@ PGENRANSTOOLSRC = $(PGENLIB_CCSRC) pgen_rans_codec.cc \
 	pgen_rans_container.cc pgen_rans_cpu.cc pgen_rans_tool.cc
 PGENRANSTOOLOBJ = $(PGENRANSTOOLSRC:.cc=.o)
 
+# The rANS hot loop benefits measurably from O3 scheduling on
+# latency-bound AVX-512 targets.  Keep the rest of PLINK's flags unchanged.
+pgen_rans_codec.o: CXXFLAGS += -O3
+
 .PHONY: libpgen_rans pgen_rans pgen_rans_codec_test \
 	pgen_rans_container_test test
 

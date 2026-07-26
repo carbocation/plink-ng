@@ -106,7 +106,7 @@ struct CpuBlockDecoder::Impl {
           anchor_phase ? nullptr : anchors->data();
       const uint32_t task_anchor_ct =
           anchor_phase ? 0 : static_cast<uint32_t>(anchors->size());
-      if (!DecodeRecordToBuffer(
+      if (!DecodeRecordToBufferFromValidatedBlock(
               record.data, record.size, task_anchors, task_anchor_ct,
               sample_ct, params,
               output + static_cast<size_t>(variant_offset) * word_stride,

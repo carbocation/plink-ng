@@ -30,6 +30,7 @@ struct RecordMetadata {
   uint8_t reference1 = 0;
   uint8_t reference2 = 0;
   bool has_entropy_payload = false;
+  bool has_interleaved_payload = false;
 };
 
 uint32_t PackedWordCt(uint32_t sample_ct);
@@ -56,6 +57,16 @@ bool DecodeRecordToBuffer(const uint8_t* record, size_t record_size,
                           const CodecParams& params, uint64_t* target,
                           size_t target_word_ct, RecordMetadata* metadata,
                           std::string* error);
+
+// Container blocks have already passed their structural and checksum
+// validation.  This entry point additionally assumes that references do
+// not select model contexts that were absent during encoding.
+bool DecodeRecordToBufferFromValidatedBlock(
+    const uint8_t* record, size_t record_size,
+    const uint64_t* const* anchors, uint32_t anchor_ct,
+    uint32_t sample_ct, const CodecParams& params, uint64_t* target,
+    size_t target_word_ct, RecordMetadata* metadata,
+    std::string* error);
 
 bool DecodeRecord(const uint8_t* record, size_t record_size,
                   const uint64_t* const* anchors, uint32_t anchor_ct,

@@ -25,8 +25,9 @@ dependency level.
 The first byte contains:
 
 - bits 0-1: mode (`0` marginal, `1` one reference, `2` two references);
-- bit 2: rANS state and lane payload are present;
-- bits 3-7: reserved and zero.
+- bit 2: rANS state and byte-renormalization payload are present;
+- bit 3: refill-interleaved payload layout;
+- bits 4-7: reserved and zero.
 
 One-reference records next store one byte containing the anchor ordinal.
 Two-reference records store two distinct anchor ordinals. Version 1 therefore
@@ -48,23 +49,37 @@ Contexts and symbols are serialized in numeric order.
 The current normalization precision is configurable from 8 through 16 bits;
 12 bits is the intended format default.
 
-## Warp-interleaved rANS payload
+## rANS payload
 
 When any model row has more than one active symbol, the record stores:
 
 1. one 32-bit initial state per lane;
-2. one 32-bit cumulative boundary after every lane except the last;
-3. the concatenated byte-renormalization streams for all lanes.
+2. the byte-renormalization payload described below.
 
 The intended lane count is 32. Sample `i` belongs to lane `i mod lane_count`.
-Each lane is an independent bytewise-rANS stream, permitting one GPU warp to
-decode 32 samples concurrently without a shared mutable input pointer.
+Each lane is an independent bytewise-rANS state.
 
-Lane byte streams are stored in encoder emission order and consumed backward.
-The record length supplies the final lane boundary.
+When bit 3 is clear, the legacy payload stores one 32-bit cumulative boundary
+after every lane except the last, followed by the concatenated lane byte
+streams. Lane streams are stored in encoder emission order and consumed
+backward. The record length supplies the final lane boundary. Readers retain
+this path for backward compatibility.
+
+When bit 3 is set, no lane-boundary table is present. Refill bytes are merged
+in forward decoder order. Each 32-sample round visits lanes 0-15 and then
+16-31. For each group, the decoder computes the mask of states below the rANS
+lower bound and consumes one byte for every set lane, in ascending lane order;
+it repeats until no lane in that group needs another byte. Fifteen zero bytes
+follow the payload. They make a final unaligned 16-byte CPU load safe without
+becoming part of the coded stream.
+
+This refill-interleaved layout replaces 124 bytes of lane boundaries with 15
+bytes of padding. More importantly, AVX-512 can load each refill layer
+contiguously and expand it under the state mask, while CUDA lanes read a
+coalesced span in warp order.
 
 If every populated row is deterministic, the state table, boundary table, and
-lane payload are omitted.
+lane payload are omitted and bit 3 is clear.
 
 ## Canonical validation
 
@@ -77,6 +92,8 @@ A conforming decoder rejects:
 - invalid normalized-frequency totals;
 - references selecting an absent model context;
 - nonmonotonic lane boundaries;
+- nonzero refill-interleaved padding;
+- refill-interleaved payloads that are not consumed exactly;
 - lanes that do not consume exactly their payload or terminate at the rANS
   lower-bound state.
 
@@ -122,9 +139,16 @@ one complete 64-bit packed genotype word per round.
 
 On x86-64 GCC and Clang builds, default 32-state/12-bit records use a
 runtime-dispatched AVX-512 decoder for cohorts with at least 32768 samples.
-It advances 16 states at once through a block-local decode table while
-retaining the scalar path for smaller cohorts and CPUs without AVX-512.
-The binary therefore keeps its existing x86-64-v3 compatibility floor.
+It keeps all three model boundaries in registers, derives packed genotype bits
+directly from the threshold masks, and refills 16 states from one contiguous
+load. The scalar path remains available for smaller cohorts and CPUs without
+AVX-512, so the binary keeps its existing x86-64-v3 compatibility floor.
+Validated container blocks use the fact that deterministic and unobserved
+contexts are identity rANS intervals; the strict standalone record API
+continues to reject a reference selecting an absent context.
+
+CRC32C block validation is runtime-dispatched to SSE4.2 on x86-64 and the
+CRC32 extension on AArch64, with a portable table fallback.
 
 `PackedVariantReader` is the CPU-facing compatibility layer. It accepts
 contiguous ranges or arbitrary variant-index lists, groups requests by block,
@@ -193,8 +217,11 @@ double-buffer block reads and decoding.
 
 The CUDA decoder batches multiple container blocks, launches one warp per
 record, and preserves the two-level dependency graph with separate anchor and
-target kernels. Each lane owns one rANS state. Warp ballots assemble the low
-and high genotype bits into the standard packed 64-bit output word.
+target kernels. Each lane owns one rANS state. Refill-interleaved records use
+warp ballots and population counts to assign a contiguous refill span to the
+active lanes; old lane-separated records remain supported. Warp ballots also
+assemble the low and high genotype bits into the standard packed 64-bit output
+word.
 
 On a CUDA machine, build and run the exact CPU/GPU comparison with:
 
