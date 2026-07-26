@@ -20,6 +20,7 @@
 
 #include "include/plink2_base.h"
 #include "include/plink2_bits.h"
+#include "include/pgenlib_misc.h"
 #include "pgen_rans_codec.h"
 #include "pgen_rans_container.h"
 #include "pgen_rans_hybrid.h"
@@ -43,6 +44,18 @@ struct AnchorCandidate {
   uint32_t ordinal = 0;
   uint32_t offset = 0;
   std::array<uint32_t, 16> joint_counts = {};
+};
+
+struct PackedGenotypePlanes {
+  uint32_t word_ct = 0;
+  uint8_t baseline = 0;
+  uint8_t independent_ct = 0;
+  std::array<uint8_t, 3> independent = {};
+  std::vector<uintptr_t> storage;
+
+  const uintptr_t* Plane(uint32_t plane_idx) const {
+    return &(storage[static_cast<size_t>(plane_idx) * word_ct]);
+  }
 };
 
 std::vector<VariantBlock> BuildBlocks(
@@ -160,6 +173,93 @@ uint32_t IndependentGenotypes(const uint32_t* counts,
     }
   }
   return independent_ct;
+}
+
+uintptr_t InverseMatchWord(uint32_t genotype) {
+  if (!genotype) {
+    return ~static_cast<uintptr_t>(0);
+  }
+  if (genotype == 1) {
+    return kMaskAAAA;
+  }
+  if (genotype == 2) {
+    return kMask5555;
+  }
+  return 0;
+}
+
+void BuildPackedGenotypePlanes(
+    const uintptr_t* genovec, const uint32_t* counts,
+    uint32_t sample_ct, PackedGenotypePlanes* planes) {
+  planes->baseline = static_cast<uint8_t>(
+      MostFrequentGenotype(counts));
+  planes->independent_ct = static_cast<uint8_t>(
+      IndependentGenotypes(
+          counts, planes->baseline, planes->independent.data()));
+  planes->word_ct = BitCtToWordCt(sample_ct);
+  planes->storage.resize(
+      static_cast<size_t>(planes->independent_ct) * planes->word_ct);
+  const uint32_t genovec_word_ct = NypCtToWordCt(sample_ct);
+  for (uint32_t plane_idx = 0;
+       plane_idx != planes->independent_ct; ++plane_idx) {
+    uintptr_t* plane =
+        &(planes->storage[
+            static_cast<size_t>(plane_idx) * planes->word_ct]);
+    std::fill(plane, &(plane[planes->word_ct]), 0);
+    PackWordsToHalfwordsInvmatch(
+        genovec,
+        InverseMatchWord(planes->independent[plane_idx]),
+        genovec_word_ct, plane);
+    ZeroTrailingBits(sample_ct, plane);
+  }
+}
+
+void ReconstructJointGenotypes(
+    const uint32_t* anchor_counts, const uint32_t* target_counts,
+    uint32_t anchor_baseline, uint32_t target_baseline,
+    uint32_t* joint_counts) {
+  for (uint32_t anchor_genotype = 0; anchor_genotype != 4;
+       ++anchor_genotype) {
+    if (anchor_genotype == anchor_baseline) {
+      continue;
+    }
+    uint32_t known = 0;
+    for (uint32_t target_genotype = 0; target_genotype != 4;
+         ++target_genotype) {
+      if (target_genotype != target_baseline) {
+        known +=
+            joint_counts[4 * anchor_genotype + target_genotype];
+      }
+    }
+    joint_counts[4 * anchor_genotype + target_baseline] =
+        anchor_counts[anchor_genotype] - known;
+  }
+  for (uint32_t target_genotype = 0; target_genotype != 4;
+       ++target_genotype) {
+    if (target_genotype == target_baseline) {
+      continue;
+    }
+    uint32_t known = 0;
+    for (uint32_t anchor_genotype = 0; anchor_genotype != 4;
+         ++anchor_genotype) {
+      if (anchor_genotype != anchor_baseline) {
+        known +=
+            joint_counts[4 * anchor_genotype + target_genotype];
+      }
+    }
+    joint_counts[4 * anchor_baseline + target_genotype] =
+        target_counts[target_genotype] - known;
+  }
+  uint32_t known = 0;
+  for (uint32_t target_genotype = 0; target_genotype != 4;
+       ++target_genotype) {
+    if (target_genotype != target_baseline) {
+      known +=
+          joint_counts[4 * anchor_baseline + target_genotype];
+    }
+  }
+  joint_counts[4 * anchor_baseline + target_baseline] =
+      anchor_counts[anchor_baseline] - known;
 }
 
 #ifdef PGEN_RANS_VERIFY_FAST_COUNTS
@@ -304,48 +404,9 @@ void CountJointGenotypes(const uintptr_t* anchor, const uintptr_t* target,
       }
     }
   }
-  for (uint32_t anchor_genotype = 0; anchor_genotype != 4;
-       ++anchor_genotype) {
-    if (anchor_genotype == anchor_baseline) {
-      continue;
-    }
-    uint32_t known = 0;
-    for (uint32_t target_genotype = 0; target_genotype != 4;
-         ++target_genotype) {
-      if (target_genotype != target_baseline) {
-        known +=
-            joint_counts[4 * anchor_genotype + target_genotype];
-      }
-    }
-    joint_counts[4 * anchor_genotype + target_baseline] =
-        anchor_counts[anchor_genotype] - known;
-  }
-  for (uint32_t target_genotype = 0; target_genotype != 4;
-       ++target_genotype) {
-    if (target_genotype == target_baseline) {
-      continue;
-    }
-    uint32_t known = 0;
-    for (uint32_t anchor_genotype = 0; anchor_genotype != 4;
-         ++anchor_genotype) {
-      if (anchor_genotype != anchor_baseline) {
-        known +=
-            joint_counts[4 * anchor_genotype + target_genotype];
-      }
-    }
-    joint_counts[4 * anchor_baseline + target_genotype] =
-        target_counts[target_genotype] - known;
-  }
-  uint32_t known = 0;
-  for (uint32_t target_genotype = 0; target_genotype != 4;
-       ++target_genotype) {
-    if (target_genotype != target_baseline) {
-      known +=
-          joint_counts[4 * anchor_baseline + target_genotype];
-    }
-  }
-  joint_counts[4 * anchor_baseline + target_baseline] =
-      anchor_counts[anchor_baseline] - known;
+  ReconstructJointGenotypes(
+      anchor_counts, target_counts, anchor_baseline, target_baseline,
+      joint_counts);
 #ifdef PGEN_RANS_VERIFY_FAST_COUNTS
   uint32_t reference_counts[16];
   CountJointGenotypesReference(
@@ -356,67 +417,42 @@ void CountJointGenotypes(const uintptr_t* anchor, const uintptr_t* target,
 #endif
 }
 
-void CountTripleGenotypes(
-    const uintptr_t* anchor1, const uintptr_t* anchor2,
-    const uintptr_t* target, uint32_t sample_ct,
-    const uint32_t* anchor1_counts, const uint32_t* anchor2_counts,
-    const uint32_t* target_counts, const uint32_t* anchor_pair_counts,
-    const uint32_t* anchor1_target_counts,
-    const uint32_t* anchor2_target_counts, uint32_t* triple_counts) {
-  std::fill(triple_counts, &(triple_counts[64]), 0U);
-  const uint32_t anchor1_baseline =
-      MostFrequentGenotype(anchor1_counts);
-  const uint32_t anchor2_baseline =
-      MostFrequentGenotype(anchor2_counts);
-  const uint32_t target_baseline =
-      MostFrequentGenotype(target_counts);
-  uint8_t independent_anchor1[3];
-  uint8_t independent_anchor2[3];
-  uint8_t independent_targets[3];
-  const uint32_t independent_anchor1_ct =
-      IndependentGenotypes(anchor1_counts, anchor1_baseline,
-                           independent_anchor1);
-  const uint32_t independent_anchor2_ct =
-      IndependentGenotypes(anchor2_counts, anchor2_baseline,
-                           independent_anchor2);
-  const uint32_t independent_target_ct =
-      IndependentGenotypes(target_counts, target_baseline,
-                           independent_targets);
-  const uint32_t word_ct = NypCtToWordCt(sample_ct);
-  const uint32_t trailing_sample_ct = sample_ct % kBitsPerWordD2;
-  for (uint32_t word_idx = 0; word_idx != word_ct; ++word_idx) {
-    uintptr_t valid_mask = kMask5555;
-    if (trailing_sample_ct && (word_idx + 1 == word_ct)) {
-      valid_mask = bzhi(kMask5555, 2 * trailing_sample_ct);
-    }
-    uintptr_t masks[3][4];
-    BuildGenotypeMasks(anchor1[word_idx], valid_mask, masks[0]);
-    BuildGenotypeMasks(anchor2[word_idx], valid_mask, masks[1]);
-    BuildGenotypeMasks(target[word_idx], valid_mask, masks[2]);
-    for (uint32_t anchor1_idx = 0;
-         anchor1_idx != independent_anchor1_ct; ++anchor1_idx) {
-      const uint32_t anchor1_genotype =
-          independent_anchor1[anchor1_idx];
-      for (uint32_t anchor2_idx = 0;
-           anchor2_idx != independent_anchor2_ct; ++anchor2_idx) {
-        const uint32_t anchor2_genotype =
-            independent_anchor2[anchor2_idx];
-        const uintptr_t references =
-            masks[0][anchor1_genotype] &
-            masks[1][anchor2_genotype];
-        for (uint32_t target_idx = 0;
-             target_idx != independent_target_ct; ++target_idx) {
-          const uint32_t target_genotype =
-              independent_targets[target_idx];
-          triple_counts[
-              16 * anchor1_genotype + 4 * anchor2_genotype +
-              target_genotype] +=
-              PopcountWord(references & masks[2][target_genotype]);
-        }
+void CountJointGenotypesPacked(
+    const PackedGenotypePlanes& anchor,
+    const PackedGenotypePlanes& target,
+    const uint32_t* anchor_counts, const uint32_t* target_counts,
+    uint32_t* joint_counts) {
+  std::fill(joint_counts, &(joint_counts[16]), 0U);
+  for (uint32_t anchor_idx = 0;
+       anchor_idx != anchor.independent_ct; ++anchor_idx) {
+    const uintptr_t* anchor_plane = anchor.Plane(anchor_idx);
+    const uint32_t anchor_genotype =
+        anchor.independent[anchor_idx];
+    for (uint32_t target_idx = 0;
+         target_idx != target.independent_ct; ++target_idx) {
+      const uintptr_t* target_plane = target.Plane(target_idx);
+      uint32_t count = 0;
+      for (uint32_t word_idx = 0; word_idx != anchor.word_ct;
+           ++word_idx) {
+        count += PopcountWord(
+            anchor_plane[word_idx] & target_plane[word_idx]);
       }
+      joint_counts[
+          4 * anchor_genotype + target.independent[target_idx]] =
+          count;
     }
   }
+  ReconstructJointGenotypes(
+      anchor_counts, target_counts, anchor.baseline, target.baseline,
+      joint_counts);
+}
 
+void ReconstructTripleGenotypes(
+    const uint32_t* anchor_pair_counts,
+    const uint32_t* anchor1_target_counts,
+    const uint32_t* anchor2_target_counts,
+    uint32_t anchor1_baseline, uint32_t anchor2_baseline,
+    uint32_t target_baseline, uint32_t* triple_counts) {
   for (uint32_t anchor1_genotype = 0; anchor1_genotype != 4;
        ++anchor1_genotype) {
     if (anchor1_genotype == anchor1_baseline) {
@@ -576,6 +612,72 @@ void CountTripleGenotypes(
       anchor_pair_counts[
           4 * anchor1_baseline + anchor2_baseline] -
       known;
+}
+
+void CountTripleGenotypes(
+    const uintptr_t* anchor1, const uintptr_t* anchor2,
+    const uintptr_t* target, uint32_t sample_ct,
+    const uint32_t* anchor1_counts, const uint32_t* anchor2_counts,
+    const uint32_t* target_counts, const uint32_t* anchor_pair_counts,
+    const uint32_t* anchor1_target_counts,
+    const uint32_t* anchor2_target_counts, uint32_t* triple_counts) {
+  std::fill(triple_counts, &(triple_counts[64]), 0U);
+  const uint32_t anchor1_baseline =
+      MostFrequentGenotype(anchor1_counts);
+  const uint32_t anchor2_baseline =
+      MostFrequentGenotype(anchor2_counts);
+  const uint32_t target_baseline =
+      MostFrequentGenotype(target_counts);
+  uint8_t independent_anchor1[3];
+  uint8_t independent_anchor2[3];
+  uint8_t independent_targets[3];
+  const uint32_t independent_anchor1_ct =
+      IndependentGenotypes(anchor1_counts, anchor1_baseline,
+                           independent_anchor1);
+  const uint32_t independent_anchor2_ct =
+      IndependentGenotypes(anchor2_counts, anchor2_baseline,
+                           independent_anchor2);
+  const uint32_t independent_target_ct =
+      IndependentGenotypes(target_counts, target_baseline,
+                           independent_targets);
+  const uint32_t word_ct = NypCtToWordCt(sample_ct);
+  const uint32_t trailing_sample_ct = sample_ct % kBitsPerWordD2;
+  for (uint32_t word_idx = 0; word_idx != word_ct; ++word_idx) {
+    uintptr_t valid_mask = kMask5555;
+    if (trailing_sample_ct && (word_idx + 1 == word_ct)) {
+      valid_mask = bzhi(kMask5555, 2 * trailing_sample_ct);
+    }
+    uintptr_t masks[3][4];
+    BuildGenotypeMasks(anchor1[word_idx], valid_mask, masks[0]);
+    BuildGenotypeMasks(anchor2[word_idx], valid_mask, masks[1]);
+    BuildGenotypeMasks(target[word_idx], valid_mask, masks[2]);
+    for (uint32_t anchor1_idx = 0;
+         anchor1_idx != independent_anchor1_ct; ++anchor1_idx) {
+      const uint32_t anchor1_genotype =
+          independent_anchor1[anchor1_idx];
+      for (uint32_t anchor2_idx = 0;
+           anchor2_idx != independent_anchor2_ct; ++anchor2_idx) {
+        const uint32_t anchor2_genotype =
+            independent_anchor2[anchor2_idx];
+        const uintptr_t references =
+            masks[0][anchor1_genotype] &
+            masks[1][anchor2_genotype];
+        for (uint32_t target_idx = 0;
+             target_idx != independent_target_ct; ++target_idx) {
+          const uint32_t target_genotype =
+              independent_targets[target_idx];
+          triple_counts[
+              16 * anchor1_genotype + 4 * anchor2_genotype +
+              target_genotype] +=
+              PopcountWord(references & masks[2][target_genotype]);
+        }
+      }
+    }
+  }
+  ReconstructTripleGenotypes(
+      anchor_pair_counts, anchor1_target_counts,
+      anchor2_target_counts, anchor1_baseline, anchor2_baseline,
+      target_baseline, triple_counts);
 #ifdef PGEN_RANS_VERIFY_FAST_COUNTS
   uint32_t reference_counts[64];
   CountTripleGenotypesReference(
@@ -583,6 +685,89 @@ void CountTripleGenotypes(
   assert(std::equal(
       triple_counts, &(triple_counts[64]), reference_counts));
 #endif
+}
+
+void CountTripleGenotypesPacked(
+    const PackedGenotypePlanes& anchor1,
+    const PackedGenotypePlanes& anchor2,
+    const PackedGenotypePlanes& target,
+    const uint32_t* anchor_pair_counts,
+    const uint32_t* anchor1_target_counts,
+    const uint32_t* anchor2_target_counts,
+    uint32_t* triple_counts) {
+  std::fill(triple_counts, &(triple_counts[64]), 0U);
+  const uintptr_t* anchor1_planes[3] = {};
+  const uintptr_t* anchor2_planes[3] = {};
+  const uintptr_t* target_planes[3] = {};
+  for (uint32_t anchor1_idx = 0;
+       anchor1_idx != anchor1.independent_ct; ++anchor1_idx) {
+    anchor1_planes[anchor1_idx] = anchor1.Plane(anchor1_idx);
+  }
+  for (uint32_t anchor2_idx = 0;
+       anchor2_idx != anchor2.independent_ct; ++anchor2_idx) {
+    anchor2_planes[anchor2_idx] = anchor2.Plane(anchor2_idx);
+  }
+  for (uint32_t target_idx = 0;
+       target_idx != target.independent_ct; ++target_idx) {
+    target_planes[target_idx] = target.Plane(target_idx);
+  }
+  uint32_t core_counts[27] = {};
+  for (uint32_t word_idx = 0; word_idx != anchor1.word_ct;
+       ++word_idx) {
+    uintptr_t anchor1_words[3];
+    uintptr_t anchor2_words[3];
+    uintptr_t target_words[3];
+    for (uint32_t anchor1_idx = 0;
+         anchor1_idx != anchor1.independent_ct; ++anchor1_idx) {
+      anchor1_words[anchor1_idx] =
+          anchor1_planes[anchor1_idx][word_idx];
+    }
+    for (uint32_t anchor2_idx = 0;
+         anchor2_idx != anchor2.independent_ct; ++anchor2_idx) {
+      anchor2_words[anchor2_idx] =
+          anchor2_planes[anchor2_idx][word_idx];
+    }
+    for (uint32_t target_idx = 0;
+         target_idx != target.independent_ct; ++target_idx) {
+      target_words[target_idx] = target_planes[target_idx][word_idx];
+    }
+    for (uint32_t anchor1_idx = 0;
+         anchor1_idx != anchor1.independent_ct; ++anchor1_idx) {
+      for (uint32_t anchor2_idx = 0;
+           anchor2_idx != anchor2.independent_ct; ++anchor2_idx) {
+        const uintptr_t references =
+            anchor1_words[anchor1_idx] & anchor2_words[anchor2_idx];
+        for (uint32_t target_idx = 0;
+             target_idx != target.independent_ct; ++target_idx) {
+          core_counts[
+              9 * anchor1_idx + 3 * anchor2_idx + target_idx] +=
+              PopcountWord(references & target_words[target_idx]);
+        }
+      }
+    }
+  }
+  for (uint32_t anchor1_idx = 0;
+       anchor1_idx != anchor1.independent_ct; ++anchor1_idx) {
+    const uint32_t anchor1_genotype =
+        anchor1.independent[anchor1_idx];
+    for (uint32_t anchor2_idx = 0;
+         anchor2_idx != anchor2.independent_ct; ++anchor2_idx) {
+      const uint32_t anchor2_genotype =
+          anchor2.independent[anchor2_idx];
+      for (uint32_t target_idx = 0;
+           target_idx != target.independent_ct; ++target_idx) {
+        triple_counts[
+            16 * anchor1_genotype + 4 * anchor2_genotype +
+            target.independent[target_idx]] =
+            core_counts[
+                9 * anchor1_idx + 3 * anchor2_idx + target_idx];
+      }
+    }
+  }
+  ReconstructTripleGenotypes(
+      anchor_pair_counts, anchor1_target_counts,
+      anchor2_target_counts, anchor1.baseline, anchor2.baseline,
+      target.baseline, triple_counts);
 }
 
 uint64_t SparseExceptionCt(const uint32_t* counts, RecordMode mode) {
@@ -644,6 +829,9 @@ bool EncodeVariant(const uintptr_t* target,
                    uint32_t genovec_word_stride, uint32_t sample_ct,
                    const std::vector<uint32_t>& anchor_offsets,
                    const std::vector<std::array<uint32_t, 4>>& counts,
+                   const std::vector<PackedGenotypePlanes>*
+                       anchor_plane_cache,
+                   PackedGenotypePlanes* target_plane_scratch,
                    const VariantMetadata* metadata,
                    const EncodeParams& params,
                    const CodecParams& codec_params, bool is_anchor,
@@ -656,8 +844,15 @@ bool EncodeVariant(const uintptr_t* target,
     return false;
   }
 
+  const bool use_packed_planes =
+      (!is_anchor) && anchor_plane_cache && target_plane_scratch;
   std::vector<AnchorCandidate> candidates;
   if (!is_anchor) {
+    if (use_packed_planes) {
+      BuildPackedGenotypePlanes(
+          target, target_counts.data(), sample_ct,
+          target_plane_scratch);
+    }
     candidates.reserve(anchor_offsets.size());
     for (uint32_t anchor_ordinal = 0;
          anchor_ordinal != anchor_offsets.size(); ++anchor_ordinal) {
@@ -671,9 +866,16 @@ bool EncodeVariant(const uintptr_t* target,
           &(block_genovecs[static_cast<uintptr_t>(anchor_offset) *
                             genovec_word_stride]);
       uint32_t joint_counts[16];
-      CountJointGenotypes(
-          anchor, target, sample_ct, counts[anchor_offset].data(),
-          target_counts.data(), joint_counts);
+      if (use_packed_planes) {
+        CountJointGenotypesPacked(
+            (*anchor_plane_cache)[anchor_ordinal],
+            *target_plane_scratch, counts[anchor_offset].data(),
+            target_counts.data(), joint_counts);
+      } else {
+        CountJointGenotypes(
+            anchor, target, sample_ct, counts[anchor_offset].data(),
+            target_counts.data(), joint_counts);
+      }
       uint64_t estimated_bytes;
       if (!EstimateRecordBytes(
               joint_counts, RecordMode::kOneReference, codec_params,
@@ -745,19 +947,44 @@ bool EncodeVariant(const uintptr_t* target,
                                   candidates[second_idx].offset) *
                               genovec_word_stride]);
         uint32_t anchor_pair_counts[16];
-        CountJointGenotypes(
-            anchor1, anchor2, sample_ct,
-            counts[candidates[first_idx].offset].data(),
-            counts[candidates[second_idx].offset].data(),
-            anchor_pair_counts);
+        if (use_packed_planes) {
+          CountJointGenotypesPacked(
+              (*anchor_plane_cache)[candidates[first_idx].ordinal],
+              (*anchor_plane_cache)[candidates[second_idx].ordinal],
+              counts[candidates[first_idx].offset].data(),
+              counts[candidates[second_idx].offset].data(),
+              anchor_pair_counts);
+        } else {
+          CountJointGenotypes(
+              anchor1, anchor2, sample_ct,
+              counts[candidates[first_idx].offset].data(),
+              counts[candidates[second_idx].offset].data(),
+              anchor_pair_counts);
+        }
         uint32_t triple_counts[64];
-        CountTripleGenotypes(
-            anchor1, anchor2, target, sample_ct,
-            counts[candidates[first_idx].offset].data(),
-            counts[candidates[second_idx].offset].data(),
-            target_counts.data(), anchor_pair_counts,
-            candidates[first_idx].joint_counts.data(),
-            candidates[second_idx].joint_counts.data(), triple_counts);
+        if (use_packed_planes) {
+          CountTripleGenotypesPacked(
+              (*anchor_plane_cache)[candidates[first_idx].ordinal],
+              (*anchor_plane_cache)[candidates[second_idx].ordinal],
+              *target_plane_scratch, anchor_pair_counts,
+              candidates[first_idx].joint_counts.data(),
+              candidates[second_idx].joint_counts.data(), triple_counts);
+#ifdef PGEN_RANS_VERIFY_FAST_COUNTS
+          uint32_t reference_counts[64];
+          CountTripleGenotypesReference(
+              anchor1, anchor2, target, sample_ct, reference_counts);
+          assert(std::equal(
+              triple_counts, &(triple_counts[64]), reference_counts));
+#endif
+        } else {
+          CountTripleGenotypes(
+              anchor1, anchor2, target, sample_ct,
+              counts[candidates[first_idx].offset].data(),
+              counts[candidates[second_idx].offset].data(),
+              target_counts.data(), anchor_pair_counts,
+              candidates[first_idx].joint_counts.data(),
+              candidates[second_idx].joint_counts.data(), triple_counts);
+        }
         uint64_t estimated_bytes;
         if (!EstimateRecordBytes(
                 triple_counts, RecordMode::kTwoReference, codec_params,
@@ -1244,6 +1471,22 @@ PglErr EncodePgenRans(const std::string& output_path,
     for (const uint32_t anchor_offset : anchor_offsets) {
       is_anchor[anchor_offset] = 1;
     }
+    const bool use_packed_planes = input.sample_ct >= 4096;
+    std::vector<PackedGenotypePlanes> anchor_plane_cache;
+    if (use_packed_planes) {
+      anchor_plane_cache.resize(anchor_offsets.size());
+      for (uint32_t anchor_ordinal = 0;
+           anchor_ordinal != anchor_offsets.size(); ++anchor_ordinal) {
+        const uint32_t anchor_offset =
+            anchor_offsets[anchor_ordinal];
+        BuildPackedGenotypePlanes(
+            &(block_genovecs[
+                static_cast<uintptr_t>(anchor_offset) *
+                genovec_word_stride]),
+            counts[anchor_offset].data(), input.sample_ct,
+            &(anchor_plane_cache[anchor_ordinal]));
+      }
+    }
     EncodedBlock block;
     block.first_variant = block_range.start;
     block.records.resize(block_range.len);
@@ -1257,6 +1500,7 @@ PglErr EncodePgenRans(const std::string& output_path,
     workers.reserve(worker_ct);
     for (uint32_t worker_idx = 0; worker_idx != worker_ct; ++worker_idx) {
       workers.emplace_back([&]() {
+        PackedGenotypePlanes target_plane_scratch;
         uint32_t offset;
         while ((!failed.load(std::memory_order_relaxed)) &&
                ((offset = next_offset.fetch_add(
@@ -1269,6 +1513,8 @@ PglErr EncodePgenRans(const std::string& output_path,
                   target, counts[offset], block_range.start + offset,
                   block_range.start, block_genovecs, genovec_word_stride,
                   input.sample_ct, anchor_offsets, counts,
+                  use_packed_planes ? &anchor_plane_cache : nullptr,
+                  use_packed_planes ? &target_plane_scratch : nullptr,
                   input.variant_metadata, params, codec_params,
                   is_anchor[offset], &(block.records[offset]),
                   &local_error)) {
