@@ -8,6 +8,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <fstream>
+#include <random>
 #include <sstream>
 #include <string>
 #include <sys/stat.h>
@@ -20,6 +21,7 @@
 #include "include/plink2_base.h"
 #include "include/plink2_bits.h"
 #include "pgen_rans_codec.h"
+#include "pgen_rans_benchmark.h"
 #include "pgen_rans_container.h"
 #include "pgen_rans_cpu.h"
 #include "pgen_rans_encode.h"
@@ -28,6 +30,7 @@ namespace {
 
 using namespace plink2;
 using pgen_rans::CodecParams;
+using pgen_rans::BlockIndexEntry;
 using pgen_rans::ContainerParams;
 using pgen_rans::ContainerReader;
 using pgen_rans::CpuBlockDecoder;
@@ -60,12 +63,16 @@ struct Options {
   uint32_t two_ref_shortlist = 4;
   uint64_t max_anchor_bp = 1000000;
   uint32_t restart_variant_ct = 64;
-  uint32_t rans_state_ct = 32;
+  uint32_t rans_state_ct = 0;
   uint32_t rans_scale_bits = 12;
   uint32_t thread_ct = 0;
   uint32_t variant_limit = UINT32_MAX;
   uint32_t benchmark_block_ct = 80;
-  uint32_t benchmark_iteration_ct = 1;
+  uint32_t benchmark_iteration_ct = 0;
+  uint32_t benchmark_warmup_ct = 2;
+  uint32_t benchmark_run_ct = 7;
+  uint64_t benchmark_seed = 17817764168754780924ULL;
+  bool enable_alternate_records = true;
 };
 
 struct PvarData {
@@ -87,8 +94,9 @@ void PrintUsage(FILE* out) {
       "  --two-ref-shortlist <n>    Pair the n best single anchors; 0 disables (default 4).\n"
       "  --max-anchor-bp <n>        Maximum reference distance (default 1000000).\n"
       "  --restart-variants <n>     Record-offset restart interval (default 64).\n"
-      "  --rans-states <n>          Independent rANS lanes (default 32).\n"
+      "  --rans-states <auto|n>     Independent rANS lanes (default auto: 16 on ARM64; x86 uses 16 small/32 large).\n"
       "  --rans-scale-bits <n>      Frequency precision, 8..16 (default 12).\n"
+      "  --alternate-modes <on|off> Enable exact raw/sparse record selection (default on).\n"
       "  --threads <n>              Reference-selection threads (default hardware count).\n"
       "  --variant-limit <n>        Encode only the first n variants.\n"
       "\n"
@@ -100,7 +108,10 @@ void PrintUsage(FILE* out) {
       "  --pvar <file>              Optional plain-text PVAR schema.\n"
       "  --threads <n>              Persistent CPU decoder workers.\n"
       "  --blocks <n>               Deterministic block strata (default 80).\n"
-      "  --iterations <n>           Decode passes per fetched block (default 1).\n",
+      "  --iterations <n>           Full passes/run (default auto, >=50 ms).\n"
+      "  --warmup <n>               Untimed A/B passes (default 2).\n"
+      "  --runs <n>                 Randomized timing runs (default 7).\n"
+      "  --seed <n>                 Reproducible 64-bit order seed.\n",
       out);
 }
 
@@ -205,7 +216,9 @@ bool ParseOptions(int argc, char** argv, Options* opts) {
         return false;
       }
     } else if (!strcmp(arg, "--rans-states")) {
-      if (!ParseU32(value, 1, 256, &(opts->rans_state_ct))) {
+      if (!strcmp(value, "auto")) {
+        opts->rans_state_ct = 0;
+      } else if (!ParseU32(value, 1, 256, &(opts->rans_state_ct))) {
         fprintf(stderr, "Error: Invalid --rans-states value '%s'.\n", value);
         return false;
       }
@@ -213,6 +226,16 @@ bool ParseOptions(int argc, char** argv, Options* opts) {
       if (!ParseU32(value, 8, 16, &(opts->rans_scale_bits))) {
         fprintf(stderr, "Error: Invalid --rans-scale-bits value '%s'.\n",
                 value);
+        return false;
+      }
+    } else if (!strcmp(arg, "--alternate-modes")) {
+      if (!strcmp(value, "on")) {
+        opts->enable_alternate_records = true;
+      } else if (!strcmp(value, "off")) {
+        opts->enable_alternate_records = false;
+      } else {
+        fprintf(stderr,
+                "Error: Invalid --alternate-modes value '%s'.\n", value);
         return false;
       }
     } else if (!strcmp(arg, "--threads")) {
@@ -240,6 +263,27 @@ bool ParseOptions(int argc, char** argv, Options* opts) {
         fprintf(stderr, "Error: Invalid --iterations value '%s'.\n", value);
         return false;
       }
+    } else if (!strcmp(arg, "--warmup")) {
+      if ((opts->command != "benchmark") ||
+          (!ParseU32(value, 1, 100,
+                     &(opts->benchmark_warmup_ct)))) {
+        fprintf(stderr, "Error: Invalid --warmup value '%s'.\n", value);
+        return false;
+      }
+    } else if (!strcmp(arg, "--runs")) {
+      if ((opts->command != "benchmark") ||
+          (!ParseU32(value, 1, 101,
+                     &(opts->benchmark_run_ct)))) {
+        fprintf(stderr, "Error: Invalid --runs value '%s'.\n", value);
+        return false;
+      }
+    } else if (!strcmp(arg, "--seed")) {
+      if ((opts->command != "benchmark") ||
+          (!ParseU64(value, 0, UINT64_MAX,
+                     &(opts->benchmark_seed)))) {
+        fprintf(stderr, "Error: Invalid --seed value '%s'.\n", value);
+        return false;
+      }
     } else {
       fprintf(stderr, "Error: Unknown option '%s'.\n", arg);
       return false;
@@ -250,8 +294,8 @@ bool ParseOptions(int argc, char** argv, Options* opts) {
         (opts->two_ref_shortlist != 4) ||
         (opts->max_anchor_bp != 1000000) ||
         (opts->restart_variant_ct != 64) ||
-        (opts->rans_state_ct != 32) || (opts->rans_scale_bits != 12) ||
-        opts->thread_ct) {
+        opts->rans_state_ct || (opts->rans_scale_bits != 12) ||
+        opts->thread_ct || (!opts->enable_alternate_records)) {
       fputs(
           "Error: verify accepts only --pvar and --variant-limit.\n",
           stderr);
@@ -262,11 +306,12 @@ bool ParseOptions(int argc, char** argv, Options* opts) {
         (opts->two_ref_shortlist != 4) ||
         (opts->max_anchor_bp != 1000000) ||
         (opts->restart_variant_ct != 64) ||
-        (opts->rans_state_ct != 32) || (opts->rans_scale_bits != 12) ||
-        (opts->variant_limit != UINT32_MAX)) {
+        opts->rans_state_ct || (opts->rans_scale_bits != 12) ||
+        (opts->variant_limit != UINT32_MAX) ||
+        (!opts->enable_alternate_records)) {
       fputs(
           "Error: benchmark accepts only --pvar, --threads, --blocks, "
-          "and --iterations.\n",
+          "--iterations, --warmup, --runs, and --seed.\n",
           stderr);
       return false;
     }
@@ -684,6 +729,7 @@ int Encode(const Options& opts) {
   params.rans_state_ct = opts.rans_state_ct;
   params.rans_scale_bits = opts.rans_scale_bits;
   params.thread_ct = opts.thread_ct;
+  params.enable_alternate_records = opts.enable_alternate_records;
   EncodeStats stats;
   if (EncodePgenRans(opts.output_fname, input, params, &stats, &error)) {
     fprintf(stderr, "\nError: %s\n", error.c_str());
@@ -701,6 +747,14 @@ int Encode(const Options& opts) {
          static_cast<unsigned long long>(stats.one_reference_ct));
   printf("  two-reference records:   %llu\n",
          static_cast<unsigned long long>(stats.two_reference_ct));
+  printf("  entropy-rANS records:    %llu\n",
+         static_cast<unsigned long long>(stats.entropy_rans_ct));
+  printf("  deterministic records:   %llu\n",
+         static_cast<unsigned long long>(stats.deterministic_rans_ct));
+  printf("  raw-packed records:      %llu\n",
+         static_cast<unsigned long long>(stats.raw_packed_ct));
+  printf("  sparse-predictor records: %llu\n",
+         static_cast<unsigned long long>(stats.sparse_predictor_ct));
   printf("  multiallelic variants:   %llu\n",
          static_cast<unsigned long long>(stats.multiallelic_ct));
   printf("  ref/ALT patches:         %llu\n",
@@ -785,6 +839,10 @@ int Verify(const Options& opts) {
   uint64_t marginal_ct = 0;
   uint64_t one_reference_ct = 0;
   uint64_t two_reference_ct = 0;
+  uint64_t entropy_rans_ct = 0;
+  uint64_t deterministic_rans_ct = 0;
+  uint64_t raw_packed_ct = 0;
+  uint64_t sparse_predictor_ct = 0;
   uint64_t multiallelic_ct = 0;
   uint32_t verified_ct = 0;
   const auto start_time = std::chrono::steady_clock::now();
@@ -873,6 +931,15 @@ int Verify(const Options& opts) {
       } else {
         ++two_reference_ct;
       }
+      if (metadata.is_raw_packed) {
+        ++raw_packed_ct;
+      } else if (metadata.is_sparse_predictor) {
+        ++sparse_predictor_ct;
+      } else if (metadata.has_entropy_payload) {
+        ++entropy_rans_ct;
+      } else {
+        ++deterministic_rans_ct;
+      }
       ++verified_ct;
     }
     if (!(verified_ct % 10000) || (verified_ct == verify_variant_ct)) {
@@ -894,6 +961,14 @@ int Verify(const Options& opts) {
            static_cast<unsigned long long>(one_reference_ct));
     printf("  two-reference records:   %llu\n",
            static_cast<unsigned long long>(two_reference_ct));
+    printf("  entropy-rANS records:    %llu\n",
+           static_cast<unsigned long long>(entropy_rans_ct));
+    printf("  deterministic records:   %llu\n",
+           static_cast<unsigned long long>(deterministic_rans_ct));
+    printf("  raw-packed records:      %llu\n",
+           static_cast<unsigned long long>(raw_packed_ct));
+    printf("  sparse-predictor records: %llu\n",
+           static_cast<unsigned long long>(sparse_predictor_ct));
     printf("  multiallelic variants:   %llu\n",
            static_cast<unsigned long long>(multiallelic_ct));
     printf("  elapsed seconds:         %.3f\n", elapsed_seconds);
@@ -973,65 +1048,85 @@ int Benchmark(const Options& opts) {
   uint64_t pgr_block_bytes = 0;
   uint64_t benchmark_variant_ct = 0;
   uint64_t checksum = 0;
-  double pgen_seconds = 0.0;
-  double pgr_read_seconds = 0.0;
-  double pgr_decode_seconds = 0.0;
   std::vector<uint8_t> block_storage;
   std::vector<uint64_t> decoded;
-  uint32_t completed_block_ct = 0;
+  std::vector<double> pgen_timing_samples;
+  std::vector<double> pgr_read_timing_samples;
+  std::vector<double> pgr_decode_timing_samples;
+  std::vector<double> pgr_total_timing_samples;
+  pgen_timing_samples.reserve(opts.benchmark_run_ct);
+  pgr_read_timing_samples.reserve(opts.benchmark_run_ct);
+  pgr_decode_timing_samples.reserve(opts.benchmark_run_ct);
+  pgr_total_timing_samples.reserve(opts.benchmark_run_ct);
+  uint32_t effective_iteration_ct = opts.benchmark_iteration_ct;
+  double calibration_pgen_seconds = 0.0;
+  double calibration_pgr_seconds = 0.0;
   int return_code = 1;
+
   for (const uint32_t block_idx : selected_blocks) {
+    const BlockIndexEntry& entry = reader.block_index()[block_idx];
+    for (uint32_t variant_offset = 0;
+         variant_offset != entry.variant_ct; ++variant_offset) {
+      pgen_payload_bytes +=
+          pgen.record_byte_ct(entry.first_variant + variant_offset);
+    }
+    pgr_block_bytes += entry.byte_ct;
+    benchmark_variant_ct += entry.variant_ct;
+  }
+
+  const auto run_pgen_block =
+      [&](uint32_t block_idx, double* seconds) -> bool {
+    const BlockIndexEntry& entry = reader.block_index()[block_idx];
+    const auto start = std::chrono::steady_clock::now();
+    for (uint32_t variant_offset = 0;
+         variant_offset != entry.variant_ct; ++variant_offset) {
+      uintptr_t* target =
+          pgen_block_genovecs +
+          static_cast<size_t>(variant_offset) * pgen_word_stride;
+      if (!pgen.Read(entry.first_variant + variant_offset, target,
+                     &error)) {
+        return false;
+      }
+    }
+    *seconds +=
+        std::chrono::duration<double>(
+            std::chrono::steady_clock::now() - start)
+            .count();
+    return true;
+  };
+  const auto run_pgr_block =
+      [&](uint32_t block_idx, double* read_seconds,
+          double* decode_seconds) -> bool {
     EncodedBlockView block;
     const auto read_start = std::chrono::steady_clock::now();
-    if (!reader.ReadBlockView(block_idx, &block_storage, &block, &error)) {
-      fprintf(stderr, "\nError: %s\n", error.c_str());
-      goto cleanup;
+    if (!reader.ReadBlockView(
+            block_idx, &block_storage, &block, &error)) {
+      return false;
     }
-    pgr_read_seconds +=
+    *read_seconds +=
         std::chrono::duration<double>(
             std::chrono::steady_clock::now() - read_start)
             .count();
-    const size_t decoded_word_ct =
-        static_cast<size_t>(block.variant_ct()) * packed_word_ct;
-    decoded.resize(decoded_word_ct);
-    for (uint32_t iteration_idx = 0;
-         iteration_idx != opts.benchmark_iteration_ct; ++iteration_idx) {
-      const auto decode_start = std::chrono::steady_clock::now();
-      if (!cpu_decoder.Decode(block, params.sample_ct, codec_params,
-                              decoded.data(), decoded.size(), &error)) {
-        fprintf(stderr, "\nError: %s\n", error.c_str());
-        goto cleanup;
-      }
-      pgr_decode_seconds +=
-          std::chrono::duration<double>(
-              std::chrono::steady_clock::now() - decode_start)
-              .count();
-      checksum ^=
-          decoded[(static_cast<size_t>(iteration_idx) +
-                   block.first_variant()) %
-                  decoded.size()];
+    decoded.resize(
+        static_cast<size_t>(block.variant_ct()) * packed_word_ct);
+    const auto decode_start = std::chrono::steady_clock::now();
+    if (!cpu_decoder.Decode(
+            block, params.sample_ct, codec_params, decoded.data(),
+            decoded.size(), &error)) {
+      return false;
     }
-    const auto pgen_start = std::chrono::steady_clock::now();
-    for (uint32_t variant_offset = 0;
-         variant_offset != block.variant_ct(); ++variant_offset) {
-      const uint32_t variant_idx =
-          block.first_variant() + variant_offset;
-      uintptr_t* expected =
-          pgen_block_genovecs +
-          static_cast<size_t>(variant_offset) * pgen_word_stride;
-      if (!pgen.Read(variant_idx, expected, &error)) {
-        fprintf(stderr, "\nError: %s\n", error.c_str());
-        goto cleanup;
-      }
-    }
-    pgen_seconds +=
+    *decode_seconds +=
         std::chrono::duration<double>(
-            std::chrono::steady_clock::now() - pgen_start)
+            std::chrono::steady_clock::now() - decode_start)
             .count();
+    return true;
+  };
+  const auto verify_block = [&](uint32_t block_idx) -> bool {
+    const BlockIndexEntry& entry = reader.block_index()[block_idx];
     for (uint32_t variant_offset = 0;
-         variant_offset != block.variant_ct(); ++variant_offset) {
+         variant_offset != entry.variant_ct; ++variant_offset) {
       const uint32_t variant_idx =
-          block.first_variant() + variant_offset;
+          entry.first_variant + variant_offset;
       const uintptr_t* expected =
           pgen_block_genovecs +
           static_cast<size_t>(variant_offset) * pgen_word_stride;
@@ -1039,28 +1134,122 @@ int Benchmark(const Options& opts) {
           decoded.data() +
           static_cast<size_t>(variant_offset) * packed_word_ct;
       if (memcmp(expected, observed,
-                 static_cast<size_t>(packed_word_ct) * sizeof(uint64_t))) {
-        fprintf(stderr,
-                "\nError: CPU benchmark genotype mismatch at variant %u.\n",
-                variant_idx);
+                 static_cast<size_t>(packed_word_ct) *
+                     sizeof(uint64_t))) {
+        error = "CPU benchmark genotype mismatch at variant " +
+                std::to_string(variant_idx) + ".";
+        return false;
+      }
+    }
+    return true;
+  };
+
+  std::mt19937_64 order_rng(opts.benchmark_seed);
+  std::vector<uint32_t> run_order(selected_blocks);
+  for (uint32_t warmup_idx = 0;
+       warmup_idx != opts.benchmark_warmup_ct; ++warmup_idx) {
+    std::shuffle(run_order.begin(), run_order.end(), order_rng);
+    double warmup_pgen_seconds = 0.0;
+    double warmup_read_seconds = 0.0;
+    double warmup_decode_seconds = 0.0;
+    uint32_t completed_block_ct = 0;
+    for (const uint32_t block_idx : run_order) {
+      const bool pgr_first = (order_rng() & 1U) != 0;
+      const bool success =
+          pgr_first
+              ? (run_pgr_block(
+                     block_idx, &warmup_read_seconds,
+                     &warmup_decode_seconds) &&
+                 run_pgen_block(block_idx, &warmup_pgen_seconds))
+              : (run_pgen_block(block_idx, &warmup_pgen_seconds) &&
+                 run_pgr_block(
+                     block_idx, &warmup_read_seconds,
+                     &warmup_decode_seconds));
+      if ((!success) || (!verify_block(block_idx))) {
+        fprintf(stderr, "\nError: %s\n", error.c_str());
         goto cleanup;
       }
-      pgen_payload_bytes += pgen.record_byte_ct(variant_idx);
+      ++completed_block_ct;
+      fprintf(stderr,
+              "\rWarmup %u/%u: %u/%zu blocks.",
+              warmup_idx + 1, opts.benchmark_warmup_ct,
+              completed_block_ct, selected_blocks.size());
+      fflush(stderr);
     }
-    pgr_block_bytes += reader.block_index()[block_idx].byte_ct;
-    benchmark_variant_ct += block.variant_ct();
-    ++completed_block_ct;
-    fprintf(stderr, "\rBenchmarked %u/%zu blocks.", completed_block_ct,
-            selected_blocks.size());
+    calibration_pgen_seconds = warmup_pgen_seconds;
+    calibration_pgr_seconds =
+        warmup_read_seconds + warmup_decode_seconds;
+  }
+  if (!effective_iteration_ct) {
+    const double calibration_seconds =
+        std::max(calibration_pgen_seconds, calibration_pgr_seconds);
+    effective_iteration_ct =
+        (calibration_seconds > 0.0)
+            ? static_cast<uint32_t>(
+                  std::min(
+                      1000.0,
+                      std::max(
+                          1.0, std::ceil(0.05 / calibration_seconds))))
+            : 1;
+  }
+
+  for (uint32_t run_idx = 0;
+       run_idx != opts.benchmark_run_ct; ++run_idx) {
+    double pgen_seconds = 0.0;
+    double pgr_read_seconds = 0.0;
+    double pgr_decode_seconds = 0.0;
+    for (uint32_t iteration_idx = 0;
+         iteration_idx != effective_iteration_ct; ++iteration_idx) {
+      std::shuffle(run_order.begin(), run_order.end(), order_rng);
+      for (const uint32_t block_idx : run_order) {
+        const bool pgr_first = (order_rng() & 1U) != 0;
+        const bool success =
+            pgr_first
+                ? (run_pgr_block(
+                       block_idx, &pgr_read_seconds,
+                       &pgr_decode_seconds) &&
+                   run_pgen_block(block_idx, &pgen_seconds))
+                : (run_pgen_block(block_idx, &pgen_seconds) &&
+                   run_pgr_block(
+                       block_idx, &pgr_read_seconds,
+                       &pgr_decode_seconds));
+        if (!success) {
+          fprintf(stderr, "\nError: %s\n", error.c_str());
+          goto cleanup;
+        }
+        const uint64_t observed =
+            decoded[(static_cast<size_t>(run_idx) + iteration_idx +
+                     block_idx) %
+                    decoded.size()];
+        checksum ^=
+            observed + 0x9e3779b97f4a7c15ULL +
+            (checksum << 6) + (checksum >> 2);
+      }
+    }
+    pgen_timing_samples.push_back(pgen_seconds);
+    pgr_read_timing_samples.push_back(pgr_read_seconds);
+    pgr_decode_timing_samples.push_back(pgr_decode_seconds);
+    pgr_total_timing_samples.push_back(
+        pgr_read_seconds + pgr_decode_seconds);
+    fprintf(stderr, "\rTimed run %u/%u.                    ",
+            run_idx + 1, opts.benchmark_run_ct);
     fflush(stderr);
   }
+
   {
-    const long double calls =
-        static_cast<long double>(benchmark_variant_ct) * params.sample_ct;
-    const double average_decode_seconds =
-        pgr_decode_seconds / opts.benchmark_iteration_ct;
-    const double pgr_serial_seconds =
-        pgr_read_seconds + average_decode_seconds;
+    const pgen_rans::TimingSummary pgen_summary =
+        pgen_rans::SummarizeTimings(pgen_timing_samples);
+    const pgen_rans::TimingSummary pgr_read_summary =
+        pgen_rans::SummarizeTimings(pgr_read_timing_samples);
+    const pgen_rans::TimingSummary pgr_decode_summary =
+        pgen_rans::SummarizeTimings(pgr_decode_timing_samples);
+    const pgen_rans::TimingSummary pgr_total_summary =
+        pgen_rans::SummarizeTimings(pgr_total_timing_samples);
+    const long double calls_per_run =
+        static_cast<long double>(benchmark_variant_ct) *
+        params.sample_ct * effective_iteration_ct;
+    const uint64_t pgen_file_bytes = FileSize(opts.input_fname);
+    const uint64_t pgr_file_bytes = FileSize(opts.output_fname);
     printf("\nConditional-rANS CPU benchmark\n");
     printf("  samples:                 %u\n", params.sample_ct);
     printf("  variants:                %llu\n",
@@ -1068,31 +1257,63 @@ int Benchmark(const Options& opts) {
     printf("  blocks:                  %zu / %u\n", selected_blocks.size(),
            params.block_ct);
     printf("  decoder threads:         %u\n", cpu_decoder.thread_ct());
-    printf("  decode iterations:       %u\n",
-           opts.benchmark_iteration_ct);
+    printf("  passes/timing run:       %u\n",
+           effective_iteration_ct);
+    printf("  pass calibration:        %s\n",
+           opts.benchmark_iteration_ct ? "explicit" : "automatic");
+    printf("  warmup/timed runs:       %u / %u\n",
+           opts.benchmark_warmup_ct, opts.benchmark_run_ct);
+    printf("  randomized-order seed:   %llu\n",
+           static_cast<unsigned long long>(opts.benchmark_seed));
     printf("  checksum:                %016llx\n",
            static_cast<unsigned long long>(checksum));
-    printf("\nCurrent PGEN\n");
-    printf("  payload bytes:           %llu\n",
+    printf("\nSize accounting\n");
+    printf("  selected source payload: %llu\n",
            static_cast<unsigned long long>(pgen_payload_bytes));
-    printf("  read + decode seconds:   %.6f\n", pgen_seconds);
+    printf("  selected rANS blocks:    %llu\n",
+           static_cast<unsigned long long>(pgr_block_bytes));
+    printf("  selected source/rANS:    %.6f\n",
+           pgr_block_bytes
+               ? static_cast<double>(pgen_payload_bytes) /
+                     pgr_block_bytes
+               : 0.0);
+    printf("  full source file:        %llu\n",
+           static_cast<unsigned long long>(pgen_file_bytes));
+    printf("  full rANS file:          %llu\n",
+           static_cast<unsigned long long>(pgr_file_bytes));
+    printf("  full source/rANS:        %.6f\n",
+           pgr_file_bytes
+               ? static_cast<double>(pgen_file_bytes) / pgr_file_bytes
+               : 0.0);
+    printf("\nCurrent PGEN\n");
+    printf("  read+decode median:      %.6f s\n",
+           pgen_summary.median);
+    printf("  min / max / MAD:         %.6f / %.6f / %.6f s\n",
+           pgen_summary.minimum, pgen_summary.maximum,
+           pgen_summary.median_absolute_deviation);
     printf("  billion calls/second:    %.3Lf\n",
-           (pgen_seconds > 0.0)
-               ? calls / pgen_seconds / 1.0e9L
+           (pgen_summary.median > 0.0)
+               ? calls_per_run / pgen_summary.median / 1.0e9L
                : 0.0L);
     printf("\nConditional rANS\n");
-    printf("  block bytes read:        %llu\n",
-           static_cast<unsigned long long>(pgr_block_bytes));
-    printf("  block read seconds:      %.6f\n", pgr_read_seconds);
-    printf("  decode seconds/pass:     %.6f\n", average_decode_seconds);
-    printf("  billion calls/second:    %.3Lf\n",
-           (average_decode_seconds > 0.0)
-               ? calls / average_decode_seconds / 1.0e9L
+    printf("  block-read median:       %.6f s (MAD %.6f)\n",
+           pgr_read_summary.median,
+           pgr_read_summary.median_absolute_deviation);
+    printf("  decode median:           %.6f s (MAD %.6f)\n",
+           pgr_decode_summary.median,
+           pgr_decode_summary.median_absolute_deviation);
+    printf("  read+decode median:      %.6f s\n",
+           pgr_total_summary.median);
+    printf("  min / max / MAD:         %.6f / %.6f / %.6f s\n",
+           pgr_total_summary.minimum, pgr_total_summary.maximum,
+           pgr_total_summary.median_absolute_deviation);
+    printf("  decode billion calls/s:  %.3Lf\n",
+           (pgr_decode_summary.median > 0.0)
+               ? calls_per_run / pgr_decode_summary.median / 1.0e9L
                : 0.0L);
-    printf("  serial read + decode:    %.6f\n", pgr_serial_seconds);
     printf("  source/rANS-PGEN serial speedup: %.3f\n",
-           (pgr_serial_seconds > 0.0)
-               ? pgen_seconds / pgr_serial_seconds
+           (pgr_total_summary.median > 0.0)
+               ? pgen_summary.median / pgr_total_summary.median
                : 0.0);
   }
   return_code = 0;
@@ -1113,6 +1334,10 @@ int Inspect(const Options& opts) {
   uint64_t marginal_ct = 0;
   uint64_t one_reference_ct = 0;
   uint64_t two_reference_ct = 0;
+  uint64_t entropy_rans_ct = 0;
+  uint64_t deterministic_rans_ct = 0;
+  uint64_t raw_packed_ct = 0;
+  uint64_t sparse_predictor_ct = 0;
   uint64_t multiallelic_ct = 0;
   uint64_t patch_01_ct = 0;
   uint64_t patch_10_ct = 0;
@@ -1159,6 +1384,15 @@ int Inspect(const Options& opts) {
       } else {
         ++two_reference_ct;
       }
+      if (metadata.is_raw_packed) {
+        ++raw_packed_ct;
+      } else if (metadata.is_sparse_predictor) {
+        ++sparse_predictor_ct;
+      } else if (metadata.has_entropy_payload) {
+        ++entropy_rans_ct;
+      } else {
+        ++deterministic_rans_ct;
+      }
     }
   }
   printf("Conditional-rANS PGEN\n");
@@ -1176,6 +1410,14 @@ int Inspect(const Options& opts) {
          static_cast<unsigned long long>(one_reference_ct));
   printf("  two-reference records:   %llu\n",
          static_cast<unsigned long long>(two_reference_ct));
+  printf("  entropy-rANS records:    %llu\n",
+         static_cast<unsigned long long>(entropy_rans_ct));
+  printf("  deterministic records:   %llu\n",
+         static_cast<unsigned long long>(deterministic_rans_ct));
+  printf("  raw-packed records:      %llu\n",
+         static_cast<unsigned long long>(raw_packed_ct));
+  printf("  sparse-predictor records: %llu\n",
+         static_cast<unsigned long long>(sparse_predictor_ct));
   printf("  multiallelic variants:   %llu\n",
          static_cast<unsigned long long>(multiallelic_ct));
   printf("  ref/ALT patches:         %llu\n",

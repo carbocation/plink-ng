@@ -294,6 +294,14 @@ int main() {
              unsupported_mode_reader.bytes.size(), ReadMemory,
              &unsupported_mode_reader, &error),
          "unsupported PGEN storage mode was accepted");
+  MemoryReader legacy_version_reader = memory_reader;
+  legacy_version_reader.bytes[12] = 1;
+  ContainerReader legacy_version_container;
+  Expect(legacy_version_container.OpenReadAt(
+             legacy_version_reader.bytes.size(), ReadMemory,
+             &legacy_version_reader, &error),
+         "legacy v1 container was rejected: " + error);
+  legacy_version_container.Close();
   Expect(reader.OpenReadAt(memory_reader.bytes.size(), ReadMemory,
                            &memory_reader, &error),
          "ranged reader open failed: " + error);
@@ -382,6 +390,77 @@ int main() {
          "CPU block decoder accepted an undersized output");
   reader.Close();
 
+  PackedVariantReader sparse_reader;
+  Expect(sparse_reader.Open(path, 4, &error),
+         "sparse packed reader open failed: " + error);
+  PackedReadStats sparse_stats;
+  MultiallelicPatches sparse_patches;
+  Expect(sparse_reader.ReadVariantPatches(
+             4, &sparse_patches, &sparse_stats, &error),
+         "patch-only packed read failed: " + error);
+  Expect((sparse_stats.block_read_ct == 1) &&
+             (!sparse_stats.decoded_variant_ct),
+         "patch-only packed read unnecessarily decoded hardcalls");
+  const size_t packed_byte_ct = (kSampleCt + 3) / 4;
+  std::vector<uint8_t> sparse_output(packed_byte_ct, 0);
+  Expect(sparse_reader.ReadVariant(
+             5, sparse_output.data(), sparse_output.size(),
+             &sparse_stats, &error),
+         "selective packed read failed: " + error);
+  Expect(!memcmp(sparse_output.data(), source[5].data(), packed_byte_ct),
+         "selective packed genotype mismatch");
+  Expect((sparse_stats.decoded_variant_ct >= 1) &&
+             (sparse_stats.decoded_variant_ct <= 3),
+         "single selective read did not use a dependency closure");
+  const uint64_t first_sparse_decode_ct =
+      sparse_stats.decoded_variant_ct;
+  Expect(sparse_reader.ReadVariant(
+             5, sparse_output.data(), sparse_output.size(),
+             &sparse_stats, &error),
+         "cached selective packed read failed: " + error);
+  Expect(sparse_stats.decoded_variant_ct == first_sparse_decode_ct,
+         "cached selective read decoded the same records twice");
+  sparse_reader.Close();
+
+  PackedVariantReader block_cache_reader;
+  Expect(block_cache_reader.Open(path, 4, &error),
+         "block-cache packed reader open failed: " + error);
+  PackedReadStats block_cache_stats;
+  Expect(block_cache_reader.ReadVariant(
+             1, sparse_output.data(), sparse_output.size(),
+             &block_cache_stats, &error),
+         "first block-cache read failed: " + error);
+  Expect(block_cache_reader.ReadVariant(
+             11, sparse_output.data(), sparse_output.size(),
+             &block_cache_stats, &error),
+         "second block-cache read failed: " + error);
+  Expect(block_cache_stats.block_read_ct == 2,
+         "block-cache initial read accounting mismatch");
+  Expect(block_cache_reader.ReadVariant(
+             2, sparse_output.data(), sparse_output.size(),
+             &block_cache_stats, &error),
+         "block-cache revisit failed: " + error);
+  Expect(block_cache_stats.block_read_ct == 2,
+         "block-cache revisit reread a retained block");
+  Expect(!memcmp(sparse_output.data(), source[2].data(), packed_byte_ct),
+         "block-cache revisit genotype mismatch");
+  block_cache_reader.Close();
+
+  PackedVariantReader dense_fallback_reader;
+  Expect(dense_fallback_reader.Open(path, 4, &error),
+         "dense-fallback packed reader open failed: " + error);
+  std::vector<uint8_t> dense_fallback_output(
+      kBlockVariantCt * packed_byte_ct, 0);
+  PackedReadStats dense_fallback_stats;
+  Expect(dense_fallback_reader.ReadRange(
+             0, kBlockVariantCt, dense_fallback_output.data(),
+             packed_byte_ct,
+             &dense_fallback_stats, &error),
+         "dense-fallback packed range failed: " + error);
+  Expect(dense_fallback_stats.decoded_variant_ct == kBlockVariantCt,
+         "complete request did not use whole-block fallback");
+  dense_fallback_reader.Close();
+
   PackedVariantReader packed_reader;
   Expect(packed_reader.Open(path, 4, &error),
          "packed reader open failed: " + error);
@@ -401,7 +480,6 @@ int main() {
              !packed_reader.variant_is_nonref(0) &&
              !packed_reader.variant_is_nonref(kVariantCt),
          "packed reader nonreference lookup mismatch");
-  const size_t packed_byte_ct = (kSampleCt + 3) / 4;
   const size_t output_stride = packed_byte_ct + 5;
   std::vector<uint8_t> packed_output(7 * output_stride, 0xa5);
   PackedReadStats packed_stats;
@@ -536,6 +614,12 @@ int main() {
   Expect(!reader.ReadBlock(1, &corrupted_block, &error),
          "block payload bit flip was not detected");
   reader.Close();
+  Expect(sparse_reader.Open(path, 4, &error),
+         "corrupted patch reader index could not be opened: " + error);
+  Expect(!sparse_reader.ReadVariantPatches(
+             18, &sparse_patches, nullptr, &error),
+         "patch-only read bypassed block checksum validation");
+  sparse_reader.Close();
 
   Expect(unlink(path.c_str()) == 0, "temporary file cleanup failed");
   puts("pgen_rans_container_test: PASS");

@@ -31,6 +31,8 @@ struct RecordMetadata {
   uint8_t reference2 = 0;
   bool has_entropy_payload = false;
   bool has_multiallelic_patches = false;
+  bool is_raw_packed = false;
+  bool is_sparse_predictor = false;
 };
 
 // PGEN's base 2-bit hardcall stream collapses all alternate alleles to ALT1.

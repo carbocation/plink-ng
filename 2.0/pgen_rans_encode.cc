@@ -19,6 +19,7 @@
 #include "include/plink2_bits.h"
 #include "pgen_rans_codec.h"
 #include "pgen_rans_container.h"
+#include "pgen_rans_hybrid.h"
 
 namespace pgen_rans {
 namespace {
@@ -35,6 +36,7 @@ struct VariantBlock {
 
 struct AnchorCandidate {
   uint64_t estimated_bytes = 0;
+  uint64_t sparse_exception_ct = 0;
   uint32_t ordinal = 0;
   uint32_t offset = 0;
 };
@@ -221,6 +223,58 @@ void CountTripleGenotypes(const uintptr_t* anchor1,
   }
 }
 
+uint64_t SparseExceptionCt(const uint32_t* counts, RecordMode mode) {
+  const uint32_t row_ct =
+      (mode == RecordMode::kMarginal)
+          ? 1
+          : ((mode == RecordMode::kOneReference) ? 4 : 16);
+  uint64_t exception_ct = 0;
+  for (uint32_t context = 0; context != row_ct; ++context) {
+    uint32_t row_total = 0;
+    uint32_t largest_count = 0;
+    for (uint32_t symbol = 0; symbol != 4; ++symbol) {
+      const uint32_t count = counts[4 * context + symbol];
+      row_total += count;
+      largest_count = std::max(largest_count, count);
+    }
+    exception_ct += row_total - largest_count;
+  }
+  return exception_ct;
+}
+
+uint32_t VarintByteCt(uint64_t value) {
+  uint32_t byte_ct = 1;
+  while (value >= 0x80U) {
+    ++byte_ct;
+    value >>= 7;
+  }
+  return byte_ct;
+}
+
+uint64_t SparseRecordLowerBoundByteCt(RecordMode mode,
+                                      uint64_t exception_ct,
+                                      uint32_t sample_ct) {
+  const uint32_t row_ct =
+      (mode == RecordMode::kMarginal)
+          ? 1
+          : ((mode == RecordMode::kOneReference) ? 4 : 16);
+  const uint32_t selector_byte_ct =
+      static_cast<uint32_t>(mode);
+  const uint64_t minimum_id_byte_ct =
+      std::min<uint64_t>(
+          exception_ct, (static_cast<uint64_t>(sample_ct) + 7) / 8);
+  return 1 + selector_byte_ct + (row_ct + 3) / 4 +
+         VarintByteCt(exception_ct) + minimum_id_byte_ct +
+         (exception_ct + 3) / 4;
+}
+
+void KeepSmallerRecord(std::vector<uint8_t>* candidate,
+                       std::vector<uint8_t>* best) {
+  if (candidate->size() < best->size()) {
+    *best = std::move(*candidate);
+  }
+}
+
 bool EncodeVariant(const uintptr_t* target,
                    const std::array<uint32_t, 4>& target_counts,
                    uint32_t target_vidx, uint32_t block_start,
@@ -237,6 +291,31 @@ bool EncodeVariant(const uintptr_t* target,
                     RecordMode::kMarginal, 0, 0, codec_params, output,
                     error)) {
     return false;
+  }
+  std::vector<uint8_t> alternate_record;
+  if (params.enable_alternate_records) {
+    const uint64_t raw_record_byte_ct =
+        1 + (static_cast<uint64_t>(sample_ct) + 3) / 4;
+    if (raw_record_byte_ct < output->size()) {
+      if (!EncodeRawRecord(
+              target64, sample_ct, &alternate_record, error)) {
+        return false;
+      }
+      KeepSmallerRecord(&alternate_record, output);
+    }
+    const uint64_t marginal_sparse_exception_ct =
+        SparseExceptionCt(
+            target_counts.data(), RecordMode::kMarginal);
+    if (SparseRecordLowerBoundByteCt(
+            RecordMode::kMarginal, marginal_sparse_exception_ct,
+            sample_ct) < output->size()) {
+      if (!EncodeSparsePredictorRecord(
+              target64, nullptr, nullptr, sample_ct,
+              RecordMode::kMarginal, 0, 0, &alternate_record, error)) {
+        return false;
+      }
+      KeepSmallerRecord(&alternate_record, output);
+    }
   }
   if (is_anchor) {
     return true;
@@ -263,7 +342,10 @@ bool EncodeVariant(const uintptr_t* target,
                              codec_params, &estimated_bytes, error)) {
       return false;
     }
-    candidates.push_back({estimated_bytes, anchor_ordinal, anchor_offset});
+    candidates.push_back(
+        {estimated_bytes,
+         SparseExceptionCt(joint_counts, RecordMode::kOneReference),
+         anchor_ordinal, anchor_offset});
   }
   if (candidates.empty()) {
     return true;
@@ -290,6 +372,42 @@ bool EncodeVariant(const uintptr_t* target,
   if (single_record.size() < output->size()) {
     *output = std::move(single_record);
   }
+  if (params.enable_alternate_records) {
+    std::vector<AnchorCandidate> sparse_candidates = candidates;
+    std::sort(
+        sparse_candidates.begin(), sparse_candidates.end(),
+        [](const AnchorCandidate& lhs, const AnchorCandidate& rhs) {
+          if (lhs.sparse_exception_ct != rhs.sparse_exception_ct) {
+            return lhs.sparse_exception_ct < rhs.sparse_exception_ct;
+          }
+          return lhs.ordinal < rhs.ordinal;
+        });
+    const size_t sparse_candidate_ct =
+        std::min<size_t>(4, sparse_candidates.size());
+    for (size_t candidate_idx = 0;
+         candidate_idx != sparse_candidate_ct; ++candidate_idx) {
+      const AnchorCandidate& candidate =
+          sparse_candidates[candidate_idx];
+      const uintptr_t* sparse_anchor =
+          &(block_genovecs[static_cast<uintptr_t>(candidate.offset) *
+                            genovec_word_stride]);
+      if (SparseRecordLowerBoundByteCt(
+              RecordMode::kOneReference,
+              candidate.sparse_exception_ct, sample_ct) >=
+          output->size()) {
+        continue;
+      }
+      if (!EncodeSparsePredictorRecord(
+              target64,
+              reinterpret_cast<const uint64_t*>(sparse_anchor), nullptr,
+              sample_ct, RecordMode::kOneReference,
+              static_cast<uint8_t>(candidate.ordinal), 0,
+              &alternate_record, error)) {
+        return false;
+      }
+      KeepSmallerRecord(&alternate_record, output);
+    }
+  }
 
   if ((!params.two_ref_shortlist) || (candidates.size() < 2)) {
     return true;
@@ -298,8 +416,12 @@ bool EncodeVariant(const uintptr_t* target,
     candidates.resize(params.two_ref_shortlist);
   }
   uint64_t best_pair_estimate = std::numeric_limits<uint64_t>::max();
+  uint64_t best_sparse_exception_ct =
+      std::numeric_limits<uint64_t>::max();
   uint32_t best_first_idx = 0;
   uint32_t best_second_idx = 0;
+  uint32_t best_sparse_first_idx = 0;
+  uint32_t best_sparse_second_idx = 0;
   for (uint32_t first_idx = 0; first_idx + 1 != candidates.size();
        ++first_idx) {
     const uintptr_t* anchor1 =
@@ -325,6 +447,15 @@ bool EncodeVariant(const uintptr_t* target,
         best_first_idx = first_idx;
         best_second_idx = second_idx;
       }
+      if (params.enable_alternate_records) {
+        const uint64_t sparse_exception_ct =
+            SparseExceptionCt(triple_counts, RecordMode::kTwoReference);
+        if (sparse_exception_ct < best_sparse_exception_ct) {
+          best_sparse_exception_ct = sparse_exception_ct;
+          best_sparse_first_idx = first_idx;
+          best_sparse_second_idx = second_idx;
+        }
+      }
     }
   }
   const AnchorCandidate& first = candidates[best_first_idx];
@@ -346,6 +477,34 @@ bool EncodeVariant(const uintptr_t* target,
   }
   if (pair_record.size() < output->size()) {
     *output = std::move(pair_record);
+  }
+  if (params.enable_alternate_records) {
+    const AnchorCandidate& sparse_first =
+        candidates[best_sparse_first_idx];
+    const AnchorCandidate& sparse_second =
+        candidates[best_sparse_second_idx];
+    const uintptr_t* sparse_anchor1 =
+        &(block_genovecs[static_cast<uintptr_t>(
+                              sparse_first.offset) *
+                          genovec_word_stride]);
+    const uintptr_t* sparse_anchor2 =
+        &(block_genovecs[static_cast<uintptr_t>(
+                              sparse_second.offset) *
+                          genovec_word_stride]);
+    if (SparseRecordLowerBoundByteCt(
+            RecordMode::kTwoReference, best_sparse_exception_ct,
+            sample_ct) < output->size()) {
+      if (!EncodeSparsePredictorRecord(
+              target64, reinterpret_cast<const uint64_t*>(sparse_anchor1),
+              reinterpret_cast<const uint64_t*>(sparse_anchor2), sample_ct,
+              RecordMode::kTwoReference,
+              static_cast<uint8_t>(sparse_first.ordinal),
+              static_cast<uint8_t>(sparse_second.ordinal),
+              &alternate_record, error)) {
+        return false;
+      }
+      KeepSmallerRecord(&alternate_record, output);
+    }
   }
   return true;
 }
@@ -388,6 +547,9 @@ bool ValidateInputs(const EncodeInput& input, EncodeParams* params,
   if ((params->block_variant_ct < 2) ||
       (params->block_variant_ct > UINT16_MAX) || (!params->anchor_ct) ||
       (params->anchor_ct > 256) || (!params->thread_ct) ||
+      (params->rans_state_ct > 256) ||
+      (params->rans_scale_bits < 8) ||
+      (params->rans_scale_bits > 16) ||
       (params->restart_variant_ct == 0) ||
       (params->restart_variant_ct > UINT16_MAX) ||
       (params->two_ref_shortlist == 1)) {
@@ -429,6 +591,18 @@ bool ValidateInputs(const EncodeInput& input, EncodeParams* params,
   return true;
 }
 
+uint32_t AutomaticRansStateCt(uint32_t sample_ct) {
+#if defined(__aarch64__) || defined(_M_ARM64)
+  // Sixteen packed scalar lanes are both smaller and faster on ARM64.
+  (void)sample_ct;
+  return 16;
+#else
+  // Keep 32 lanes for large x86 cohorts so AVX-512 and CUDA consumers can
+  // use their natural warp/register width.
+  return (sample_ct < 32768) ? 16 : 32;
+#endif
+}
+
 }  // namespace
 
 PglErr EncodePgenRans(const std::string& output_path,
@@ -438,6 +612,9 @@ PglErr EncodePgenRans(const std::string& output_path,
   EncodeParams params = requested_params;
   if (!ValidateInputs(input, &params, error)) {
     return kPglRetInconsistentInput;
+  }
+  if (!params.rans_state_ct) {
+    params.rans_state_ct = AutomaticRansStateCt(input.sample_ct);
   }
   *stats = EncodeStats();
   stats->variant_ct = input.variant_ct;
@@ -684,6 +861,15 @@ PglErr EncodePgenRans(const std::string& output_path,
         ++stats->one_reference_ct;
       } else {
         ++stats->two_reference_ct;
+      }
+      if (record_metadata.is_raw_packed) {
+        ++stats->raw_packed_ct;
+      } else if (record_metadata.is_sparse_predictor) {
+        ++stats->sparse_predictor_ct;
+      } else if (record_metadata.has_entropy_payload) {
+        ++stats->entropy_rans_ct;
+      } else {
+        ++stats->deterministic_rans_ct;
       }
     }
     if (!writer.WriteBlock(block, error)) {

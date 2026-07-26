@@ -23,6 +23,8 @@
 #include "include/pgenlib_read.h"
 #include "include/plink2_base.h"
 #include "include/plink2_bits.h"
+#include "pgen_rans_codec.h"
+#include "pgen_rans_size.h"
 
 namespace {
 
@@ -123,6 +125,7 @@ struct Totals {
   uint64_t projected_scheduled_conditional_ct = 0;
   uint64_t projected_scheduled_two_ref_ct = 0;
   uint64_t scheduled_anchor_ct = 0;
+  uint64_t nonref_ct = 0;
   uint64_t block_ct = 0;
   long double scheduled_two_ref_shannon_bits = 0.0;
 };
@@ -549,11 +552,9 @@ double QuantizedRowBits(const uint32_t* counts, uint32_t scale_bits,
 }
 
 RansEstimate EstimateRans(const uint32_t* counts, uint32_t row_ct,
-                          uint32_t reference_ct, uint32_t selector_bytes,
-                          const Options& opts, uint32_t sample_ct) {
+                          uint32_t reference_ct, const Options& opts) {
   RansEstimate result;
-  const bool conditional = (reference_ct != 0);
-  result.model_bytes = (reference_ct == 2) ? 2 : 1;
+  result.model_bytes = (reference_ct == 2) ? 2 : reference_ct;
   for (uint32_t row_idx = 0; row_idx != row_ct; ++row_idx) {
     const uint32_t* row = &(counts[row_idx * 4]);
     uint32_t row_total = 0;
@@ -567,35 +568,26 @@ RansEstimate EstimateRans(const uint32_t* counts, uint32_t row_ct,
     uint32_t active_ct;
     result.quantized_bits +=
         QuantizedRowBits(row, opts.rans_scale_bits, &active_ct);
-    if (conditional) {
-      ++result.model_bytes;
-    }
+    ++result.model_bytes;
     result.model_bytes += 2 * (active_ct - 1);
   }
-  const uint32_t state_ct = std::min(opts.rans_state_ct, sample_ct);
-  const uint64_t base_bytes = 1 + selector_bytes;
-  uint64_t state_and_offset_bytes = 0;
-  if (result.quantized_bits > 0.0) {
-    state_and_offset_bytes =
-        4LLU * state_ct + 4LLU * (state_ct - 1);
+  pgen_rans::RecordMode mode = pgen_rans::RecordMode::kMarginal;
+  if (reference_ct == 1) {
+    mode = pgen_rans::RecordMode::kOneReference;
+  } else if (reference_ct == 2) {
+    mode = pgen_rans::RecordMode::kTwoReference;
   }
-  result.record_bytes =
-      base_bytes + result.model_bytes + state_and_offset_bytes +
-      static_cast<uint64_t>(ceil(result.quantized_bits / 8.0));
+  std::string error;
+  if (!pgen_rans::EstimateRecordBytes(
+          counts, mode,
+          pgen_rans::CodecParams(
+              opts.rans_state_ct, opts.rans_scale_bits),
+          &result.record_bytes, &error)) {
+    fprintf(stderr, "Error: Production rANS size estimator failed: %s\n",
+            error.c_str());
+    exit(1);
+  }
   return result;
-}
-
-uint32_t SelectorByteCt(uint64_t choice_ct) {
-  if (choice_ct <= 1) {
-    return 0;
-  }
-  uint32_t bit_ct = 0;
-  --choice_ct;
-  while (choice_ct) {
-    ++bit_ct;
-    choice_ct >>= 1;
-  }
-  return (bit_ct + 7) / 8;
 }
 
 uint64_t ProjectRansRecordBytes(const RansEstimate& estimate,
@@ -611,10 +603,8 @@ uint64_t ProjectRansRecordBytes(const RansEstimate& estimate,
         std::min(opts.rans_state_ct, source_sample_ct);
     const uint32_t projected_state_ct =
         std::min(opts.rans_state_ct, projected_sample_ct);
-    source_state_bytes =
-        4LLU * source_state_ct + 4LLU * (source_state_ct - 1);
-    projected_state_bytes =
-        4LLU * projected_state_ct + 4LLU * (projected_state_ct - 1);
+    source_state_bytes = 4LLU * source_state_ct;
+    projected_state_bytes = 4LLU * projected_state_ct;
   }
   const uint64_t fixed_bytes =
       estimate.record_bytes - source_payload_bytes - source_state_bytes;
@@ -765,14 +755,16 @@ double ComputeMaf(const uint32_t* counts) {
   return static_cast<double>(minor_ct) / allele_ct;
 }
 
-void AddIndexOverhead(const Options& opts, uint64_t variant_ct,
-                      uint64_t block_ct, uint64_t* byte_ct_ptr) {
-  // Three bytes per record length is a conservative first-pass assumption.
-  *byte_ct_ptr += 3 * variant_ct;
-  *byte_ct_ptr +=
-      4 * ((variant_ct + opts.restart_variant_ct - 1) /
-           opts.restart_variant_ct);
-  *byte_ct_ptr += 8 * block_ct;
+uint64_t ContainerOverheadByteCt(
+    const Options& opts, const std::vector<VariantBlock>& blocks,
+    uint64_t metadata_byte_ct) {
+  uint64_t result = pgen_rans::ContainerGlobalOverheadByteCt(
+      blocks.size(), metadata_byte_ct);
+  for (const VariantBlock& block : blocks) {
+    result += pgen_rans::ContainerBlockOverheadByteCt(
+        block.len, opts.restart_variant_ct);
+  }
+  return result;
 }
 
 std::string FormatGb(long double byte_ct) {
@@ -826,6 +818,8 @@ int main(int argc, char** argv) {
   uint32_t block_start = 0;
   uint32_t source_variant_ct = 0;
   uint32_t processed_variant_ct = 0;
+  uint64_t metadata_byte_ct = 0;
+  uint64_t container_overhead_bytes = 0;
   std::vector<VariantBlock> all_blocks;
   std::vector<VariantBlock> analysis_blocks;
 
@@ -988,8 +982,7 @@ int main(int argc, char** argv) {
       results[offset].maf = ComputeMaf(results[offset].counts.data());
       results[offset].pgen_bytes = GetPgfiVrecWidth(&pgfi, vidx);
       results[offset].marginal =
-          EstimateRans(results[offset].counts.data(), 1, 0, 0, opts,
-                       sample_ct);
+          EstimateRans(results[offset].counts.data(), 1, 0, opts);
       results[offset].previous_best = results[offset].marginal;
       results[offset].scheduled_best = results[offset].marginal;
       results[offset].scheduled_two_ref_best = results[offset].marginal;
@@ -1006,13 +999,6 @@ int main(int argc, char** argv) {
       is_scheduled_anchor[anchor_vidx - block_start] = 1;
       results[anchor_vidx - block_start].scheduled_anchor = true;
     }
-    const uint64_t anchor_pair_ct =
-        static_cast<uint64_t>(scheduled_anchors.size()) *
-        (scheduled_anchors.size() - 1) / 2;
-    const uint32_t scheduled_selector_bytes =
-        SelectorByteCt(scheduled_anchors.size());
-    const uint32_t two_ref_selector_bytes = SelectorByteCt(anchor_pair_ct);
-
     std::atomic<uint32_t> next_offset(0);
     const uint32_t worker_ct =
         std::min(opts.thread_ct, std::max(1U, block_len));
@@ -1059,9 +1045,7 @@ int main(int argc, char** argv) {
                                 results[anchor_offset].counts.data(),
                                 target_result.counts.data(), joint_counts);
             const RansEstimate estimate =
-                EstimateRans(joint_counts, 4, 1,
-                             SelectorByteCt(opts.previous_window), opts,
-                             sample_ct);
+                EstimateRans(joint_counts, 4, 1, opts);
             if (estimate.record_bytes <
                 target_result.previous_best.record_bytes) {
               target_result.previous_best = estimate;
@@ -1100,8 +1084,7 @@ int main(int argc, char** argv) {
                                   results[anchor_offset].counts.data(),
                                   target_result.counts.data(), joint_counts);
               const RansEstimate estimate =
-                  EstimateRans(joint_counts, 4, 1,
-                               scheduled_selector_bytes, opts, sample_ct);
+                  EstimateRans(joint_counts, 4, 1, opts);
               if (opts.two_ref_shortlist) {
                 two_ref_candidates.push_back(
                     {estimate.record_bytes, anchor_offset});
@@ -1162,8 +1145,7 @@ int main(int argc, char** argv) {
                 CountTripleGenotypes(anchor1, anchor2, target, sample_ct,
                                      triple_counts);
                 const RansEstimate estimate =
-                    EstimateRans(triple_counts, 16, 2,
-                                 two_ref_selector_bytes, opts, sample_ct);
+                    EstimateRans(triple_counts, 16, 2, opts);
                 if (estimate.record_bytes <
                     target_result.scheduled_two_ref_best.record_bytes) {
                   target_result.scheduled_two_ref_best = estimate;
@@ -1243,6 +1225,9 @@ int main(int argc, char** argv) {
       totals.projected_scheduled_two_ref_ct +=
           (result.projected_scheduled_two_ref1 >= 0);
       totals.scheduled_anchor_ct += result.scheduled_anchor;
+      if (pgfi.nonref_flags && IsSet(pgfi.nonref_flags, vidx)) {
+        ++totals.nonref_ct;
+      }
       if (variant_out) {
         const char* chrom = ".";
         uint64_t bp = 0;
@@ -1308,26 +1293,25 @@ int main(int argc, char** argv) {
   }
   fputc('\n', stderr);
 
-  AddIndexOverhead(opts, totals.variant_ct, totals.block_ct,
-                   &totals.marginal_bytes);
-  AddIndexOverhead(opts, totals.variant_ct, totals.block_ct,
-                   &totals.previous_bytes);
-  AddIndexOverhead(opts, totals.variant_ct, totals.block_ct,
-                   &totals.scheduled_bytes);
+  metadata_byte_ct =
+      (totals.nonref_ct && (totals.nonref_ct != totals.variant_ct))
+          ? ((totals.variant_ct + 7) / 8)
+          : 0;
+  container_overhead_bytes =
+      ContainerOverheadByteCt(opts, analysis_blocks, metadata_byte_ct);
+  totals.marginal_bytes += container_overhead_bytes;
+  totals.previous_bytes += container_overhead_bytes;
+  totals.scheduled_bytes += container_overhead_bytes;
   if (opts.two_ref_shortlist) {
-    AddIndexOverhead(opts, totals.variant_ct, totals.block_ct,
-                     &totals.scheduled_two_ref_bytes);
+    totals.scheduled_two_ref_bytes += container_overhead_bytes;
   }
   if (opts.project_sample_ct) {
-    AddIndexOverhead(opts, totals.variant_ct, totals.block_ct,
-                     &totals.projected_marginal_bytes);
-    AddIndexOverhead(opts, totals.variant_ct, totals.block_ct,
-                     &totals.projected_previous_bytes);
-    AddIndexOverhead(opts, totals.variant_ct, totals.block_ct,
-                     &totals.projected_scheduled_bytes);
+    totals.projected_marginal_bytes += container_overhead_bytes;
+    totals.projected_previous_bytes += container_overhead_bytes;
+    totals.projected_scheduled_bytes += container_overhead_bytes;
     if (opts.two_ref_shortlist) {
-      AddIndexOverhead(opts, totals.variant_ct, totals.block_ct,
-                       &totals.projected_scheduled_two_ref_bytes);
+      totals.projected_scheduled_two_ref_bytes +=
+          container_overhead_bytes;
     }
   }
 
@@ -1348,6 +1332,8 @@ int main(int argc, char** argv) {
            static_cast<unsigned long long>(pgen_file_bytes));
     printf("  PGEN analyzed payload bytes: %llu\n",
            static_cast<unsigned long long>(totals.pgen_payload_bytes));
+    printf("  exact container overhead:    %llu\n",
+           static_cast<unsigned long long>(container_overhead_bytes));
     printf("  scheduled anchors:           %llu\n",
            static_cast<unsigned long long>(totals.scheduled_anchor_ct));
     printf("  previous conditional calls:  %llu (%.2f%%)\n",

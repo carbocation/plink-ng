@@ -25,23 +25,28 @@ Pass `--two-ref-shortlist L` to retain the `L` best single-anchor candidates
 for each target and test every pair among them under
 `P(g_target | g_anchor1, g_anchor2)`.  Both references remain in the
 independent anchor slab, so decode depth stays at one.  The estimate charges
-for the larger 16-row model and for an anchor-pair selector.  `L` equal to the
-block's anchor count is exhaustive; smaller values are explicitly a
+for the larger 16-row model and the production record's two reference bytes.
+`L` equal to the block's anchor count is exhaustive; smaller values are
+explicitly a
 shortlisted estimate, since exhaustive pair search grows quadratically.
 
-The estimated rANS byte counts include:
+Record sizes come from the production codec's `EstimateRecordBytes()` helper,
+so the oracle and encoder use the same model serialization, reference bytes,
+initial-state count, and interleaved-payload tail policy.  The whole-file
+estimates additionally use the exact v1 container accounting:
 
 - empirical payload cost after frequency quantization;
 - a compact model description;
-- 32-bit initial states and 32-bit per-lane offsets;
-- three bytes of record-length index per variant;
-- a 32-bit cumulative restart offset at the requested interval;
-- a 64-bit block offset.
+- 32-bit initial states and the current guardless interleaved-tail policy;
+- the 96-byte file header and 32-byte block-index entries;
+- 16-byte block headers and three-byte record lengths;
+- the exact number of per-block 32-bit restart offsets;
+- a nonreference bitmap when the analyzed variants have mixed flags.
 
-They do not include a working rANS encoder or GPU decoder.  Treat the estimates
-as a way to decide whether those are worth implementing.  In particular, the
-oracle does not predict kernel throughput; the go/no-go decision still needs
-an end-to-end localization + GPU decode + analysis benchmark.
+The entropy payload itself remains an estimate based on quantized ideal code
+length, so a small difference from actual encoded size is expected.  The
+oracle does not predict kernel throughput; performance decisions still need
+an end-to-end decode benchmark.
 
 ## Build
 
@@ -49,6 +54,7 @@ From `2.0/`:
 
 ```sh
 make -f Makefile.pgen_entropy_oracle
+make -f Makefile.pgen_entropy_oracle test
 ```
 
 The standalone makefile reuses PLINK 2's existing build definitions without

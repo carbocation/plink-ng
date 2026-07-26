@@ -22,9 +22,12 @@ struct EncodeParams {
   uint32_t two_ref_shortlist = 4;
   uint64_t max_anchor_bp = 1000000;
   uint32_t restart_variant_ct = 64;
-  uint32_t rans_state_ct = 32;
+  // Zero selects the platform-adaptive file-wide default documented in
+  // pgen_rans_format.md. Explicit counts remain unchanged.
+  uint32_t rans_state_ct = 0;
   uint32_t rans_scale_bits = 12;
   uint32_t thread_ct = 1;
+  bool enable_alternate_records = true;
 };
 
 struct EncodeInput {
@@ -50,6 +53,10 @@ struct EncodeStats {
   uint64_t marginal_ct = 0;
   uint64_t one_reference_ct = 0;
   uint64_t two_reference_ct = 0;
+  uint64_t entropy_rans_ct = 0;
+  uint64_t deterministic_rans_ct = 0;
+  uint64_t raw_packed_ct = 0;
+  uint64_t sparse_predictor_ct = 0;
   uint64_t anchor_ct = 0;
   uint64_t multiallelic_ct = 0;
   uint64_t patch_01_ct = 0;

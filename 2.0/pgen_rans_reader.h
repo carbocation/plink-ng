@@ -43,8 +43,8 @@ class PackedVariantReader {
   size_t packed_variant_byte_ct() const;
 
   // Indices are zero-based positions in the stored sample order and must be
-  // strictly increasing. Decoding still visits every stored genotype; this
-  // controls the packed projection copied to callers.
+  // strictly increasing. Each requested record still visits every stored
+  // sample; this controls the packed projection copied to callers.
   bool SetSampleSubset(const uint32_t* sample_indices,
                        uint32_t subset_sample_ct, std::string* error);
   void ClearSampleSubset();

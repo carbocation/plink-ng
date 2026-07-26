@@ -5,6 +5,7 @@
 #include <algorithm>
 #include <chrono>
 #include <cstring>
+#include <list>
 #include <limits>
 #include <utility>
 #include <vector>
@@ -25,6 +26,26 @@ void SetError(const std::string& message, std::string* error) {
 }  // namespace
 
 struct PackedVariantReader::Impl {
+  struct CachedBlock {
+    size_t ByteCt() const {
+      return storage.size() +
+             decoded.size() * sizeof(uint64_t) +
+             decoded_flags.size() + projected.size() +
+             projected_flags.size();
+    }
+
+    uint32_t block_idx = UINT32_MAX;
+    std::vector<uint8_t> storage;
+    EncodedBlockView view;
+    std::vector<uint64_t> decoded;
+    std::vector<uint8_t> decoded_flags;
+    std::vector<uint8_t> projected;
+    std::vector<uint8_t> projected_flags;
+  };
+
+  static constexpr size_t kCachedBlockByteLimit =
+      64ULL * 1024 * 1024;
+
   bool Open(const std::string& path, uint32_t thread_ct,
             std::string* error) {
     Close();
@@ -62,7 +83,12 @@ struct PackedVariantReader::Impl {
     cached_block_idx = UINT32_MAX;
     block_storage.clear();
     decoded_block.clear();
+    decoded_flags.clear();
+    projected_block.clear();
+    projected_flags.clear();
     block_view = {};
+    cached_blocks.clear();
+    cached_block_byte_ct = 0;
   }
 
   void ClearSampleSubset() {
@@ -109,16 +135,77 @@ struct PackedVariantReader::Impl {
         sample_subset.clear();
       }
     }
-    cached_block_idx = UINT32_MAX;
     projected_block.clear();
+    projected_flags.clear();
+    cached_block_byte_ct = 0;
+    for (CachedBlock& block : cached_blocks) {
+      block.projected.clear();
+      block.projected_flags.clear();
+      cached_block_byte_ct += block.ByteCt();
+    }
+    TrimBlockCache();
     return true;
   }
 
-  bool DecodeBlock(uint32_t block_idx, PackedReadStats* stats,
-                   std::string* error) {
+  void TrimBlockCache() {
+    while ((cached_block_byte_ct > kCachedBlockByteLimit) &&
+           (!cached_blocks.empty())) {
+      cached_block_byte_ct -= cached_blocks.back().ByteCt();
+      cached_blocks.pop_back();
+    }
+  }
+
+  void StashActiveBlock() {
+    if (cached_block_idx == UINT32_MAX) {
+      return;
+    }
+    CachedBlock block;
+    block.block_idx = cached_block_idx;
+    block.storage = std::move(block_storage);
+    block.view = std::move(block_view);
+    block.decoded = std::move(decoded_block);
+    block.decoded_flags = std::move(decoded_flags);
+    block.projected = std::move(projected_block);
+    block.projected_flags = std::move(projected_flags);
+    cached_block_byte_ct += block.ByteCt();
+    cached_blocks.push_front(std::move(block));
+    cached_block_idx = UINT32_MAX;
+    block_view = {};
+    TrimBlockCache();
+  }
+
+  bool RestoreCachedBlock(uint32_t block_idx) {
+    auto iter = std::find_if(
+        cached_blocks.begin(), cached_blocks.end(),
+        [block_idx](const CachedBlock& block) {
+          return block.block_idx == block_idx;
+        });
+    if (iter == cached_blocks.end()) {
+      return false;
+    }
+    CachedBlock requested = std::move(*iter);
+    cached_block_byte_ct -= requested.ByteCt();
+    cached_blocks.erase(iter);
+    StashActiveBlock();
+    cached_block_idx = requested.block_idx;
+    block_storage = std::move(requested.storage);
+    block_view = std::move(requested.view);
+    decoded_block = std::move(requested.decoded);
+    decoded_flags = std::move(requested.decoded_flags);
+    projected_block = std::move(requested.projected);
+    projected_flags = std::move(requested.projected_flags);
+    return true;
+  }
+
+  bool LoadBlock(uint32_t block_idx, PackedReadStats* stats,
+                 std::string* error) {
     if (block_idx == cached_block_idx) {
       return true;
     }
+    if (RestoreCachedBlock(block_idx)) {
+      return true;
+    }
+    StashActiveBlock();
     const auto read_start = std::chrono::steady_clock::now();
     if (!reader.ReadBlockView(block_idx, &block_storage, &block_view,
                               error)) {
@@ -134,13 +221,81 @@ struct PackedVariantReader::Impl {
                error);
       return false;
     }
-    decoded_block.resize(
-        static_cast<size_t>(block_view.variant_ct()) * word_stride);
-    const auto decode_start = std::chrono::steady_clock::now();
-    if (!decoder->Decode(block_view, reader.params().sample_ct, params,
-                         decoded_block.data(), decoded_block.size(),
-                         error)) {
+    decoded_block.clear();
+    decoded_flags.clear();
+    projected_block.clear();
+    projected_flags.clear();
+    cached_block_idx = block_idx;
+    if (stats) {
+      ++stats->block_read_ct;
+      stats->block_byte_ct += reader.block_index()[block_idx].byte_ct;
+      stats->block_read_seconds += read_seconds;
+    }
+    return true;
+  }
+
+  bool DecodeOffsets(uint32_t block_idx,
+                     const std::vector<uint32_t>& variant_offsets,
+                     PackedReadStats* stats, std::string* error) {
+    if (variant_offsets.empty()) {
+      return true;
+    }
+    if (!LoadBlock(block_idx, stats, error)) {
       return false;
+    }
+    if (decoded_flags.empty()) {
+      decoded_block.resize(
+          static_cast<size_t>(block_view.variant_ct()) * word_stride);
+      decoded_flags.assign(block_view.variant_ct(), 0);
+    }
+    std::vector<uint32_t> requested_offsets;
+    requested_offsets.reserve(variant_offsets.size());
+    std::vector<uint8_t> requested_flags(block_view.variant_ct(), 0);
+    uint32_t missing_request_ct = 0;
+    for (const uint32_t variant_offset : variant_offsets) {
+      if (variant_offset >= block_view.variant_ct()) {
+        SetError("Conditional-rANS block request is out of range.", error);
+        return false;
+      }
+      if (!requested_flags[variant_offset]) {
+        requested_flags[variant_offset] = 1;
+        requested_offsets.push_back(variant_offset);
+        missing_request_ct += !decoded_flags[variant_offset];
+      }
+    }
+    if (!missing_request_ct) {
+      if (sample_subset.empty()) {
+        return true;
+      }
+    }
+
+    // At near-total density, decoding the whole block is slightly faster
+    // than building the sparse dependency closure.  Sparse reads below this
+    // measured crossover decode only requested records plus their one or two
+    // scheduled marginal anchors.
+    const bool decode_dense =
+        missing_request_ct &&
+        (missing_request_ct == block_view.variant_ct());
+    const auto decode_start = std::chrono::steady_clock::now();
+    uint32_t decoded_variant_ct = 0;
+    if (decode_dense) {
+      if (!decoder->Decode(block_view, reader.params().sample_ct, params,
+                           decoded_block.data(), decoded_block.size(),
+                           error)) {
+        return false;
+      }
+      std::fill(decoded_flags.begin(), decoded_flags.end(), 1);
+      decoded_variant_ct = block_view.variant_ct();
+    } else if (missing_request_ct) {
+      if (!decoder->DecodeSelected(
+              block_view, reader.params().sample_ct, params,
+              requested_offsets.data(),
+              static_cast<uint32_t>(requested_offsets.size()),
+              decoded_block.data(), decoded_block.size(),
+              decoded_flags.data(), decoded_flags.size(),
+              &decoded_variant_ct, error)) {
+        return false;
+      }
     }
     const double decode_seconds =
         std::chrono::duration<double>(
@@ -148,29 +303,50 @@ struct PackedVariantReader::Impl {
             .count();
     double projection_seconds = 0.0;
     if (!sample_subset.empty()) {
-      projected_block.resize(
-          static_cast<size_t>(block_view.variant_ct()) * packed_byte_ct);
-      const auto projection_start = std::chrono::steady_clock::now();
-      if (!decoder->ProjectSampleSubset(
-              decoded_block.data(), block_view.variant_ct(),
-              reader.params().sample_ct, sample_subset.data(),
-              output_sample_ct, projected_block.data(), packed_byte_ct,
-              error)) {
-        return false;
+      if (projected_block.empty()) {
+        projected_block.resize(
+            static_cast<size_t>(block_view.variant_ct()) * packed_byte_ct);
+        projected_flags.assign(block_view.variant_ct(), 0);
+      }
+      const auto projection_start =
+          std::chrono::steady_clock::now();
+      if (decode_dense) {
+        if (!decoder->ProjectSampleSubset(
+                decoded_block.data(), block_view.variant_ct(),
+                reader.params().sample_ct, sample_subset.data(),
+                output_sample_ct, projected_block.data(), packed_byte_ct,
+                error)) {
+          return false;
+        }
+        std::fill(projected_flags.begin(), projected_flags.end(), 1);
+      } else {
+        std::vector<uint32_t> projection_offsets;
+        projection_offsets.reserve(requested_offsets.size());
+        for (const uint32_t variant_offset : requested_offsets) {
+          if (!projected_flags[variant_offset]) {
+            projection_offsets.push_back(variant_offset);
+          }
+        }
+        if ((!projection_offsets.empty()) &&
+            (!decoder->ProjectSampleSubsetSelected(
+                decoded_block.data(), block_view.variant_ct(),
+                reader.params().sample_ct, projection_offsets.data(),
+                static_cast<uint32_t>(projection_offsets.size()),
+                sample_subset.data(), output_sample_ct,
+                projected_block.data(), packed_byte_ct, error))) {
+          return false;
+        }
+        for (const uint32_t variant_offset : projection_offsets) {
+          projected_flags[variant_offset] = 1;
+        }
       }
       projection_seconds =
           std::chrono::duration<double>(
               std::chrono::steady_clock::now() - projection_start)
               .count();
-    } else {
-      projected_block.clear();
     }
-    cached_block_idx = block_idx;
     if (stats) {
-      ++stats->block_read_ct;
-      stats->block_byte_ct += reader.block_index()[block_idx].byte_ct;
-      stats->decoded_variant_ct += block_view.variant_ct();
-      stats->block_read_seconds += read_seconds;
+      stats->decoded_variant_ct += decoded_variant_ct;
       stats->decode_seconds += decode_seconds;
       stats->projection_seconds += projection_seconds;
     }
@@ -203,22 +379,35 @@ struct PackedVariantReader::Impl {
       requests.emplace_back(variants[output_idx], output_idx);
     }
     std::sort(requests.begin(), requests.end());
-    uint32_t active_block_idx = UINT32_MAX;
-    for (const auto& request : requests) {
+    size_t request_begin = 0;
+    while (request_begin != requests.size()) {
       uint32_t block_idx;
-      if (!reader.FindBlock(request.first, &block_idx, error)) {
+      if (!reader.FindBlock(requests[request_begin].first, &block_idx,
+                            error)) {
         return false;
       }
-      if (block_idx != active_block_idx) {
-        if (!DecodeBlock(block_idx, stats, error)) {
-          return false;
-        }
-        active_block_idx = block_idx;
+      const BlockIndexEntry& entry = reader.block_index()[block_idx];
+      const uint32_t block_end = entry.first_variant + entry.variant_ct;
+      size_t request_end = request_begin;
+      std::vector<uint32_t> variant_offsets;
+      while ((request_end != requests.size()) &&
+             (requests[request_end].first < block_end)) {
+        variant_offsets.push_back(
+            requests[request_end].first - entry.first_variant);
+        ++request_end;
       }
-      uint8_t* destination =
-          output +
-          static_cast<size_t>(request.second) * output_variant_stride;
-      CopyDecodedVariant(request.first, destination);
+      if (!DecodeOffsets(block_idx, variant_offsets, stats, error)) {
+        return false;
+      }
+      for (size_t request_idx = request_begin;
+           request_idx != request_end; ++request_idx) {
+        const auto& request = requests[request_idx];
+        uint8_t* destination =
+            output +
+            static_cast<size_t>(request.second) * output_variant_stride;
+        CopyDecodedVariant(request.first, destination);
+      }
+      request_begin = request_end;
     }
     if (stats) {
       stats->returned_variant_ct += variant_ct;
@@ -250,7 +439,11 @@ struct PackedVariantReader::Impl {
   std::vector<uint8_t> block_storage;
   EncodedBlockView block_view;
   std::vector<uint64_t> decoded_block;
+  std::vector<uint8_t> decoded_flags;
   std::vector<uint8_t> projected_block;
+  std::vector<uint8_t> projected_flags;
+  std::list<CachedBlock> cached_blocks;
+  size_t cached_block_byte_ct = 0;
 };
 
 PackedVariantReader::PackedVariantReader() : impl_(new Impl()) {}
@@ -327,8 +520,13 @@ bool PackedVariantReader::ReadVariant(
     return false;
   }
   uint32_t block_idx;
-  if (!impl_->reader.FindBlock(variant, &block_idx, error) ||
-      !impl_->DecodeBlock(block_idx, stats, error)) {
+  if (!impl_->reader.FindBlock(variant, &block_idx, error)) {
+    return false;
+  }
+  const uint32_t variant_offset =
+      variant - impl_->reader.block_index()[block_idx].first_variant;
+  const std::vector<uint32_t> variant_offsets = {variant_offset};
+  if (!impl_->DecodeOffsets(block_idx, variant_offsets, stats, error)) {
     return false;
   }
   impl_->CopyDecodedVariant(variant, output);
@@ -349,7 +547,7 @@ bool PackedVariantReader::ReadVariantPatches(
   }
   uint32_t block_idx;
   if (!impl_->reader.FindBlock(variant, &block_idx, error) ||
-      !impl_->DecodeBlock(block_idx, stats, error)) {
+      !impl_->LoadBlock(block_idx, stats, error)) {
     return false;
   }
   const ByteSpan record =
@@ -377,16 +575,36 @@ bool PackedVariantReader::ReadRange(
     SetError("Invalid conditional-rANS packed range output.", error);
     return false;
   }
-  for (uint32_t offset = 0; offset != variant_ct; ++offset) {
-    const uint32_t variant = first_variant + offset;
+  uint32_t output_offset = 0;
+  while (output_offset != variant_ct) {
+    const uint32_t variant = first_variant + output_offset;
     uint32_t block_idx;
-    if (!impl_->reader.FindBlock(variant, &block_idx, error) ||
-        !impl_->DecodeBlock(block_idx, stats, error)) {
+    if (!impl_->reader.FindBlock(variant, &block_idx, error)) {
       return false;
     }
-    impl_->CopyDecodedVariant(
-        variant, output + static_cast<size_t>(offset) *
-                              output_variant_stride);
+    const BlockIndexEntry& entry =
+        impl_->reader.block_index()[block_idx];
+    const uint32_t block_offset = variant - entry.first_variant;
+    const uint32_t chunk_variant_ct =
+        std::min(variant_ct - output_offset,
+                 entry.variant_ct - block_offset);
+    std::vector<uint32_t> variant_offsets(chunk_variant_ct);
+    for (uint32_t chunk_offset = 0;
+         chunk_offset != chunk_variant_ct; ++chunk_offset) {
+      variant_offsets[chunk_offset] = block_offset + chunk_offset;
+    }
+    if (!impl_->DecodeOffsets(block_idx, variant_offsets, stats, error)) {
+      return false;
+    }
+    for (uint32_t chunk_offset = 0;
+         chunk_offset != chunk_variant_ct; ++chunk_offset) {
+      impl_->CopyDecodedVariant(
+          variant + chunk_offset,
+          output +
+              static_cast<size_t>(output_offset + chunk_offset) *
+                  output_variant_stride);
+    }
+    output_offset += chunk_variant_ct;
   }
   if (stats) {
     stats->returned_variant_ct += variant_ct;

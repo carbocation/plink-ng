@@ -655,7 +655,8 @@ bool ContainerReader::OpenIndex(std::string* error) {
       (flags & kContainerFlagNonrefBitmap)
           ? 3
           : ((flags & kContainerFlagAllNonref) ? 2 : 1);
-  if ((version != kPgenRansFormatVersion) ||
+  if ((version < kPgenRansMinimumFormatVersion) ||
+      (version > kPgenRansFormatVersion) ||
       (header_byte_ct != kFileHeaderByteCt) ||
       (block_table_offset != kFileHeaderByteCt) ||
       (header_ctrl & 0x3f) ||

@@ -2,6 +2,8 @@
 
 #include "pgen_rans_codec.h"
 
+#include "pgen_rans_hybrid.h"
+
 #include <algorithm>
 #include <array>
 #include <cmath>
@@ -27,8 +29,10 @@ constexpr uint32_t kRansLowerBound = 1U << 23;
 constexpr uint8_t kModeMask = 3;
 constexpr uint8_t kEntropyPayloadFlag = 1U << 2;
 constexpr uint8_t kMultiallelicPatchFlag = 1U << 3;
+constexpr uint8_t kUnpaddedPayloadFlag = 1U << 4;
 constexpr uint8_t kKnownFlagMask =
-    kModeMask | kEntropyPayloadFlag | kMultiallelicPatchFlag;
+    kModeMask | kEntropyPayloadFlag | kMultiallelicPatchFlag |
+    kUnpaddedPayloadFlag | kAlternateRecordFlagMask;
 constexpr uint32_t kInterleavedPaddingByteCt = 15;
 constexpr uint32_t kDefaultScaleBits = 12;
 constexpr uint8_t kMultiallelicPatchVersion = 1;
@@ -45,10 +49,13 @@ constexpr uint32_t kAvx512MinimumSampleCt = 32768;
 
 #if defined(_MSC_VER)
 #define PGEN_RANS_ALWAYS_INLINE __forceinline
+#define PGEN_RANS_NOINLINE __declspec(noinline)
 #elif defined(__GNUC__) || defined(__clang__)
 #define PGEN_RANS_ALWAYS_INLINE inline __attribute__((always_inline))
+#define PGEN_RANS_NOINLINE __attribute__((noinline))
 #else
 #define PGEN_RANS_ALWAYS_INLINE inline
+#define PGEN_RANS_NOINLINE
 #endif
 
 struct ModelRow {
@@ -901,10 +908,17 @@ bool RansDecodeGroup16Avx512(
       SetError("Truncated interleaved rANS payload.", error);
       return false;
     }
-    // Fifteen zero padding bytes at the end of an interleaved
-    // record make this 16-byte load safe even for the final refill.
-    const __m128i packed_bytes = _mm_loadu_si128(
-        reinterpret_cast<const __m128i*>(*interleaved_iter));
+    const size_t remaining_byte_ct =
+        static_cast<size_t>(interleaved_end - *interleaved_iter);
+    const __m128i packed_bytes =
+        (remaining_byte_ct >= 16)
+            ? _mm_loadu_si128(
+                  reinterpret_cast<const __m128i*>(
+                      *interleaved_iter))
+            : _mm_maskz_loadu_epi8(
+                  static_cast<__mmask16>(
+                      (1U << remaining_byte_ct) - 1),
+                  *interleaved_iter);
     const __m512i refill_values =
         _mm512_cvtepu8_epi32(packed_bytes);
     const __m512i expanded_values =
@@ -1111,6 +1125,188 @@ bool DecodeEntropyRecordInterleavedAvx512(
 }
 #endif
 
+template <RecordMode kMode, uint32_t kStateCt, uint32_t kScaleBits>
+bool DecodeEntropyPackedWordsInterleavedScalar(
+    const Model& model, const uint64_t* reference1,
+    const uint64_t* reference2, uint32_t sample_ct,
+    uint32_t runtime_scale_bits, const uint8_t* payload_begin,
+    const uint8_t* payload_end, std::array<uint32_t, 256>* states,
+    uint64_t* target, const uint8_t** payload_iter_out,
+    std::string* error) {
+  const uint32_t scale_bits =
+      kScaleBits ? kScaleBits : runtime_scale_bits;
+  const uint32_t slot_mask = (1U << scale_bits) - 1;
+  const uint8_t* payload_iter = payload_begin;
+  const uint32_t word_ct = (sample_ct + 31) / 32;
+  for (uint32_t word_idx = 0; word_idx != word_ct; ++word_idx) {
+    const uint32_t word_sample_ct =
+        std::min(32U, sample_ct - 32 * word_idx);
+    const uint64_t reference1_word =
+        (kMode == RecordMode::kMarginal)
+            ? 0
+            : reference1[word_idx];
+    const uint64_t reference2_word =
+        (kMode == RecordMode::kTwoReference)
+            ? reference2[word_idx]
+            : 0;
+    uint64_t packed_word = 0;
+    for (uint32_t first_word_sample = 0;
+         first_word_sample < word_sample_ct;
+         first_word_sample += kStateCt) {
+      const uint32_t round_sample_ct =
+          std::min(kStateCt, word_sample_ct - first_word_sample);
+      for (uint32_t group_start = 0;
+           group_start < round_sample_ct; group_start += 16) {
+        const uint32_t group_end =
+            std::min(group_start + 16, round_sample_ct);
+        uint32_t entropy_lane_mask = 0;
+        for (uint32_t lane = group_start; lane != group_end;
+             ++lane) {
+          const uint32_t word_sample = first_word_sample + lane;
+          uint32_t context = 0;
+          if (kMode != RecordMode::kMarginal) {
+            context = static_cast<uint32_t>(
+                (reference1_word >> (2 * word_sample)) & 3U);
+          }
+          if (kMode == RecordMode::kTwoReference) {
+            context =
+                4 * context +
+                static_cast<uint32_t>(
+                    (reference2_word >> (2 * word_sample)) & 3U);
+          }
+          const uint32_t active_symbol_ct =
+              model.active_symbol_cts[context];
+          if (!active_symbol_ct) {
+            SetError("Reference selects an absent model context.",
+                     error);
+            return false;
+          }
+          uint8_t symbol = model.deterministic_symbols[context];
+          if (active_symbol_ct > 1) {
+            entropy_lane_mask |= 1U << (lane - group_start);
+            const ModelRow& row = model.rows[context];
+            const uint32_t slot = (*states)[lane] & slot_mask;
+            symbol = static_cast<uint8_t>(
+                static_cast<uint32_t>(
+                    slot >= row.cumulative[1]) +
+                static_cast<uint32_t>(
+                    slot >= row.cumulative[2]) +
+                static_cast<uint32_t>(
+                    slot >= row.cumulative[3]));
+            (*states)[lane] =
+                row.frequencies[symbol] *
+                    ((*states)[lane] >> scale_bits) +
+                slot - row.cumulative[symbol];
+          }
+          packed_word |=
+              static_cast<uint64_t>(symbol) << (2 * word_sample);
+        }
+        while (true) {
+          uint32_t refill_mask = 0;
+          for (uint32_t lane = group_start; lane != group_end;
+               ++lane) {
+            if ((entropy_lane_mask &
+                 (1U << (lane - group_start))) &&
+                ((*states)[lane] < kRansLowerBound)) {
+              refill_mask |= 1U << (lane - group_start);
+            }
+          }
+          if (!refill_mask) {
+            break;
+          }
+          for (uint32_t lane = group_start; lane != group_end;
+               ++lane) {
+            if (!(refill_mask & (1U << (lane - group_start)))) {
+              continue;
+            }
+            if (payload_iter == payload_end) {
+              SetError(
+                  "Truncated interleaved rANS payload.", error);
+              return false;
+            }
+            (*states)[lane] =
+                ((*states)[lane] << 8) | *payload_iter++;
+          }
+        }
+      }
+    }
+    target[word_idx] = packed_word;
+  }
+  *payload_iter_out = payload_iter;
+  return true;
+}
+
+template <uint32_t kStateCt, uint32_t kScaleBits>
+PGEN_RANS_NOINLINE
+bool DecodeEntropyRecordPackedWordsInterleavedScalar(
+    RecordMode mode, const Model& model, const uint64_t* reference1,
+    const uint64_t* reference2, uint32_t sample_ct,
+    uint32_t runtime_scale_bits, const uint8_t* payload_begin,
+    const uint8_t* payload_end, std::array<uint32_t, 256>* states,
+    uint64_t* target, const uint8_t** payload_iter_out,
+    std::string* error) {
+  switch (mode) {
+    case RecordMode::kMarginal:
+      return DecodeEntropyPackedWordsInterleavedScalar<
+          RecordMode::kMarginal, kStateCt, kScaleBits>(
+          model, reference1, reference2, sample_ct,
+          runtime_scale_bits, payload_begin, payload_end, states,
+          target, payload_iter_out, error);
+    case RecordMode::kOneReference:
+      return DecodeEntropyPackedWordsInterleavedScalar<
+          RecordMode::kOneReference, kStateCt, kScaleBits>(
+          model, reference1, reference2, sample_ct,
+          runtime_scale_bits, payload_begin, payload_end, states,
+          target, payload_iter_out, error);
+    case RecordMode::kTwoReference:
+      return DecodeEntropyPackedWordsInterleavedScalar<
+          RecordMode::kTwoReference, kStateCt, kScaleBits>(
+          model, reference1, reference2, sample_ct,
+          runtime_scale_bits, payload_begin, payload_end, states,
+          target, payload_iter_out, error);
+  }
+  SetError("Unknown rANS record mode.", error);
+  return false;
+}
+
+template <uint32_t kScaleBits>
+bool DecodeEntropyRecordPowerOfTwoInterleavedScalar(
+    RecordMode mode, const Model& model, const uint64_t* reference1,
+    const uint64_t* reference2, uint32_t sample_ct,
+    uint32_t state_ct, uint32_t runtime_scale_bits,
+    const uint8_t* payload_begin, const uint8_t* payload_end,
+    std::array<uint32_t, 256>* states, uint64_t* target,
+    const uint8_t** payload_iter_out, std::string* error) {
+  switch (state_ct) {
+    case 4:
+      return DecodeEntropyRecordPackedWordsInterleavedScalar<
+          4, kScaleBits>(
+          mode, model, reference1, reference2, sample_ct,
+          runtime_scale_bits, payload_begin, payload_end, states,
+          target, payload_iter_out, error);
+    case 8:
+      return DecodeEntropyRecordPackedWordsInterleavedScalar<
+          8, kScaleBits>(
+          mode, model, reference1, reference2, sample_ct,
+          runtime_scale_bits, payload_begin, payload_end, states,
+          target, payload_iter_out, error);
+    case 16:
+      return DecodeEntropyRecordPackedWordsInterleavedScalar<
+          16, kScaleBits>(
+          mode, model, reference1, reference2, sample_ct,
+          runtime_scale_bits, payload_begin, payload_end, states,
+          target, payload_iter_out, error);
+    case 32:
+      return DecodeEntropyRecordPackedWordsInterleavedScalar<
+          32, kScaleBits>(
+          mode, model, reference1, reference2, sample_ct,
+          runtime_scale_bits, payload_begin, payload_end, states,
+          target, payload_iter_out, error);
+  }
+  SetError("Unsupported packed-word rANS state count.", error);
+  return false;
+}
+
 template <RecordMode kMode, uint32_t kScaleBits>
 bool DecodeEntropyInterleaved(
     const Model& model, const uint64_t* reference1,
@@ -1252,6 +1448,12 @@ bool ParsePrefix(const uint8_t* record, size_t record_size,
     SetError("Unknown rANS record flags.", error);
     return false;
   }
+  if ((flags & kUnpaddedPayloadFlag) &&
+      !(flags & kEntropyPayloadFlag)) {
+    SetError("Unpadded-payload flag requires an entropy payload.",
+             error);
+    return false;
+  }
   const uint8_t mode_code = flags & kModeMask;
   if (mode_code > static_cast<uint8_t>(RecordMode::kTwoReference)) {
     SetError("Unknown rANS record mode.", error);
@@ -1261,6 +1463,19 @@ bool ParsePrefix(const uint8_t* record, size_t record_size,
   metadata->has_entropy_payload = (flags & kEntropyPayloadFlag);
   metadata->has_multiallelic_patches =
       (flags & kMultiallelicPatchFlag);
+  metadata->is_raw_packed = flags & kRawPackedRecordFlag;
+  metadata->is_sparse_predictor =
+      flags & kSparsePredictorRecordFlag;
+  if ((metadata->is_raw_packed && metadata->is_sparse_predictor) ||
+      ((flags & kSparsePredictorBitmapFlag) &&
+       !metadata->is_sparse_predictor) ||
+      ((metadata->is_raw_packed || metadata->is_sparse_predictor) &&
+       (flags & (kEntropyPayloadFlag | kUnpaddedPayloadFlag))) ||
+      (metadata->is_raw_packed &&
+       (metadata->mode != RecordMode::kMarginal))) {
+    SetError("Invalid alternate-record flag combination.", error);
+    return false;
+  }
   *offset = 1;
   if (metadata->mode != RecordMode::kMarginal) {
     if (*offset == record_size) {
@@ -1334,7 +1549,7 @@ bool EncodeRecord(const uint64_t* target, const uint64_t* reference1,
   }
   uint8_t flags = static_cast<uint8_t>(mode);
   if (model.has_entropy) {
-    flags |= kEntropyPayloadFlag;
+    flags |= kEntropyPayloadFlag | kUnpaddedPayloadFlag;
   }
   record->push_back(flags);
   if (mode != RecordMode::kMarginal) {
@@ -1384,8 +1599,6 @@ bool EncodeRecord(const uint64_t* target, const uint64_t* reference1,
   record->insert(
       record->end(), interleaved_payload.begin(),
       interleaved_payload.end());
-  record->insert(
-      record->end(), kInterleavedPaddingByteCt, 0);
   return true;
 }
 
@@ -1434,8 +1647,7 @@ bool EstimateRecordBytes(const uint32_t* context_symbol_counts,
   if (model.has_entropy) {
     const uint32_t state_ct = static_cast<uint32_t>(
         std::min<uint64_t>(params.state_ct, sample_ct));
-    result +=
-        4LLU * state_ct + kInterleavedPaddingByteCt;
+    result += 4LLU * state_ct;
     result += static_cast<uint64_t>(std::ceil(quantized_bits / 8.0L));
   }
   *record_bytes = result;
@@ -1736,6 +1948,11 @@ bool DecodeRecordToBufferImpl(
           record, record_size, &base_record_size, error)) {
     return false;
   }
+  if (IsAlternateRecord(record[0])) {
+    return DecodeAlternateRecordToBuffer(
+        record, base_record_size, anchors, anchor_ct, sample_ct,
+        target, target_word_ct, metadata, error);
+  }
   size_t offset;
   if (!ParsePrefix(
           record, base_record_size, &parsed_metadata, &offset, error)) {
@@ -1819,18 +2036,21 @@ bool DecodeRecordToBufferImpl(
       return false;
     }
   }
-  if (base_record_size - offset < kInterleavedPaddingByteCt) {
-    SetError("Truncated interleaved rANS padding.", error);
-    return false;
-  }
   const uint8_t* const payload_begin = record + offset;
-  const uint8_t* const payload_end =
-      record + base_record_size - kInterleavedPaddingByteCt;
-  for (const uint8_t* padding_iter = payload_end;
-       padding_iter != record + base_record_size; ++padding_iter) {
-    if (*padding_iter) {
-      SetError("Interleaved rANS padding is nonzero.", error);
+  const bool unpadded_payload = record[0] & kUnpaddedPayloadFlag;
+  const uint8_t* payload_end = record + base_record_size;
+  if (!unpadded_payload) {
+    if (base_record_size - offset < kInterleavedPaddingByteCt) {
+      SetError("Truncated interleaved rANS padding.", error);
       return false;
+    }
+    payload_end -= kInterleavedPaddingByteCt;
+    for (const uint8_t* padding_iter = payload_end;
+         padding_iter != record + base_record_size; ++padding_iter) {
+      if (*padding_iter) {
+        SetError("Interleaved rANS padding is nonzero.", error);
+        return false;
+      }
     }
   }
   const uint8_t* payload_iter = payload_begin;
@@ -1860,19 +2080,36 @@ bool DecodeRecordToBufferImpl(
   }
 #endif
   if (!used_vector_decoder) {
-    decode_ok =
-        (params.scale_bits == kDefaultScaleBits)
-            ? DecodeEntropyRecordInterleaved<
-                  kDefaultScaleBits>(
-                  parsed_metadata.mode, model, reference1,
-                  reference2, sample_ct, state_ct,
-                  params.scale_bits, payload_begin, payload_end,
-                  &states, target, &payload_iter, error)
-            : DecodeEntropyRecordInterleaved<0>(
-                  parsed_metadata.mode, model, reference1,
-                  reference2, sample_ct, state_ct,
-                  params.scale_bits, payload_begin, payload_end,
-                  &states, target, &payload_iter, error);
+    if ((state_ct == 4) || (state_ct == 8) ||
+        (state_ct == 16) || (state_ct == 32)) {
+      decode_ok =
+          (params.scale_bits == kDefaultScaleBits)
+              ? DecodeEntropyRecordPowerOfTwoInterleavedScalar<
+                    kDefaultScaleBits>(
+                    parsed_metadata.mode, model, reference1,
+                    reference2, sample_ct, state_ct, params.scale_bits,
+                    payload_begin, payload_end, &states, target,
+                    &payload_iter, error)
+              : DecodeEntropyRecordPowerOfTwoInterleavedScalar<0>(
+                    parsed_metadata.mode, model, reference1,
+                    reference2, sample_ct, state_ct, params.scale_bits,
+                    payload_begin, payload_end, &states, target,
+                    &payload_iter, error);
+    } else {
+      decode_ok =
+          (params.scale_bits == kDefaultScaleBits)
+              ? DecodeEntropyRecordInterleaved<
+                    kDefaultScaleBits>(
+                    parsed_metadata.mode, model, reference1,
+                    reference2, sample_ct, state_ct,
+                    params.scale_bits, payload_begin, payload_end,
+                    &states, target, &payload_iter, error)
+              : DecodeEntropyRecordInterleaved<0>(
+                    parsed_metadata.mode, model, reference1,
+                    reference2, sample_ct, state_ct,
+                    params.scale_bits, payload_begin, payload_end,
+                    &states, target, &payload_iter, error);
+    }
   }
   if (!decode_ok) {
     return false;

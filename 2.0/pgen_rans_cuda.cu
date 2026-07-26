@@ -15,6 +15,11 @@ namespace {
 constexpr uint32_t kRansLowerBound = 1U << 23;
 constexpr uint32_t kWarpSize = 32;
 constexpr uint32_t kThreadsPerBlock = 256;
+constexpr uint8_t kEntropyPayloadFlag = 0x04;
+constexpr uint8_t kUnpaddedPayloadFlag = 0x10;
+constexpr uint8_t kRawPackedRecordFlag = 0x20;
+constexpr uint8_t kSparsePredictorRecordFlag = 0x40;
+constexpr uint8_t kSparsePredictorBitmapFlag = 0x80;
 
 enum DeviceDecodeError : uint32_t {
   kDeviceDecodeSuccess = 0,
@@ -46,12 +51,18 @@ struct DeviceModelRow {
 struct DeviceWarpModel {
   DeviceModelRow rows[16];
   uint32_t entropy_offset;
+  uint32_t exception_ct;
+  uint32_t exception_id_offset;
+  uint32_t exception_value_offset;
   uint16_t context_mask;
   uint8_t mode;
   uint8_t has_entropy;
   uint8_t reference1;
   uint8_t reference2;
-  uint8_t padding[2];
+  uint8_t alternate_kind;
+  uint8_t sparse_bitmap;
+  uint8_t unpadded_payload;
+  uint8_t predictions[16];
   uint32_t error;
 };
 
@@ -144,6 +155,29 @@ __device__ uint32_t ReadDeviceU32(const uint8_t* input) {
          (static_cast<uint32_t>(input[3]) << 24);
 }
 
+__device__ bool ReadDeviceVarint(const uint8_t* input,
+                                 uint32_t input_size,
+                                 uint32_t* offset,
+                                 uint32_t* value) {
+  uint32_t result = 0;
+  for (uint32_t byte_idx = 0; byte_idx != 5; ++byte_idx) {
+    if (*offset == input_size) {
+      return false;
+    }
+    const uint8_t cur_byte = input[(*offset)++];
+    if ((byte_idx == 4) && (cur_byte & 0xf0U)) {
+      return false;
+    }
+    result |= static_cast<uint32_t>(cur_byte & 0x7fU)
+              << (7 * byte_idx);
+    if (!(cur_byte & 0x80U)) {
+      *value = result;
+      return true;
+    }
+  }
+  return false;
+}
+
 __device__ uint64_t SpreadBits32(uint32_t value) {
   uint64_t result = value;
   result = (result | (result << 16)) & 0x0000ffff0000ffffULL;
@@ -164,6 +198,7 @@ __device__ uint32_t ScheduledAnchorOffset(uint32_t anchor_idx,
 
 __device__ void ParseDeviceModel(const uint8_t* record,
                                  uint32_t record_size,
+                                 uint32_t sample_ct,
                                  uint32_t scale_bits,
                                  uint32_t anchor_ct,
                                  DeviceWarpModel* model) {
@@ -172,7 +207,14 @@ __device__ void ParseDeviceModel(const uint8_t* record,
   model->has_entropy = 0;
   model->reference1 = 0;
   model->reference2 = 0;
+  model->alternate_kind = 0;
+  model->sparse_bitmap = 0;
+  model->unpadded_payload = 0;
+  model->exception_ct = 0;
+  model->exception_id_offset = 0;
+  model->exception_value_offset = 0;
   for (uint32_t context = 0; context != 16; ++context) {
+    model->predictions[context] = 0;
     DeviceModelRow& row = model->rows[context];
     row.active_symbol_ct = 0;
     row.deterministic_symbol = 0;
@@ -187,8 +229,17 @@ __device__ void ParseDeviceModel(const uint8_t* record,
   }
   const uint8_t flags = record[0];
   model->mode = flags & 3U;
-  model->has_entropy = (flags >> 2) & 1U;
-  if ((flags & 0xf0U) || (model->mode > 2)) {
+  model->has_entropy = !!(flags & kEntropyPayloadFlag);
+  model->unpadded_payload = !!(flags & kUnpaddedPayloadFlag);
+  const bool is_raw = flags & kRawPackedRecordFlag;
+  const bool is_sparse = flags & kSparsePredictorRecordFlag;
+  if ((model->mode > 2) ||
+      (model->unpadded_payload && !model->has_entropy) ||
+      (is_raw && is_sparse) ||
+      ((flags & kSparsePredictorBitmapFlag) && !is_sparse) ||
+      ((is_raw || is_sparse) &&
+       (model->has_entropy || model->unpadded_payload)) ||
+      (is_raw && model->mode)) {
     model->error = kDeviceDecodeInvalidRecord;
     return;
   }
@@ -216,11 +267,106 @@ __device__ void ParseDeviceModel(const uint8_t* record,
       return;
     }
   }
+  if (is_raw) {
+    const uint32_t packed_byte_ct = (sample_ct + 3) / 4;
+    if ((record_size != offset + packed_byte_ct) ||
+        ((sample_ct % 4) &&
+         (record[record_size - 1] >> (2 * (sample_ct % 4))))) {
+      model->error = kDeviceDecodeInvalidRecord;
+      return;
+    }
+    model->alternate_kind = 1;
+    model->entropy_offset = offset;
+    return;
+  }
+
   uint32_t row_ct = 1;
+  if (model->mode == 1) {
+    row_ct = 4;
+  } else if (model->mode == 2) {
+    row_ct = 16;
+  }
+  if (is_sparse) {
+    const uint32_t mapping_byte_ct = (row_ct + 3) / 4;
+    if (offset + mapping_byte_ct > record_size) {
+      model->error = kDeviceDecodeInvalidRecord;
+      return;
+    }
+    for (uint32_t context = 0; context != row_ct; ++context) {
+      model->predictions[context] = static_cast<uint8_t>(
+          (record[offset + context / 4] >>
+           (2 * (context % 4))) & 3U);
+    }
+    if ((row_ct % 4) &&
+        (record[offset + mapping_byte_ct - 1] >>
+         (2 * (row_ct % 4)))) {
+      model->error = kDeviceDecodeInvalidRecord;
+      return;
+    }
+    offset += mapping_byte_ct;
+    if ((!ReadDeviceVarint(
+             record, record_size, &offset, &model->exception_ct)) ||
+        (model->exception_ct > sample_ct)) {
+      model->error = kDeviceDecodeInvalidRecord;
+      return;
+    }
+    model->exception_id_offset = offset;
+    if (flags & kSparsePredictorBitmapFlag) {
+      const uint32_t bitmap_byte_ct = (sample_ct + 7) / 8;
+      if (offset + bitmap_byte_ct > record_size) {
+        model->error = kDeviceDecodeInvalidRecord;
+        return;
+      }
+      if ((sample_ct % 8) &&
+          (record[offset + bitmap_byte_ct - 1] >>
+           (sample_ct % 8))) {
+        model->error = kDeviceDecodeInvalidRecord;
+        return;
+      }
+      uint32_t observed_ct = 0;
+      for (uint32_t byte_idx = 0; byte_idx != bitmap_byte_ct;
+           ++byte_idx) {
+        observed_ct += __popc(
+            static_cast<uint32_t>(record[offset + byte_idx]));
+      }
+      if (observed_ct != model->exception_ct) {
+        model->error = kDeviceDecodeInvalidRecord;
+        return;
+      }
+      offset += bitmap_byte_ct;
+      model->sparse_bitmap = 1;
+    } else {
+      uint32_t previous = 0;
+      for (uint32_t exception_idx = 0;
+           exception_idx != model->exception_ct; ++exception_idx) {
+        uint32_t delta = 0;
+        if ((!ReadDeviceVarint(
+                 record, record_size, &offset, &delta)) ||
+            (exception_idx && !delta) ||
+            (delta > UINT32_MAX - previous) ||
+            (previous + delta >= sample_ct)) {
+          model->error = kDeviceDecodeInvalidRecord;
+          return;
+        }
+        previous += delta;
+      }
+    }
+    model->exception_value_offset = offset;
+    const uint32_t value_byte_ct = (model->exception_ct + 3) / 4;
+    if ((record_size - offset != value_byte_ct) ||
+        ((model->exception_ct % 4) && value_byte_ct &&
+         (record[record_size - 1] >>
+          (2 * (model->exception_ct % 4))))) {
+      model->error = kDeviceDecodeInvalidRecord;
+      return;
+    }
+    model->alternate_kind = 2;
+    return;
+  }
+
   if (model->mode == 0) {
     model->context_mask = 1;
   } else if (model->mode == 1) {
-    row_ct = 4;
     if (offset == record_size) {
       model->error = kDeviceDecodeInvalidModel;
       return;
@@ -231,7 +377,6 @@ __device__ void ParseDeviceModel(const uint8_t* record,
       return;
     }
   } else {
-    row_ct = 16;
     if (offset + 2 > record_size) {
       model->error = kDeviceDecodeInvalidModel;
       return;
@@ -330,7 +475,7 @@ __global__ void DecodeRecordsKernel(
   const DeviceRecordDescriptor descriptor = descriptors[warp_idx];
   const uint8_t* record = record_bytes + descriptor.record_offset;
   if (!lane) {
-    ParseDeviceModel(record, descriptor.record_size, scale_bits,
+    ParseDeviceModel(record, descriptor.record_size, sample_ct, scale_bits,
                      descriptor.anchor_ct, model);
     if (model->error) {
       atomicCAS(global_error, kDeviceDecodeSuccess, model->error);
@@ -381,14 +526,17 @@ __global__ void DecodeRecordsKernel(
         lane_error = true;
       }
       constexpr uint32_t kPaddingByteCt = kWarpSize / 2 - 1;
+      const uint32_t padding_byte_ct =
+          model->unpadded_payload ? 0 : kPaddingByteCt;
       if (descriptor.record_size <
-          state_end_offset + kPaddingByteCt) {
+          state_end_offset + padding_byte_ct) {
         lane_error = true;
       } else {
         interleaved_offset = state_end_offset;
         interleaved_end_offset =
-            descriptor.record_size - kPaddingByteCt;
-        if ((lane < kPaddingByteCt) &&
+            descriptor.record_size - padding_byte_ct;
+        if ((!model->unpadded_payload) &&
+            (lane < kPaddingByteCt) &&
             record[interleaved_end_offset + lane]) {
           lane_error = true;
         }
@@ -404,31 +552,41 @@ __global__ void DecodeRecordsKernel(
     const uint32_t sample_idx = word_idx * kWarpSize + lane;
     uint32_t symbol = 0;
     if ((sample_idx < sample_ct) && (!lane_error)) {
-      uint32_t context = 0;
-      if (model->mode != 0) {
-        context = static_cast<uint32_t>(
-            (reference1[word_idx] >> (2 * lane)) & 3U);
-      }
-      if (model->mode == 2) {
-        context =
-            4 * context +
-            static_cast<uint32_t>(
-                (reference2[word_idx] >> (2 * lane)) & 3U);
-      }
-      const DeviceModelRow& row = model->rows[context];
-      if (!row.active_symbol_ct) {
-        lane_error = true;
-      } else if (row.active_symbol_ct == 1) {
-        symbol = row.deterministic_symbol;
+      if (model->alternate_kind == 1) {
+        symbol = static_cast<uint32_t>(
+            (record[model->entropy_offset + sample_idx / 4] >>
+             (2 * (sample_idx % 4))) & 3U);
       } else {
-        const uint32_t slot = state & slot_mask;
-        symbol =
-            static_cast<uint32_t>(slot >= row.cumulative[1]) +
-            static_cast<uint32_t>(slot >= row.cumulative[2]) +
-            static_cast<uint32_t>(slot >= row.cumulative[3]);
-        const uint32_t frequency = row.frequencies[symbol];
-        state = frequency * (state >> scale_bits) + slot -
-                row.cumulative[symbol];
+        uint32_t context = 0;
+        if (model->mode != 0) {
+          context = static_cast<uint32_t>(
+              (reference1[word_idx] >> (2 * lane)) & 3U);
+        }
+        if (model->mode == 2) {
+          context =
+              4 * context +
+              static_cast<uint32_t>(
+                  (reference2[word_idx] >> (2 * lane)) & 3U);
+        }
+        if (model->alternate_kind == 2) {
+          symbol = model->predictions[context];
+        } else {
+          const DeviceModelRow& row = model->rows[context];
+          if (!row.active_symbol_ct) {
+            lane_error = true;
+          } else if (row.active_symbol_ct == 1) {
+            symbol = row.deterministic_symbol;
+          } else {
+            const uint32_t slot = state & slot_mask;
+            symbol =
+                static_cast<uint32_t>(slot >= row.cumulative[1]) +
+                static_cast<uint32_t>(slot >= row.cumulative[2]) +
+                static_cast<uint32_t>(slot >= row.cumulative[3]);
+            const uint32_t frequency = row.frequencies[symbol];
+            state = frequency * (state >> scale_bits) + slot -
+                    row.cumulative[symbol];
+          }
+        }
       }
     }
     if (model->has_entropy) {
@@ -470,6 +628,47 @@ __global__ void DecodeRecordsKernel(
     if (!lane) {
       target[word_idx] =
           SpreadBits32(low_bits) | (SpreadBits32(high_bits) << 1);
+    }
+  }
+  __syncwarp();
+  if ((!lane) && (model->alternate_kind == 2)) {
+    uint32_t id_offset = model->exception_id_offset;
+    uint32_t exception_idx = 0;
+    uint32_t sample_idx = 0;
+    while (exception_idx != model->exception_ct) {
+      if (model->sparse_bitmap) {
+        while (!(record[id_offset + sample_idx / 8] &
+                 (1U << (sample_idx % 8)))) {
+          ++sample_idx;
+        }
+      } else {
+        uint32_t delta = 0;
+        if (!ReadDeviceVarint(
+                record, model->exception_value_offset, &id_offset,
+                &delta)) {
+          lane_error = true;
+          break;
+        }
+        sample_idx += delta;
+      }
+      const uint32_t value = static_cast<uint32_t>(
+          (record[model->exception_value_offset +
+                  exception_idx / 4] >>
+           (2 * (exception_idx % 4))) & 3U);
+      const uint32_t word_idx = sample_idx / 32;
+      const uint32_t shift = 2 * (sample_idx % 32);
+      const uint64_t value_mask = 3ULL << shift;
+      if (((target[word_idx] >> shift) & 3U) == value) {
+        lane_error = true;
+        break;
+      }
+      target[word_idx] =
+          (target[word_idx] & ~value_mask) |
+          (static_cast<uint64_t>(value) << shift);
+      ++exception_idx;
+      if (model->sparse_bitmap) {
+        ++sample_idx;
+      }
     }
   }
   if (model->has_entropy) {

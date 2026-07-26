@@ -161,7 +161,14 @@ void RoundTrip(const std::vector<uint8_t>& target,
                        sample_ct, params, &decoded, nullptr, &error),
          "multiallelic flag without a patch suffix was accepted");
   if (metadata.has_entropy_payload) {
-    std::vector<uint8_t> invalid_padding = record;
+    std::vector<uint8_t> legacy_padded = record;
+    legacy_padded[0] &= static_cast<uint8_t>(~0x10U);
+    legacy_padded.insert(legacy_padded.end(), 15, 0);
+    Expect(DecodeRecord(legacy_padded.data(), legacy_padded.size(),
+                        anchors, 8, sample_ct, params, &decoded,
+                        nullptr, &error),
+           "legacy interleaved padding was rejected");
+    std::vector<uint8_t> invalid_padding = legacy_padded;
     invalid_padding.back() = 1;
     Expect(!DecodeRecord(invalid_padding.data(), invalid_padding.size(),
                          anchors, 8, sample_ct, params, &decoded,
@@ -174,7 +181,8 @@ void TestRandomRoundTrips() {
   std::mt19937_64 rng(0x7067656e72616e73ULL);
   const uint32_t sample_counts[] = {1, 2, 31, 32, 33, 257, 4099};
   const CodecParams parameter_sets[] = {
-      {1, 8}, {7, 10}, {32, 12}, {32, 16}};
+      {1, 8}, {4, 12}, {7, 10}, {8, 12},
+      {16, 12}, {32, 12}, {32, 16}};
   for (const uint32_t sample_ct : sample_counts) {
     std::vector<uint8_t> reference1(sample_ct);
     std::vector<uint8_t> reference2(sample_ct);

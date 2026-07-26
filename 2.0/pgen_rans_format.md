@@ -31,7 +31,14 @@ The first byte contains:
 - bits 0-1: mode (`0` marginal, `1` one reference, `2` two references);
 - bit 2: rANS state and byte-renormalization payload are present;
 - bit 3: a multiallelic patch suffix is present;
-- bits 4-7: reserved and zero.
+- bit 4: the rANS payload has no legacy 15-byte zero guard;
+- bit 5: raw packed record;
+- bit 6: sparse predictor record;
+- bit 7: sparse predictor exception IDs use a bitmap.
+
+Bits 5 and 6 are mutually exclusive. Bit 7 requires bit 6. Alternate raw
+and sparse records do not set bits 2 or 4; the patch-suffix bit remains
+independent.
 
 One-reference records next store one byte containing the anchor ordinal.
 Two-reference records store two distinct anchor ordinals. The current format
@@ -60,22 +67,54 @@ When any model row has more than one active symbol, the record stores:
 1. one 32-bit initial state per lane;
 2. the byte-renormalization payload described below.
 
-The intended lane count is 32. Sample `i` belongs to lane `i mod lane_count`.
-Each lane is an independent bytewise-rANS state.
+Sample `i` belongs to lane `i mod lane_count`. Each lane is an independent
+bytewise-rANS state. The encoder API's automatic policy uses 16 lanes on
+ARM64, where the packed scalar decoder is faster as well as smaller. On x86
+it uses 16 lanes below 32768 samples and 32 lanes for larger cohorts so the
+AVX-512 path remains available. Callers can still request an explicit count;
+the CUDA decoder currently requires 32.
 
 There is no lane-boundary table. Refill bytes are merged in forward decoder
-order. Each 32-sample round visits lanes 0-15 and then 16-31. For each group,
-the decoder computes the mask of states below the rANS lower bound and consumes
-one byte for every set lane, in ascending lane order; it repeats until no lane
-in that group needs another byte. Fifteen zero bytes follow the payload. They
-make a final unaligned 16-byte CPU load safe without becoming part of the coded
-stream.
+order. Each `lane_count`-sample round visits consecutive groups of up to 16
+lanes. For each group, the decoder computes the mask of states below the rANS
+lower bound and consumes one byte for every set lane, in ascending lane order;
+it repeats until no lane in that group needs another byte. New encoders set
+record flag bit 4 and end the record at the coded stream. AVX-512 decoders use
+a masked load for the final short refill. Decoders also accept the legacy
+representation, where bit 4 is clear and fifteen validated zero guard bytes
+follow the payload.
 
 AVX-512 can load each refill layer contiguously and expand it under the state
 mask, while CUDA lanes read a coalesced span in warp order.
 
 If every populated row is deterministic, the state table and refill payload
 are omitted.
+
+## Raw and sparse alternate records
+
+The encoder compares complete serialized record sizes and can replace rANS
+with one of two exactly decoded alternatives. This is a per-record decision,
+so these modes cannot make the base record larger.
+
+A raw packed record sets bit 5, has marginal reference mode, and stores
+exactly `ceil(sample_count / 4)` bytes in ordinary two-bit sample order.
+Unused high nyps of the last byte are zero. This both caps worst-case
+expansion and provides a copy-like decode path for high-entropy records.
+
+A sparse predictor record sets bit 6 and may use marginal, one-reference, or
+two-reference mode. After any reference selectors it stores:
+
+1. one two-bit modal prediction for every context, four predictions per byte;
+2. the exception count as an unsigned base-128 varint;
+3. exception sample IDs, as either strictly increasing delta varints or a
+   `ceil(sample_count / 8)` bitmap (bit 7), whichever is smaller;
+4. the actual exception genotypes, four two-bit values per byte.
+
+Predictor mappings cover all 1, 4, or 16 contexts, including contexts absent
+from the input. Ties choose the lowest genotype. Mapping, bitmap, and value
+padding bits are zero. The CPU decoder expands predictors a packed word at a
+time; the CUDA decoder expands them warp-wide and applies sparse exceptions
+afterward.
 
 ## Multiallelic patch suffix
 
@@ -113,6 +152,7 @@ it in the stored sample order.
 A conforming decoder rejects:
 
 - unknown flag bits or modes;
+- invalid raw/sparse flag combinations, lengths, padding, or exceptions;
 - truncated selectors, models, states, or refill payloads;
 - duplicate two-reference selectors;
 - selectors outside the block anchor slab;
@@ -132,7 +172,7 @@ summary bits.  The storage-mode-specific header continues through byte 95:
 
 | Offset | Width | Value |
 | --- | ---: | --- |
-| 12 | 4 | conditional-rANS format version (`1`) |
+| 12 | 4 | conditional-rANS format version (`2`; readers also accept legacy v1) |
 | 16 | 4 | header size (`96`) |
 | 20 | 4 | variants per block |
 | 24 | 4 | anchor count |
@@ -186,10 +226,11 @@ not need to copy every record into a separate allocation.
 The CPU block decoder emits the standard variant-major packed two-bit
 hardcall layout. It first decodes the scheduled anchor slab and then dispatches
 all remaining records independently across a persistent worker pool. The
-32-state record path advances the independent states in sample order and emits
-one complete 64-bit packed genotype word per round.
+packed scalar paths for 4, 8, 16, and 32 states advance lanes in sample order
+and assemble complete 64-bit packed genotype words without a per-sample output
+loop.
 
-On x86-64 GCC and Clang builds, default 32-state/12-bit records use a
+On x86-64 GCC and Clang builds, 32-state/12-bit records use a
 runtime-dispatched AVX-512 decoder for cohorts with at least 32768 samples.
 It keeps all three model boundaries in registers, derives packed genotype bits
 directly from the threshold masks, and refills 16 states from one contiguous
@@ -204,13 +245,18 @@ CRC32 extension on AArch64, with a portable table fallback.
 
 `PackedVariantReader` is the CPU-facing compatibility layer. It accepts
 contiguous ranges or arbitrary variant-index lists, groups requests by block,
-decodes each required block once, and copies exact `(sample_count + 3) / 4`
-byte packed hardcalls into the caller's existing per-variant stride. The most
-recent decoded block is retained for adjacent or repeated requests. An
-optional sorted sample index projects the fully decoded record into a smaller
-packed output. Since rANS states cannot jump over arbitrary samples, this
-projection reduces downstream work and buffer size but not entropy-decode
-work.
+and copies exact `(sample_count + 3) / 4` byte packed hardcalls into the
+caller's existing per-variant stride. Sparse requests decode only requested
+records and their one or two scheduled marginal anchors; complete fresh-block
+requests retain the parallel dense fallback. A byte-bounded cache retains
+recent block bytes, decoded anchors, and decoded targets for adjacent or
+repeated requests. Patch-only reads still fetch and checksum the complete
+block but skip hardcall entropy decoding.
+
+An optional sorted sample index projects each decoded requested record into a
+smaller packed output. Since rANS states cannot jump over arbitrary samples,
+this projection reduces downstream work and buffer size but not the
+within-record entropy-decode work.
 
 ## Reference CLI
 

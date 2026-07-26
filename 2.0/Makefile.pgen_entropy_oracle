@@ -5,11 +5,15 @@ include Makefile
 PGENRANS_BUILD_DIR ?= build_pgen_rans
 PGENORACLE_OBJ_DIR := $(PGENRANS_BUILD_DIR)/oracle_obj
 PGENRANS_BIN_DIR := $(PGENRANS_BUILD_DIR)/bin
-PGENORACLESRC = $(PGENLIB_CCSRC) pgen_entropy_oracle.cc
+PGENORACLESRC = $(PGENLIB_CCSRC) pgen_rans_codec.cc pgen_rans_hybrid.cc \
+	pgen_entropy_oracle.cc
 PGENORACLEOBJ = $(addprefix $(PGENORACLE_OBJ_DIR)/,\
 	$(PGENORACLESRC:.cc=.o))
+PGENORACLETESTOBJ = $(addprefix $(PGENORACLE_OBJ_DIR)/,\
+	pgen_rans_codec.o pgen_rans_hybrid.o pgen_rans_container.o \
+	pgen_rans_size_test.o)
 
-.PHONY: pgen_entropy_oracle
+.PHONY: pgen_entropy_oracle pgen_rans_size_test test
 
 $(PGENORACLE_OBJ_DIR)/%.o: %.cc
 	$(MKDIR) -p $(dir $@)
@@ -20,5 +24,14 @@ pgen_entropy_oracle: $(PGENORACLEOBJ)
 	$(CXX) $(PGENORACLEOBJ) \
 		-o $(PGENRANS_BIN_DIR)/pgen_entropy_oracle $(LDFLAGS)
 
-CLEAN += $(PGENORACLEOBJ) \
-	$(PGENRANS_BIN_DIR)/pgen_entropy_oracle
+pgen_rans_size_test: $(PGENORACLETESTOBJ)
+	$(MKDIR) -p $(PGENRANS_BIN_DIR)
+	$(CXX) $(PGENORACLETESTOBJ) \
+		-o $(PGENRANS_BIN_DIR)/pgen_rans_size_test $(LDFLAGS)
+
+test: pgen_entropy_oracle pgen_rans_size_test
+	$(PGENRANS_BIN_DIR)/pgen_rans_size_test
+
+CLEAN += $(PGENORACLEOBJ) $(PGENORACLETESTOBJ) \
+	$(PGENRANS_BIN_DIR)/pgen_entropy_oracle \
+	$(PGENRANS_BIN_DIR)/pgen_rans_size_test
