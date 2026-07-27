@@ -52,6 +52,15 @@ struct ContainerMetadata {
   bool all_nonref = false;
 };
 
+struct ContainerConcatStats {
+  uint32_t input_file_ct = 0;
+  uint32_t sample_ct = 0;
+  uint32_t variant_ct = 0;
+  uint32_t block_ct = 0;
+  uint64_t copied_block_byte_ct = 0;
+  uint64_t output_byte_ct = 0;
+};
+
 struct EncodedBlock {
   uint32_t first_variant = 0;
   std::vector<std::vector<uint8_t>> records;
@@ -121,6 +130,11 @@ class ContainerWriter {
             const ContainerMetadata& metadata,
             std::string* error);
   bool WriteBlock(const EncodedBlock& block, std::string* error);
+  // Writes a validated serialized block without materializing its records.
+  // The block's local first-variant field is rebased to first_variant.
+  bool WriteSerializedBlock(uint32_t first_variant, uint32_t variant_ct,
+                            std::vector<uint8_t>* serialized,
+                            std::string* error);
   bool Close(std::string* error);
 
  private:
@@ -172,6 +186,17 @@ class ContainerReader {
   std::vector<BlockIndexEntry> block_index_;
   uint64_t file_size_ = 0;
 };
+
+// Concatenates compatible containers in input order without decoding or
+// re-encoding genotype records.  The container stores only a sample count, so
+// callers assembling PLINK filesets must separately verify identical sample
+// ID order across inputs.  output_path must not already exist.  On failure,
+// removal of a partially written output is attempted and any cleanup error is
+// reported.
+bool ConcatenateContainers(const std::vector<std::string>& input_paths,
+                           const std::string& output_path,
+                           ContainerConcatStats* stats,
+                           std::string* error);
 
 }  // namespace pgen_rans
 

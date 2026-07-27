@@ -8,6 +8,11 @@
 #include <cstddef>
 #include <cstring>
 #include <limits>
+#include <sys/stat.h>
+
+#ifdef _WIN32
+#include <windows.h>
+#endif
 
 #if defined(__x86_64__) && \
     (defined(__GNUC__) || defined(__clang__))
@@ -34,6 +39,7 @@ constexpr uint32_t kBlockIndexByteCt = 32;
 constexpr uint32_t kBlockHeaderByteCt = 16;
 constexpr uint32_t kBlockMagic = 0x314b4c42U;
 constexpr uint32_t kMaximumRecordByteCt = 0xffffffU;
+constexpr uint32_t kMaximumVariantCt = 0x7ffffffdU;
 constexpr uint32_t kContainerFlagNonrefBitmap = 1U << 0;
 constexpr uint32_t kContainerFlagAllNonref = 1U << 1;
 constexpr uint32_t kContainerKnownFlags =
@@ -46,6 +52,53 @@ void SetError(const std::string& message, std::string* error) {
   if (error) {
     *error = message;
   }
+}
+
+void RemovePartialOutput(const std::string& path, std::string* error) {
+  if (std::remove(path.c_str()) && (errno != ENOENT) && error) {
+    *error += " Failed to remove partial output " + path + ": " +
+              strerror(errno) + ".";
+  }
+}
+
+bool PathExists(const std::string& path) {
+#ifdef _WIN32
+  return GetFileAttributesA(path.c_str()) != INVALID_FILE_ATTRIBUTES;
+#else
+  struct stat path_stat;
+  return !lstat(path.c_str(), &path_stat);
+#endif
+}
+
+bool SameParams(const ContainerParams& lhs, const ContainerParams& rhs) {
+  return (lhs.sample_ct == rhs.sample_ct) &&
+         (lhs.variant_ct == rhs.variant_ct) &&
+         (lhs.block_variant_ct == rhs.block_variant_ct) &&
+         (lhs.anchor_ct == rhs.anchor_ct) &&
+         (lhs.state_ct == rhs.state_ct) &&
+         (lhs.scale_bits == rhs.scale_bits) &&
+         (lhs.restart_variant_ct == rhs.restart_variant_ct) &&
+         (lhs.block_ct == rhs.block_ct) &&
+         (lhs.max_allele_ct == rhs.max_allele_ct);
+}
+
+bool SameBlockIndex(const std::vector<BlockIndexEntry>& lhs,
+                    const std::vector<BlockIndexEntry>& rhs) {
+  if (lhs.size() != rhs.size()) {
+    return false;
+  }
+  for (size_t block_idx = 0; block_idx != lhs.size(); ++block_idx) {
+    const BlockIndexEntry& left = lhs[block_idx];
+    const BlockIndexEntry& right = rhs[block_idx];
+    if ((left.first_variant != right.first_variant) ||
+        (left.variant_ct != right.variant_ct) ||
+        (left.file_offset != right.file_offset) ||
+        (left.byte_ct != right.byte_ct) ||
+        (left.checksum != right.checksum)) {
+      return false;
+    }
+  }
+  return true;
 }
 
 #if !PGEN_RANS_ARM_CRC32C
@@ -311,6 +364,7 @@ std::vector<uint8_t> SerializeBlockIndex(
 
 bool ValidateParams(const ContainerParams& params, std::string* error) {
   if ((!params.sample_ct) || (!params.variant_ct) ||
+      (params.variant_ct > kMaximumVariantCt) ||
       (!params.block_variant_ct) || (params.block_variant_ct > UINT16_MAX) ||
       (!params.anchor_ct) || (params.anchor_ct > 256) ||
       (params.anchor_ct > params.block_variant_ct) || (!params.state_ct) ||
@@ -403,6 +457,9 @@ bool ContainerWriter::Open(const std::string& path,
       metadata_.nonref_flags.size();
   if (!Seek(file_, data_offset, error)) {
     failed_ = true;
+    fclose(file_);
+    file_ = nullptr;
+    RemovePartialOutput(path, error);
     return false;
   }
   return true;
@@ -442,6 +499,12 @@ bool ContainerWriter::WriteBlock(const EncodedBlock& block,
       return false;
     }
     record_payload_byte_ct += record.size();
+  }
+  if (record_payload_byte_ct > UINT32_MAX) {
+    SetError("Block record payload exceeds the v1 32-bit offset limit.",
+             error);
+    failed_ = true;
+    return false;
   }
   const uint64_t block_byte_ct =
       kBlockHeaderByteCt + 3LLU * block_variant_ct +
@@ -494,6 +557,118 @@ bool ContainerWriter::WriteBlock(const EncodedBlock& block,
       {block.first_variant, block_variant_ct, file_offset, block_byte_ct,
        Crc32c(serialized.data(), serialized.size())});
   next_variant_ += block_variant_ct;
+  return true;
+}
+
+bool ContainerWriter::WriteSerializedBlock(
+    uint32_t first_variant, uint32_t variant_ct,
+    std::vector<uint8_t>* serialized, std::string* error) {
+  if ((!file_) || failed_ || (!serialized)) {
+    SetError("Container writer is not writable.", error);
+    return false;
+  }
+  if ((block_index_.size() == params_.block_ct) ||
+      (first_variant != next_variant_) || (!variant_ct) ||
+      (variant_ct > params_.block_variant_ct) ||
+      (variant_ct > UINT16_MAX) ||
+      (variant_ct > params_.variant_ct) ||
+      (next_variant_ > params_.variant_ct - variant_ct) ||
+      (serialized->size() < kBlockHeaderByteCt)) {
+    SetError("Invalid or out-of-order serialized container block.", error);
+    failed_ = true;
+    return false;
+  }
+
+  size_t offset = 0;
+  uint32_t magic;
+  uint32_t old_first_variant;
+  uint16_t embedded_variant_ct;
+  uint16_t anchor_ct;
+  uint16_t restart_variant_ct;
+  uint16_t restart_offset_ct;
+  if ((!ReadU32(serialized->data(), serialized->size(), &offset, &magic)) ||
+      (!ReadU32(serialized->data(), serialized->size(), &offset,
+                &old_first_variant)) ||
+      (!ReadU16(serialized->data(), serialized->size(), &offset,
+                &embedded_variant_ct)) ||
+      (!ReadU16(serialized->data(), serialized->size(), &offset,
+                &anchor_ct)) ||
+      (!ReadU16(serialized->data(), serialized->size(), &offset,
+                &restart_variant_ct)) ||
+      (!ReadU16(serialized->data(), serialized->size(), &offset,
+                &restart_offset_ct)) ||
+      (magic != kBlockMagic) || (embedded_variant_ct != variant_ct) ||
+      (anchor_ct != std::min(params_.anchor_ct, variant_ct)) ||
+      (restart_variant_ct != params_.restart_variant_ct) ||
+      (restart_offset_ct !=
+       (variant_ct + restart_variant_ct - 1) / restart_variant_ct - 1)) {
+    SetError("Invalid serialized conditional-rANS block header.", error);
+    failed_ = true;
+    return false;
+  }
+  // Silence compilers which do not recognize that parsing this field is
+  // itself part of validating the fixed header.
+  (void)old_first_variant;
+
+  uint64_t record_payload_byte_ct = 0;
+  std::vector<uint32_t> expected_restart_offsets;
+  expected_restart_offsets.reserve(restart_offset_ct);
+  for (uint32_t variant_idx = 0; variant_idx != variant_ct; ++variant_idx) {
+    uint32_t record_byte_ct;
+    if ((!ReadU24(serialized->data(), serialized->size(), &offset,
+                  &record_byte_ct)) ||
+        (!record_byte_ct)) {
+      SetError("Invalid serialized block record-length table.", error);
+      failed_ = true;
+      return false;
+    }
+    record_payload_byte_ct += record_byte_ct;
+    const uint32_t completed_variant_ct = variant_idx + 1;
+    if ((completed_variant_ct < variant_ct) &&
+        (!(completed_variant_ct % restart_variant_ct))) {
+      if (record_payload_byte_ct > UINT32_MAX) {
+        SetError("Serialized block restart offset exceeds format limits.",
+                 error);
+        failed_ = true;
+        return false;
+      }
+      expected_restart_offsets.push_back(
+          static_cast<uint32_t>(record_payload_byte_ct));
+    }
+  }
+  for (uint32_t restart_idx = 0; restart_idx != restart_offset_ct;
+       ++restart_idx) {
+    uint32_t restart_offset;
+    if ((!ReadU32(serialized->data(), serialized->size(), &offset,
+                  &restart_offset)) ||
+        (restart_offset != expected_restart_offsets[restart_idx])) {
+      SetError("Invalid serialized block restart-offset table.", error);
+      failed_ = true;
+      return false;
+    }
+  }
+  if ((record_payload_byte_ct > UINT32_MAX) ||
+      (record_payload_byte_ct != serialized->size() - offset)) {
+    SetError("Serialized block record lengths do not span its payload.",
+             error);
+    failed_ = true;
+    return false;
+  }
+
+  (*serialized)[4] = static_cast<uint8_t>(first_variant);
+  (*serialized)[5] = static_cast<uint8_t>(first_variant >> 8);
+  (*serialized)[6] = static_cast<uint8_t>(first_variant >> 16);
+  (*serialized)[7] = static_cast<uint8_t>(first_variant >> 24);
+  uint64_t file_offset;
+  if ((!Tell(file_, &file_offset, error)) ||
+      (!WriteBytes(file_, serialized->data(), serialized->size(), error))) {
+    failed_ = true;
+    return false;
+  }
+  block_index_.push_back(
+      {first_variant, variant_ct, file_offset, serialized->size(),
+       Crc32c(serialized->data(), serialized->size())});
+  next_variant_ += variant_ct;
   return true;
 }
 
@@ -938,6 +1113,206 @@ bool ContainerReader::FindBlock(uint32_t variant_idx, uint32_t* block_idx,
   }
   *block_idx = static_cast<uint32_t>(
       std::distance(block_index_.begin(), iter - 1));
+  return true;
+}
+
+bool ConcatenateContainers(const std::vector<std::string>& input_paths,
+                           const std::string& output_path,
+                           ContainerConcatStats* stats,
+                           std::string* error) {
+  if (stats) {
+    *stats = {};
+  }
+  if (input_paths.empty() || output_path.empty()) {
+    SetError("Conditional-rANS concatenation requires input and output paths.",
+             error);
+    return false;
+  }
+  for (const std::string& input_path : input_paths) {
+    if (input_path == output_path) {
+      SetError("Conditional-rANS concatenation output is also an input.",
+               error);
+      return false;
+    }
+  }
+  if (PathExists(output_path)) {
+    SetError("Conditional-rANS concatenation output already exists.", error);
+    return false;
+  }
+  if (input_paths.size() > UINT32_MAX) {
+    SetError("Too many conditional-rANS concatenation inputs.", error);
+    return false;
+  }
+
+  ContainerParams output_params;
+  ContainerMetadata output_metadata;
+  uint64_t variant_ct = 0;
+  uint64_t block_ct = 0;
+  uint64_t copied_block_byte_ct = 0;
+  bool saw_nonref = false;
+  bool saw_ref = false;
+  std::vector<ContainerParams> input_params;
+  std::vector<ContainerMetadata> input_metadata;
+  std::vector<std::vector<BlockIndexEntry>> input_block_indexes;
+  input_params.reserve(input_paths.size());
+  input_metadata.reserve(input_paths.size());
+  input_block_indexes.reserve(input_paths.size());
+  for (uint32_t input_idx = 0; input_idx != input_paths.size();
+       ++input_idx) {
+    ContainerReader reader;
+    if (!reader.Open(input_paths[input_idx], error)) {
+      return false;
+    }
+    const ContainerParams& params = reader.params();
+    if (!input_idx) {
+      output_params = params;
+      output_params.variant_ct = 0;
+      output_params.block_ct = 0;
+    } else if ((params.sample_ct != output_params.sample_ct) ||
+               (params.anchor_ct != output_params.anchor_ct) ||
+               (params.state_ct != output_params.state_ct) ||
+               (params.scale_bits != output_params.scale_bits) ||
+               (params.restart_variant_ct !=
+                output_params.restart_variant_ct)) {
+      SetError("Conditional-rANS inputs have incompatible parameters.",
+               error);
+      return false;
+    }
+    output_params.block_variant_ct =
+        std::max(output_params.block_variant_ct, params.block_variant_ct);
+    output_params.max_allele_ct =
+        std::max(output_params.max_allele_ct, params.max_allele_ct);
+    if ((variant_ct + params.variant_ct > kMaximumVariantCt) ||
+        (block_ct + params.block_ct > UINT32_MAX)) {
+      SetError("Conditional-rANS concatenation count exceeds format limits.",
+               error);
+      return false;
+    }
+    const uint32_t global_first_variant =
+        static_cast<uint32_t>(variant_ct);
+    const ContainerMetadata& metadata = reader.metadata();
+    input_params.push_back(params);
+    input_metadata.push_back(metadata);
+    input_block_indexes.push_back(reader.block_index());
+    for (uint32_t local_variant_idx = 0;
+         local_variant_idx != params.variant_ct; ++local_variant_idx) {
+      const bool is_nonref =
+          metadata.all_nonref ||
+          ((!metadata.nonref_flags.empty()) &&
+           ((metadata.nonref_flags[local_variant_idx / 8] >>
+             (local_variant_idx % 8)) &
+            1U));
+      saw_nonref |= is_nonref;
+      saw_ref |= !is_nonref;
+      if (is_nonref) {
+        const uint32_t global_variant_idx =
+            global_first_variant + local_variant_idx;
+        const size_t required_byte_ct =
+            static_cast<size_t>(global_variant_idx / 8) + 1;
+        if (output_metadata.nonref_flags.size() < required_byte_ct) {
+          output_metadata.nonref_flags.resize(required_byte_ct, 0);
+        }
+        output_metadata.nonref_flags[global_variant_idx / 8] |=
+            static_cast<uint8_t>(1U << (global_variant_idx % 8));
+      }
+    }
+    for (const BlockIndexEntry& entry : reader.block_index()) {
+      if (copied_block_byte_ct > UINT64_MAX - entry.byte_ct) {
+        SetError("Conditional-rANS concatenation byte count overflow.",
+                 error);
+        return false;
+      }
+      copied_block_byte_ct += entry.byte_ct;
+    }
+    variant_ct += params.variant_ct;
+    block_ct += params.block_ct;
+  }
+  output_params.variant_ct = static_cast<uint32_t>(variant_ct);
+  output_params.block_ct = static_cast<uint32_t>(block_ct);
+  if (!saw_nonref) {
+    output_metadata.nonref_flags.clear();
+  } else if (!saw_ref) {
+    output_metadata.nonref_flags.clear();
+    output_metadata.all_nonref = true;
+  } else {
+    output_metadata.nonref_flags.resize(
+        (static_cast<size_t>(output_params.variant_ct) + 7) / 8, 0);
+  }
+  const uint64_t output_overhead_byte_ct =
+      kFileHeaderByteCt +
+      static_cast<uint64_t>(output_params.block_ct) * kBlockIndexByteCt +
+      output_metadata.nonref_flags.size();
+  if ((copied_block_byte_ct >
+       UINT64_MAX - output_overhead_byte_ct) ||
+      (copied_block_byte_ct + output_overhead_byte_ct >
+       static_cast<uint64_t>(std::numeric_limits<int64_t>::max()))) {
+    SetError("Conditional-rANS concatenation output exceeds file limits.",
+             error);
+    return false;
+  }
+
+  ContainerWriter writer;
+  if (!writer.Open(output_path, output_params, output_metadata, error)) {
+    return false;
+  }
+  uint32_t global_first_variant = 0;
+  bool success = true;
+  std::vector<uint8_t> serialized;
+  for (uint32_t input_idx = 0; input_idx != input_paths.size();
+       ++input_idx) {
+    const std::string& input_path = input_paths[input_idx];
+    ContainerReader reader;
+    if (!reader.Open(input_path, error)) {
+      success = false;
+      break;
+    }
+    const ContainerMetadata& metadata = reader.metadata();
+    if ((!SameParams(reader.params(), input_params[input_idx])) ||
+        (metadata.all_nonref != input_metadata[input_idx].all_nonref) ||
+        (metadata.nonref_flags !=
+         input_metadata[input_idx].nonref_flags) ||
+        (!SameBlockIndex(reader.block_index(),
+                         input_block_indexes[input_idx]))) {
+      SetError(
+          "Conditional-rANS input changed during concatenation.", error);
+      success = false;
+      break;
+    }
+    for (uint32_t block_idx = 0; block_idx != reader.params().block_ct;
+         ++block_idx) {
+      EncodedBlockView view;
+      if ((!reader.ReadBlockView(block_idx, &serialized, &view, error)) ||
+          (!writer.WriteSerializedBlock(global_first_variant,
+                                        view.variant_ct(), &serialized,
+                                        error))) {
+        success = false;
+        break;
+      }
+      global_first_variant += view.variant_ct();
+    }
+    if (!success) {
+      break;
+    }
+  }
+  if (success) {
+    success = writer.Close(error);
+  }
+  if (!success) {
+    std::string ignored_error;
+    writer.Close(&ignored_error);
+    RemovePartialOutput(output_path, error);
+    return false;
+  }
+
+  if (stats) {
+    stats->input_file_ct = static_cast<uint32_t>(input_paths.size());
+    stats->sample_ct = output_params.sample_ct;
+    stats->variant_ct = output_params.variant_ct;
+    stats->block_ct = output_params.block_ct;
+    stats->copied_block_byte_ct = copied_block_byte_ct;
+    stats->output_byte_ct =
+        output_overhead_byte_ct + copied_block_byte_ct;
+  }
   return true;
 }
 

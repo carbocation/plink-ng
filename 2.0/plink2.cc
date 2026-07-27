@@ -126,6 +126,34 @@ static_assert(CompileTimeSlen(ver_str) + CompileTimeSlen(ver_str2) == 160, "ver_
 #endif
 static const char errstr_append[] = "For more info, try \"" PROG_NAME_STR " --help <flag name>\" or \"" PROG_NAME_STR " --help | more\".\n";
 
+static uint32_t RansConcatCanBeFinalOutput(int argc, char** argv) {
+  // The direct merge already implements the options below.  With any other
+  // option, retain the concatenated rANS fileset as the normal pmerge
+  // intermediate so Plink2Core can apply downstream filters or updates.
+  static const char* const kAllowedFlags[] = {
+      "allow-misleading-out-arg", "debug", "delete-pmerge-result",
+      "indiv-sort", "make-pgen", "memory", "out", "pfile", "pgen",
+      "pmerge", "pmerge-list", "psam", "pvar", "randmem", "seed",
+      "silent", "threads"};
+  for (int arg_idx = 1; arg_idx != argc; ++arg_idx) {
+    const char* flagname = IsCmdlineFlagStart(argv[arg_idx]);
+    if (!flagname) {
+      continue;
+    }
+    bool is_allowed = false;
+    for (const char* allowed_flag : kAllowedFlags) {
+      if (!strcmp(flagname, allowed_flag)) {
+        is_allowed = true;
+        break;
+      }
+    }
+    if (!is_allowed) {
+      return 0;
+    }
+  }
+  return 1;
+}
+
 #ifndef NOLAPACK
 static const char notestr_null_calc2[] = "Commands include --rm-dup list, --make-bpgen, --export, --freq, --geno-counts,\n--sample-counts, --missing, --hardy, --mendel, --het, --fst, --indep-pairwise,\n--r2-phased, --sample-diff, --make-king, --king-cutoff, --pmerge, --pgen-diff,\n--check-sex, --write-samples, --write-snplist, --make-grm-list, --pca, --glm,\n--adjust-file, --gwas-ssf, --pheno-svd, --clump, --score-list, --variant-score,\n--genotyping-rate, --pgen-info, --validate, and --zst-decompress.\n\n\"" PROG_NAME_STR " --help | more\" describes all functions.\n";
 #else
@@ -13492,19 +13520,36 @@ int main(int argc, char** argv) {
 
       if (pc.command_flags1 & kfCommand1Pmerge) {
         const LoadFilterLogFlags load_filter_log_merge_flags = pc.load_filter_log_flags & kfLoadFilterLogMergeMask;
-        char* merge_outname_end = outname_end;
-        if (make_plink2_flags & (kfMakePgen | kfMakePvar | kfMakePsam)) {
-          merge_outname_end = strcpya_k(merge_outname_end, "-merge");
-        }
-        reterr = Pmerge(&pmerge_info, pc.sample_sort_fname, pc.missing_catname, pc.varid_template_str, pc.varid_multi_template_str, pc.varid_multi_nonsnp_template_str, pc.missing_varid_match, pc.misc_flags, load_filter_log_merge_flags, pc.sample_sort_mode, pc.fam_cols, pc.missing_pheno, pc.new_variant_id_max_allele_slen, pc.input_missing_geno_char, pc.max_thread_ct, pc.sort_vars_mode, pgenname, psamname, pvarname, outname, merge_outname_end, &chr_info);
+        const uint32_t write_pmerge_intermediate =
+            !!(make_plink2_flags &
+               (kfMakePgen | kfMakePvar | kfMakePsam));
+        const uint32_t prefer_rans_concat =
+            (make_plink2_flags & kfMakePgenRans) &&
+            (!(pc.command_flags1 &
+               (~(kfCommand1Pmerge | kfCommand1MakePlink2))));
+        const uint32_t rans_concat_final_output =
+            prefer_rans_concat &&
+            (make_plink2_flags ==
+             S_CAST(MakePlink2Flags,
+                    kfMakePgen | kfMakePvar | kfMakePsam |
+                        kfMakePgenRans)) &&
+            (pc.pvar_psam_flags ==
+             S_CAST(PvarPsamFlags,
+                    kfPvarColDefault | kfPsamColDefault)) &&
+            RansConcatCanBeFinalOutput(argc, argv);
+        uint32_t rans_concat_finalized;
+        reterr = Pmerge(&pmerge_info, pc.sample_sort_fname, pc.missing_catname, pc.varid_template_str, pc.varid_multi_template_str, pc.varid_multi_nonsnp_template_str, pc.missing_varid_match, pc.misc_flags, load_filter_log_merge_flags, pc.sample_sort_mode, pc.fam_cols, pc.missing_pheno, pc.new_variant_id_max_allele_slen, pc.input_missing_geno_char, pc.max_thread_ct, pc.sort_vars_mode, prefer_rans_concat, rans_concat_final_output, write_pmerge_intermediate, pgenname, psamname, pvarname, outname, outname_end, &chr_info, &rans_concat_finalized);
         if (unlikely(reterr)) {
           goto main_ret_1;
         }
         pc.command_flags1 ^= kfCommand1Pmerge;
+        if (rans_concat_finalized) {
+          pc.command_flags1 ^= kfCommand1MakePlink2;
+        }
         if (!pc.command_flags1) {
           goto main_ret_1;
         }
-        if (delete_pmerge_result) {
+        if (delete_pmerge_result && (!rans_concat_finalized)) {
           if (unlikely(PushLlStr(pgenname, &file_delete_list) ||
                        PushLlStr(pvarname, &file_delete_list) ||
                        PushLlStr(psamname, &file_delete_list))) {

@@ -311,8 +311,33 @@ with more than two alleles at any variant currently require `--read-freq` for
 scoring; multiallelic `--make-pgen`, `--r-unphased`, and allele-aware A/Av
 exports are exact, while PCA, frequency scans, LD pruning, clumping, and
 genotype-frequency filters are currently limited to biallelic filesets.
-Merge and other construction commands continue to use the upstream
-general-purpose PGEN storage mode as their working format.
+Other construction commands continue to use the upstream general-purpose
+PGEN storage mode as their working format.
+
+Nonoverlapping conditional-rANS shards can be merged without decoding and
+re-encoding their genotype records:
+
+```sh
+plink2 --pmerge-list shards.txt pfile \
+  --make-pgen format=rans \
+  --indiv-sort none \
+  --out cohort
+```
+
+The direct path preserves each compressed record byte-for-byte, rebases block
+variant offsets, rebuilds the block index and checksums, and combines
+nonreference metadata. All inputs must use compatible conditional-rANS codec
+parameters, contain identical samples in identical order, and already be in
+concatenable variant order without filtering, overlapping variant ranges, or
+duplicate-variant merging. `--indiv-sort none` is only needed when the common
+input order should be retained instead of PLINK's default sample sort. Mixing
+ordinary and conditional-rANS PGEN inputs is rejected; ordinary-only merges
+continue through the existing upstream merge and optional re-encode path.
+When downstream filters, metadata updates, or nondefault PVAR/PSAM output
+modifiers are present, PLINK first performs the block-copy merge to the normal
+`-merge` intermediate and then runs the regular `--make-pgen` step. Thus those
+options retain their usual semantics, while the no-reencode shortcut is
+reserved for a plain final concatenation.
 
 Encode an unphased hardcall PGEN, including exact multiallelic calls:
 

@@ -21,6 +21,7 @@ using pgen_rans::AppendMultiallelicPatches;
 using pgen_rans::ContainerParams;
 using pgen_rans::ContainerMetadata;
 using pgen_rans::ContainerReader;
+using pgen_rans::ContainerConcatStats;
 using pgen_rans::ContainerWriter;
 using pgen_rans::CpuBlockDecoder;
 using pgen_rans::EncodedBlockView;
@@ -123,6 +124,83 @@ MemoryReader LoadMemoryReader(const std::string& path) {
          "could not read temporary container");
   Expect(fclose(input) == 0, "could not close temporary container");
   return result;
+}
+
+void WriteSourceContainer(
+    const std::string& path,
+    const std::vector<std::vector<uint64_t>>& source,
+    const std::vector<MultiallelicPatches>& source_patches,
+    uint32_t source_first_variant, uint32_t variant_ct,
+    uint32_t sample_ct, uint32_t block_variant_ct, uint32_t anchor_ct,
+    uint32_t restart_variant_ct, uint32_t max_allele_ct,
+    const CodecParams& codec_params, const ContainerMetadata& metadata) {
+  const uint32_t block_ct =
+      (variant_ct + block_variant_ct - 1) / block_variant_ct;
+  const ContainerParams params = {
+      sample_ct, variant_ct, block_variant_ct, anchor_ct,
+      codec_params.state_ct, codec_params.scale_bits, restart_variant_ct,
+      block_ct, max_allele_ct};
+  std::string error;
+  ContainerWriter writer;
+  Expect(writer.Open(path, params, metadata, &error),
+         "shard writer open failed: " + error);
+  uint32_t local_first_variant = 0;
+  while (local_first_variant != variant_ct) {
+    const uint32_t block_variant_ct_actual =
+        std::min(block_variant_ct, variant_ct - local_first_variant);
+    const std::vector<uint32_t> anchor_offsets =
+        ScheduledAnchorOffsets(block_variant_ct_actual, anchor_ct);
+    EncodedBlock block;
+    block.first_variant = local_first_variant;
+    block.records.resize(block_variant_ct_actual);
+    for (uint32_t variant_offset = 0;
+         variant_offset != block_variant_ct_actual; ++variant_offset) {
+      const uint32_t source_variant_idx =
+          source_first_variant + local_first_variant + variant_offset;
+      RecordMode mode = RecordMode::kMarginal;
+      uint8_t reference1 = 0;
+      uint8_t reference2 = 0;
+      const uint64_t* reference1_data = nullptr;
+      const uint64_t* reference2_data = nullptr;
+      const auto anchor_iter =
+          std::find(anchor_offsets.begin(), anchor_offsets.end(),
+                    variant_offset);
+      if (anchor_iter == anchor_offsets.end()) {
+        reference1 =
+            static_cast<uint8_t>(variant_offset % anchor_offsets.size());
+        reference1_data =
+            source[source_first_variant + local_first_variant +
+                   anchor_offsets[reference1]]
+                .data();
+        if (variant_offset % 2) {
+          mode = RecordMode::kOneReference;
+        } else {
+          mode = RecordMode::kTwoReference;
+          reference2 =
+              static_cast<uint8_t>((reference1 + 1) % anchor_offsets.size());
+          reference2_data =
+              source[source_first_variant + local_first_variant +
+                     anchor_offsets[reference2]]
+                  .data();
+        }
+      }
+      Expect(EncodeRecord(
+                 source[source_variant_idx].data(), reference1_data,
+                 reference2_data, sample_ct, mode, reference1, reference2,
+                 codec_params, &block.records[variant_offset], &error),
+             "shard record encode failed: " + error);
+      if (source_patches[source_variant_idx].allele_ct > 2) {
+        Expect(AppendMultiallelicPatches(
+                   sample_ct, source_patches[source_variant_idx],
+                   &block.records[variant_offset], &error),
+               "shard record patch encode failed: " + error);
+      }
+    }
+    Expect(writer.WriteBlock(block, &error),
+           "shard block write failed: " + error);
+    local_first_variant += block_variant_ct_actual;
+  }
+  Expect(writer.Close(&error), "shard writer close failed: " + error);
 }
 
 }  // namespace
@@ -597,6 +675,130 @@ int main() {
          "packed reader did not clear its sample subset");
   packed_reader.Close();
 
+  const std::string shard1_path = TemporaryPath();
+  const std::string shard2_path = TemporaryPath();
+  const std::string concat_path = TemporaryPath();
+  ContainerMetadata shard1_metadata;
+  shard1_metadata.all_nonref = true;
+  const ContainerMetadata shard2_metadata;
+  WriteSourceContainer(
+      shard1_path, source, source_patches, 0, 7, kSampleCt, 4, kAnchorCt,
+      4, 3, codec_params, shard1_metadata);
+  WriteSourceContainer(
+      shard2_path, source, source_patches, 7, 12, kSampleCt, 5, kAnchorCt,
+      4, 5, codec_params, shard2_metadata);
+
+  std::vector<std::vector<uint8_t>> shard_records;
+  for (const std::string& shard_path :
+       std::vector<std::string>{shard1_path, shard2_path}) {
+    ContainerReader shard_reader;
+    Expect(shard_reader.Open(shard_path, &error),
+           "shard reader open failed: " + error);
+    for (uint32_t block_idx = 0;
+         block_idx != shard_reader.params().block_ct; ++block_idx) {
+      std::vector<uint8_t> storage;
+      EncodedBlockView view;
+      Expect(shard_reader.ReadBlockView(
+                 block_idx, &storage, &view, &error),
+             "shard block view failed: " + error);
+      for (uint32_t variant_offset = 0;
+           variant_offset != view.variant_ct(); ++variant_offset) {
+        const pgen_rans::ByteSpan record = view.record(variant_offset);
+        shard_records.emplace_back(record.data, record.data + record.size);
+      }
+    }
+  }
+
+  ContainerConcatStats concat_stats;
+  Expect(pgen_rans::ConcatenateContainers(
+             {shard1_path, shard2_path}, concat_path, &concat_stats, &error),
+         "container concatenation failed: " + error);
+  Expect((concat_stats.input_file_ct == 2) &&
+             (concat_stats.sample_ct == kSampleCt) &&
+             (concat_stats.variant_ct == kVariantCt) &&
+             (concat_stats.block_ct == 5) &&
+             (concat_stats.output_byte_ct >
+              concat_stats.copied_block_byte_ct),
+         "container concatenation statistics mismatch");
+  ContainerReader concat_reader;
+  Expect(concat_reader.Open(concat_path, &error),
+         "concatenated reader open failed: " + error);
+  Expect((concat_reader.params().variant_ct == kVariantCt) &&
+             (concat_reader.params().block_variant_ct == 5) &&
+             (concat_reader.params().max_allele_ct == 5),
+         "concatenated container parameters mismatch");
+  std::vector<uint8_t> expected_concat_nonref_flags(
+      (kVariantCt + 7) / 8, 0);
+  for (uint32_t variant_idx = 0; variant_idx != 7; ++variant_idx) {
+    expected_concat_nonref_flags[variant_idx / 8] |=
+        static_cast<uint8_t>(1U << (variant_idx % 8));
+  }
+  Expect((concat_reader.metadata().nonref_flags ==
+          expected_concat_nonref_flags) &&
+             (!concat_reader.metadata().all_nonref),
+         "concatenated nonreference bitmap mismatch");
+  uint32_t concatenated_variant_idx = 0;
+  for (uint32_t block_idx = 0;
+       block_idx != concat_reader.params().block_ct; ++block_idx) {
+    std::vector<uint8_t> storage;
+    EncodedBlockView view;
+    Expect(concat_reader.ReadBlockView(
+               block_idx, &storage, &view, &error),
+           "concatenated block view failed: " + error);
+    Expect(view.first_variant() == concatenated_variant_idx,
+           "concatenated block was not rebased");
+    const std::vector<uint32_t> anchor_offsets =
+        ScheduledAnchorOffsets(view.variant_ct(), kAnchorCt);
+    std::vector<std::vector<uint64_t>> anchors(anchor_offsets.size());
+    std::vector<const uint64_t*> anchor_ptrs(anchor_offsets.size());
+    for (uint32_t anchor_idx = 0; anchor_idx != anchor_offsets.size();
+         ++anchor_idx) {
+      const pgen_rans::ByteSpan record =
+          view.record(anchor_offsets[anchor_idx]);
+      Expect(DecodeRecord(
+                 record.data, record.size, nullptr, 0, kSampleCt,
+                 codec_params, &anchors[anchor_idx], nullptr, &error),
+             "concatenated anchor decode failed: " + error);
+      anchor_ptrs[anchor_idx] = anchors[anchor_idx].data();
+    }
+    for (uint32_t variant_offset = 0;
+         variant_offset != view.variant_ct(); ++variant_offset) {
+      const pgen_rans::ByteSpan record = view.record(variant_offset);
+      Expect(std::vector<uint8_t>(record.data, record.data + record.size) ==
+                 shard_records[concatenated_variant_idx],
+             "concatenation changed a compressed record");
+      std::vector<uint64_t> decoded;
+      Expect(DecodeRecord(
+                 record.data, record.size, anchor_ptrs.data(),
+                 static_cast<uint32_t>(anchor_ptrs.size()), kSampleCt,
+                 codec_params, &decoded, nullptr, &error),
+             "concatenated record decode failed: " + error);
+      ExpectEqual(decoded, source[concatenated_variant_idx], kSampleCt);
+      ++concatenated_variant_idx;
+    }
+  }
+  Expect(concatenated_variant_idx == kVariantCt,
+         "concatenated blocks did not span all variants");
+  concat_reader.Close();
+  Expect(!pgen_rans::ConcatenateContainers(
+             {shard1_path}, concat_path, nullptr, &error),
+         "concatenation accepted a preexisting output");
+
+  const std::string incompatible_path = TemporaryPath();
+  const std::string rejected_path = TemporaryPath();
+  WriteSourceContainer(
+      incompatible_path, source, source_patches, 0, 3, kSampleCt, 3,
+      kAnchorCt, 2, 3, codec_params, {});
+  Expect(!pgen_rans::ConcatenateContainers(
+             {shard1_path, incompatible_path}, rejected_path, nullptr,
+             &error),
+         "incompatible restart intervals were accepted");
+  Expect(access(rejected_path.c_str(), F_OK) != 0,
+         "failed concatenation left a partial output");
+  Expect(!pgen_rans::ConcatenateContainers(
+             {shard1_path}, shard1_path, nullptr, &error),
+         "concatenation accepted an input as its output");
+
   FILE* corrupt_file = fopen(path.c_str(), "r+b");
   Expect(corrupt_file != nullptr, "could not reopen temporary container");
   Expect(fseeko(corrupt_file, -1, SEEK_END) == 0,
@@ -621,6 +823,14 @@ int main() {
          "patch-only read bypassed block checksum validation");
   sparse_reader.Close();
 
+  Expect(unlink(shard1_path.c_str()) == 0,
+         "first shard cleanup failed");
+  Expect(unlink(shard2_path.c_str()) == 0,
+         "second shard cleanup failed");
+  Expect(unlink(concat_path.c_str()) == 0,
+         "concatenated file cleanup failed");
+  Expect(unlink(incompatible_path.c_str()) == 0,
+         "incompatible shard cleanup failed");
   Expect(unlink(path.c_str()) == 0, "temporary file cleanup failed");
   puts("pgen_rans_container_test: PASS");
   return 0;

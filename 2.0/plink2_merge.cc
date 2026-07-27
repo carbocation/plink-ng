@@ -22,7 +22,10 @@
 #include <stddef.h>
 #include <stdlib.h>
 #include <string.h>
+#include <string>
+#include <sys/stat.h>
 #include <unistd.h>
+#include <vector>
 
 #include "include/pgenlib_misc.h"
 #include "include/pgenlib_write.h"
@@ -38,6 +41,7 @@
 #include "plink2_decompress.h"
 #include "plink2_data.h"
 #include "plink2_pvar.h"
+#include "pgen_rans_container.h"
 
 #ifdef __cplusplus
 namespace plink2 {
@@ -145,6 +149,110 @@ PmergeInputFilesetLl* AllocFilesetLlEntry(PmergeInputFilesetLl*** filesets_endpp
   **filesets_endpp = new_entry;
   *filesets_endpp = &(new_entry->next);
   return new_entry;
+}
+
+static PglErr ProbeAllRansContainers(
+    const PmergeInputFilesetLl* filesets, uint32_t* all_ransp,
+    uint32_t* any_ransp) {
+  *all_ransp = 1;
+  *any_ransp = 0;
+  for (const PmergeInputFilesetLl* filesets_iter = filesets;
+       filesets_iter; filesets_iter = filesets_iter->next) {
+    FILE* infile = fopen(filesets_iter->pgen_fname, "rb");
+    if (unlikely(!infile)) {
+      logerrprintfww(kErrprintfFopen, filesets_iter->pgen_fname,
+                     strerror(errno));
+      return kPglRetOpenFail;
+    }
+    unsigned char magic[3];
+    const size_t byte_ct = fread(magic, 1, sizeof(magic), infile);
+    const uint32_t read_error = ferror(infile);
+    const uint32_t close_error = fclose(infile);
+    if (unlikely((byte_ct != sizeof(magic)) || read_error || close_error)) {
+      logerrprintfww("Error: Failed to read %s: %s.\n",
+                     filesets_iter->pgen_fname,
+                     read_error || close_error ? strerror(errno)
+                                               : "file is too short");
+      return kPglRetReadFail;
+    }
+    const uint32_t is_rans =
+        (magic[0] == 0x6c) && (magic[1] == 0x1b) &&
+        (magic[2] == pgen_rans::kPgenRansStorageMode);
+    *any_ransp |= is_rans;
+    if (!is_rans) {
+      *all_ransp = 0;
+    }
+  }
+  return kPglRetSuccess;
+}
+
+static bool PathsAlias(const char* path1, const char* path2) {
+  if (!strcmp(path1, path2)) {
+    return true;
+  }
+#ifdef _WIN32
+  return false;
+#else
+  struct stat stat1;
+  struct stat stat2;
+  return (!stat(path1, &stat1)) && (!stat(path2, &stat2)) &&
+         (stat1.st_dev == stat2.st_dev) && (stat1.st_ino == stat2.st_ino);
+#endif
+}
+
+static bool RansPathExists(const char* path) {
+#ifdef _WIN32
+  return GetFileAttributesA(path) != INVALID_FILE_ATTRIBUTES;
+#else
+  struct stat path_stat;
+  return !lstat(path, &path_stat);
+#endif
+}
+
+static PglErr RejectRansOutputAliases(
+    const PmergeInputFilesetLl* filesets, const char* output_prefix,
+    uint32_t output_pvar_zst) {
+  const std::string output_pgen =
+      std::string(output_prefix) + ".pgen";
+  const std::string output_pvar =
+      std::string(output_prefix) +
+      (output_pvar_zst ? ".pvar.zst" : ".pvar");
+  const std::string output_psam =
+      std::string(output_prefix) + ".psam";
+  const char* output_paths[] = {
+      output_pgen.c_str(), output_pvar.c_str(), output_psam.c_str()};
+  for (const PmergeInputFilesetLl* filesets_iter = filesets;
+       filesets_iter; filesets_iter = filesets_iter->next) {
+    const char* input_paths[] = {
+        filesets_iter->pgen_fname, filesets_iter->pvar_fname,
+        filesets_iter->psam_fname};
+    for (const char* output_path : output_paths) {
+      for (const char* input_path : input_paths) {
+        if (PathsAlias(output_path, input_path)) {
+          logerrprintfww(
+              "Error: Direct conditional-rANS merge output %s aliases "
+              "input %s.\n",
+              output_path, input_path);
+          return kPglRetInconsistentInput;
+        }
+      }
+    }
+  }
+  return kPglRetSuccess;
+}
+
+static bool RansOutputFilesetExists(const char* output_prefix,
+                                    uint32_t output_pvar_zst) {
+  const std::string output_pgen =
+      std::string(output_prefix) + ".pgen";
+  const std::string output_pvar =
+      std::string(output_prefix) +
+      (output_pvar_zst ? ".pvar.zst" : ".pvar");
+  const std::string output_psam =
+      std::string(output_prefix) + ".psam";
+  return RansPathExists(output_pgen.c_str()) ||
+         RansPathExists(output_pvar.c_str()) ||
+         RansPathExists(output_psam.c_str());
 }
 
 PglErr LoadPmergeList(const char* list_fname, const char* list_base_dir, PmergeListMode mode, uint32_t main_fileset_present, PmergeInputFilesetLl*** filesets_endpp, uintptr_t* fileset_ctp) {
@@ -6235,7 +6343,7 @@ int32_t SamePosPvarRecordNcmp(const void* r1, const void* r2) {
 }
 #endif
 
-PglErr ConcatPvariantPos(int32_t cur_bp, uintptr_t variant_ct, PvariantPosMergeContext* ppmcp, SamePosPvarRecord** same_pos_records, MergeReader* mrp, MergeWriter* mwp) {
+PglErr ConcatPvariantPos(int32_t cur_bp, uintptr_t variant_ct, PvariantPosMergeContext* ppmcp, SamePosPvarRecord** same_pos_records, MergeReader* mrp, MergeWriter* mwp, uint32_t* rans_expected_variant_idxp) {
   if (!variant_ct) {
     return kPglRetSuccess;
   }
@@ -6263,6 +6371,7 @@ PglErr ConcatPvariantPos(int32_t cur_bp, uintptr_t variant_ct, PvariantPosMergeC
     }
     SamePosPvarRecord** same_id_records = &(same_pos_records[rec_idx_start]);
     const uintptr_t merge_rec_ct = rec_idx_end - rec_idx_start;
+    const uint32_t input_allele_ct = same_id_records[0]->allele_ct;
     uint32_t is_pr = 0;
     uint32_t allele_ct;
     uint64_t cur_line_blen;
@@ -6272,6 +6381,18 @@ PglErr ConcatPvariantPos(int32_t cur_bp, uintptr_t variant_ct, PvariantPosMergeC
     }
     // bugfix (8 Sep 2021): forgot that allele_ct == 0 indicates variant skip
     if (allele_ct) {
+      if (rans_expected_variant_idxp &&
+          ((merge_rec_ct != 1) ||
+           (same_id_records[0]->secondary_key !=
+            *rans_expected_variant_idxp) ||
+           (allele_ct != input_allele_ct))) {
+        logputs("\n");
+        logerrputs(
+            "Error: Direct conditional-rANS concatenation requires each "
+            "input variant to\nremain in its original order without merging "
+            "or allele filtering.\n");
+        return kPglRetInconsistentInput;
+      }
       if (unlikely(cur_line_blen > kMaxLongLine)) {
         logerrprintfww("Error: Merged .pvar entry for variant '%s' at %s:%d is too long for this " PROG_NAME_STR " build.\n", cur_variant_id, ppmcp->pmc.chr_buf, cur_bp);
         return kPglRetNotYetSupported;
@@ -6283,9 +6404,13 @@ PglErr ConcatPvariantPos(int32_t cur_bp, uintptr_t variant_ct, PvariantPosMergeC
         AssignBit(write_variant_idx, is_pr, write_nonref_flags);
       }
 
-      reterr = MergePgenVariantNoTmpLocked(same_id_records, ppmcp->pmc.allele_remap, merge_rec_ct, allele_ct, ppmcp->pmc.read_max_allele_ct, &mrp, mwp);
-      if (unlikely(reterr)) {
-        return reterr;
+      if (rans_expected_variant_idxp) {
+        ++(*rans_expected_variant_idxp);
+      } else {
+        reterr = MergePgenVariantNoTmpLocked(same_id_records, ppmcp->pmc.allele_remap, merge_rec_ct, allele_ct, ppmcp->pmc.read_max_allele_ct, &mrp, mwp);
+        if (unlikely(reterr)) {
+          return reterr;
+        }
       }
 
       ++write_variant_idx;
@@ -6312,7 +6437,7 @@ void CleanupPvariantPosMergeContext(PvariantPosMergeContext* ppmcp) {
 // are reordered by ID, and same-position same-ID variants are merged.  The
 // distinction from the general case is that we never need to have more than
 // one .pvar + .pgen open for reading at a time.
-PglErr PmergeConcat(const PmergeInfo* pmip, const SampleIdInfo* siip, const ChrInfo* cip, const PmergeInputFilesetLl* filesets, const char* missing_varid_match, const char* const* info_keys, const uint32_t* info_keys_htable, uint32_t sample_ct, FamCol fam_cols, uintptr_t fileset_ct, uint32_t psam_linebuf_capacity, uint32_t missing_varid_match_slen, uint32_t info_key_ct, uint32_t info_keys_htable_size, uint32_t info_conflict_present, char input_missing_geno_char, uint32_t max_thread_ct, SortMode sort_vars_mode, VaridTemplate* varid_templatep, VaridTemplate* varid_multi_templatep, VaridTemplate* varid_multi_nonsnp_templatep, char* outname, char* outname_end) {
+PglErr PmergeConcat(const PmergeInfo* pmip, const SampleIdInfo* siip, const ChrInfo* cip, const PmergeInputFilesetLl* filesets, const char* missing_varid_match, const char* const* info_keys, const uint32_t* info_keys_htable, uint32_t sample_ct, FamCol fam_cols, uintptr_t fileset_ct, uint32_t psam_linebuf_capacity, uint32_t missing_varid_match_slen, uint32_t info_key_ct, uint32_t info_keys_htable_size, uint32_t info_conflict_present, char input_missing_geno_char, uint32_t max_thread_ct, SortMode sort_vars_mode, VaridTemplate* varid_templatep, VaridTemplate* varid_multi_templatep, VaridTemplate* varid_multi_nonsnp_templatep, uint32_t rans_concat, char* outname, char* outname_end) {
   // Don't need to reset bigstack at function end, since Pmerge() will do it.
   const char* read_pgen_fname = nullptr;
   const char* read_pvar_fname = nullptr;
@@ -6350,8 +6475,25 @@ PglErr PmergeConcat(const PmergeInfo* pmip, const SampleIdInfo* siip, const ChrI
     uint32_t max_single_pos_ct = 1;
     uintptr_t max_single_pos_blen = 0;
     uint32_t read_max_nonpass_filter_ct = 0;
+    std::vector<std::string> rans_input_paths;
+    if (rans_concat) {
+      rans_input_paths.reserve(fileset_ct);
+    }
     const PmergeInputFilesetLl* filesets_iter = filesets;
     for (uintptr_t fileset_idx = 0; fileset_idx != fileset_ct; ++fileset_idx) {
+      if (rans_concat) {
+        if ((filesets_iter->write_nondoomed_variant_ct !=
+             filesets_iter->read_variant_ct) ||
+            (filesets_iter->write_variant_ct !=
+             filesets_iter->read_variant_ct)) {
+          logerrputs(
+              "Error: Direct conditional-rANS concatenation cannot be "
+              "combined with\nvariant filtering or duplicate-variant "
+              "merging.\n");
+          goto PmergeConcat_ret_INCONSISTENT_INPUT;
+        }
+        rans_input_paths.emplace_back(filesets_iter->pgen_fname);
+      }
       write_variant_ct += filesets_iter->write_nondoomed_variant_ct;
       write_qual |= filesets_iter->nm_qual_exists;
       write_filter |= filesets_iter->nm_filter_exists;
@@ -6448,83 +6590,95 @@ PglErr PmergeConcat(const PmergeInfo* pmip, const SampleIdInfo* siip, const ChrI
         goto PmergeConcat_ret_NOMEM;
       }
     }
-    snprintf(outname_end, kMaxOutfnameExtBlen, ".pgen");
     const PgenGlobalFlags write_gflags = vrtype_8bit_needed? (kfPgenGlobalHardcallPhasePresent | kfPgenGlobalDosagePresent | kfPgenGlobalDosagePhasePresent) : kfPgenGlobal0;
-    uintptr_t spgw_alloc_cacheline_ct;
-    uint32_t max_vrec_len;
-    // bugfix (1 Jun 2022): in multiallelic case, contents of
-    // write_allele_idx_offsets have not been initialized, and this triggered
-    // an assert-failure in debug builds or a write_max_allele_ct
-    // miscalculation otherwise (practically always a harmless overestimate)
-    reterr = SpgwInitPhase1(outname, nullptr, ppmc.write_nonref_flags, write_variant_ct, sample_ct, write_max_allele_ct, kPgenWriteBackwardSeek, write_gflags, nonref_flags_storage, &mw.spgw, &spgw_alloc_cacheline_ct, &max_vrec_len);
-    if (unlikely(reterr)) {
-      if (reterr == kPglRetOpenFail) {
-        logerrprintfww(kErrprintfFopen, outname, strerror(errno));
-      }
-      goto PmergeConcat_ret_1;
-    }
     const uint32_t sample_id_htable_size = GetHtableMinSize(sample_ct);
     const uint32_t sample_ctl2 = NypCtToWordCt(sample_ct);
     const uint32_t sample_ctl = BitCtToWordCt(sample_ct);
-    unsigned char* spgw_alloc;
     uint32_t* sample_id_htable;
     uint32_t* old_sample_idx_to_new_buf;
-    if (unlikely(bigstack_alloc_uc(spgw_alloc_cacheline_ct * kCacheline, &spgw_alloc) ||
-                 bigstack_alloc_u32(sample_id_htable_size, &sample_id_htable) ||
-                 bigstack_alloc_u32(sample_ct, &old_sample_idx_to_new_buf) ||
-                 bigstack_alloc_w(sample_ctl2, &mw.genovec))) {
+    if (unlikely(bigstack_alloc_u32(sample_id_htable_size,
+                                    &sample_id_htable) ||
+                 bigstack_alloc_u32(sample_ct,
+                                    &old_sample_idx_to_new_buf))) {
       goto PmergeConcat_ret_NOMEM;
     }
-    SpgwInitPhase2(max_vrec_len, &mw.spgw, spgw_alloc);
-    mw.patch_01_set = nullptr;
-    mw.patch_01_vals = nullptr;
-    mw.patch_10_set = nullptr;
-    mw.patch_10_vals = nullptr;
-    if (write_max_allele_ct > 2) {
-      if (unlikely(bigstack_alloc_w(sample_ctl, &mw.patch_01_set) ||
-                   bigstack_alloc_ac(sample_ct, &mw.patch_01_vals) ||
-                   bigstack_alloc_w(sample_ctl, &mw.patch_10_set) ||
-                   bigstack_alloc_ac(2 * sample_ct, &mw.patch_10_vals) ||
-                   bigstack_alloc_ac(2 * sample_ct, &mw.wide_codes))) {
+    if (!rans_concat) {
+      snprintf(outname_end, kMaxOutfnameExtBlen, ".pgen");
+      uintptr_t spgw_alloc_cacheline_ct;
+      uint32_t max_vrec_len;
+      // bugfix (1 Jun 2022): in multiallelic case, contents of
+      // write_allele_idx_offsets have not been initialized, and this triggered
+      // an assert-failure in debug builds or a write_max_allele_ct
+      // miscalculation otherwise (practically always a harmless overestimate)
+      reterr = SpgwInitPhase1(outname, nullptr, ppmc.write_nonref_flags, write_variant_ct, sample_ct, write_max_allele_ct, kPgenWriteBackwardSeek, write_gflags, nonref_flags_storage, &mw.spgw, &spgw_alloc_cacheline_ct, &max_vrec_len);
+      if (unlikely(reterr)) {
+        if (reterr == kPglRetOpenFail) {
+          logerrprintfww(kErrprintfFopen, outname, strerror(errno));
+        }
+        goto PmergeConcat_ret_1;
+      }
+      unsigned char* spgw_alloc;
+      if (unlikely(
+              bigstack_alloc_uc(spgw_alloc_cacheline_ct * kCacheline,
+                                &spgw_alloc) ||
+              bigstack_alloc_w(sample_ctl2, &mw.genovec))) {
         goto PmergeConcat_ret_NOMEM;
       }
-    }
-    mw.phasepresent = nullptr;
-    mw.phaseinfo = nullptr;
-    mw.dosage_present = nullptr;
-    mw.dosage_main = nullptr;
-    mw.dphase_present = nullptr;
-    mw.dphase_delta = nullptr;
-    if (vrtype_8bit_needed) {
-      if (unlikely(bigstack_alloc_w(sample_ctl, &mw.phasepresent) ||
-                   bigstack_alloc_w(sample_ctl, &mw.phaseinfo) ||
-                   bigstack_alloc_w(sample_ctl, &mw.dosage_present) ||
-                   bigstack_alloc_dosage(sample_ct, &mw.dosage_main) ||
-                   bigstack_alloc_w(sample_ctl, &mw.dphase_present) ||
-                   bigstack_alloc_dphase(sample_ct, &mw.dphase_delta) ||
-                   bigstack_alloc_w(sample_ctl, &mw.phaseinfo_xor))) {
+      SpgwInitPhase2(max_vrec_len, &mw.spgw, spgw_alloc);
+      mw.patch_01_set = nullptr;
+      mw.patch_01_vals = nullptr;
+      mw.patch_10_set = nullptr;
+      mw.patch_10_vals = nullptr;
+      if (write_max_allele_ct > 2) {
+        if (unlikely(bigstack_alloc_w(sample_ctl, &mw.patch_01_set) ||
+                     bigstack_alloc_ac(sample_ct, &mw.patch_01_vals) ||
+                     bigstack_alloc_w(sample_ctl, &mw.patch_10_set) ||
+                     bigstack_alloc_ac(2 * sample_ct, &mw.patch_10_vals) ||
+                     bigstack_alloc_ac(2 * sample_ct, &mw.wide_codes))) {
+          goto PmergeConcat_ret_NOMEM;
+        }
+      }
+      mw.phasepresent = nullptr;
+      mw.phaseinfo = nullptr;
+      mw.dosage_present = nullptr;
+      mw.dosage_main = nullptr;
+      mw.dphase_present = nullptr;
+      mw.dphase_delta = nullptr;
+      if (vrtype_8bit_needed) {
+        if (unlikely(bigstack_alloc_w(sample_ctl, &mw.phasepresent) ||
+                     bigstack_alloc_w(sample_ctl, &mw.phaseinfo) ||
+                     bigstack_alloc_w(sample_ctl, &mw.dosage_present) ||
+                     bigstack_alloc_dosage(sample_ct, &mw.dosage_main) ||
+                     bigstack_alloc_w(sample_ctl, &mw.dphase_present) ||
+                     bigstack_alloc_dphase(sample_ct, &mw.dphase_delta) ||
+                     bigstack_alloc_w(sample_ctl, &mw.phaseinfo_xor))) {
+          goto PmergeConcat_ret_NOMEM;
+        }
+      }
+      // pgv_readbuf reinitialized for each file we're reading from
+      if (unlikely(bigstack_alloc_w(sample_ctl, &mw.unlocked_set) ||
+                   bigstack_alloc_w(sample_ctl, &mw.unlocked_sample_span) ||
+                   bigstack_alloc_u32(sample_ct,
+                                      &mw.clobber_sample_idx_to_new) ||
+                   bigstack_alloc_w(sample_ctl, &mw.mask_buf) ||
+                   BigstackAllocPgv(sample_ct, write_max_allele_ct > 2,
+                                    write_gflags, &mw.pgv_midbuf))) {
         goto PmergeConcat_ret_NOMEM;
       }
-    }
-    // pgv_readbuf reinitialized for each file we're reading from
-    if (unlikely(bigstack_alloc_w(sample_ctl, &mw.unlocked_set) ||
-                 bigstack_alloc_w(sample_ctl, &mw.unlocked_sample_span) ||
-                 bigstack_alloc_u32(sample_ct, &mw.clobber_sample_idx_to_new) ||
-                 bigstack_alloc_w(sample_ctl, &mw.mask_buf) ||
-                 BigstackAllocPgv(sample_ct, write_max_allele_ct > 2, write_gflags, &mw.pgv_midbuf))) {
-      goto PmergeConcat_ret_NOMEM;
-    }
-    mw.unlocked_missing_set = nullptr;
-    mw.clobber_sample_span = nullptr;
-    mw.unlocked_nonmissing_sample_span = nullptr;
-    if (pmip->merge_mode == kMergeModeNmMatch) {
-      if (unlikely(bigstack_alloc_w(sample_ctl, &mw.unlocked_missing_set) ||
-                   bigstack_alloc_w(sample_ctl, &mw.clobber_sample_span) ||
-                   bigstack_alloc_w(sample_ctl, &mw.unlocked_nonmissing_sample_span))) {
-        goto PmergeConcat_ret_NOMEM;
+      mw.unlocked_missing_set = nullptr;
+      mw.clobber_sample_span = nullptr;
+      mw.unlocked_nonmissing_sample_span = nullptr;
+      if (pmip->merge_mode == kMergeModeNmMatch) {
+        if (unlikely(
+                bigstack_alloc_w(sample_ctl, &mw.unlocked_missing_set) ||
+                bigstack_alloc_w(sample_ctl, &mw.clobber_sample_span) ||
+                bigstack_alloc_w(
+                    sample_ctl, &mw.unlocked_nonmissing_sample_span))) {
+          goto PmergeConcat_ret_NOMEM;
+        }
       }
+      mw.merge_mode = pmip->merge_mode;
     }
-    mw.merge_mode = pmip->merge_mode;
 
     InitXidHtable(siip, sample_ct, sample_id_htable_size, sample_id_htable, g_textbuf);
 
@@ -6557,62 +6711,127 @@ PglErr PmergeConcat(const PmergeInfo* pmip, const SampleIdInfo* siip, const ChrI
         mr.sample_idx_increasing = 2;
       }
       mr.sample_ct = cur_write_sample_ct;
+      if (rans_concat &&
+          ((read_sample_ct != sample_ct) ||
+           (mr.sample_idx_increasing != 2))) {
+        logputs("\n");
+        logerrputs(
+            "Error: Direct conditional-rANS concatenation requires identical "
+            "samples in\nidentical order in every input.  Retry with "
+            "'--indiv-sort none' when the input\n.psam files already have "
+            "matching order.\n");
+        goto PmergeConcat_ret_INCONSISTENT_INPUT;
+      }
 
       read_pgen_fname = filesets_iter->pgen_fname;
       const uint32_t read_variant_ct = filesets_iter->read_variant_ct;
-      PgenHeaderCtrl header_ctrl;
-      uintptr_t cur_alloc_cacheline_ct;
-      reterr = PgfiInitPhase1(read_pgen_fname, nullptr, read_variant_ct, read_sample_ct, &header_ctrl, &pgfi, &cur_alloc_cacheline_ct, g_logbuf);
-      if (unlikely(reterr)) {
-        if (reterr == kPglRetInconsistentInput) {
-          // .pgen was not checked for consistency with .pvar on the first
-          // pass.
+      read_pvar_fname = filesets_iter->pvar_fname;
+      if (rans_concat) {
+        pgfi.allele_idx_offsets = nullptr;
+        pgfi.nonref_flags = nullptr;
+        pgfi.max_allele_ct = filesets_iter->read_max_allele_ct;
+        if (filesets_iter->read_max_allele_ct > 2) {
+          if (bigstack_alloc_w(read_variant_ct + 1,
+                               &pgfi.allele_idx_offsets)) {
+            goto PmergeConcat_ret_NOMEM;
+          }
+          pgfi.allele_idx_offsets[0] = 0;
+        }
+        pgen_rans::ContainerReader rans_reader;
+        std::string rans_error;
+        if (unlikely(!rans_reader.Open(read_pgen_fname, &rans_error))) {
+          logputs("\n");
+          logerrprintfww(
+              "Error: Failed to open conditional-rANS input %s: %s\n",
+              read_pgen_fname, rans_error.c_str());
+          goto PmergeConcat_ret_INCONSISTENT_INPUT;
+        }
+        const pgen_rans::ContainerParams& rans_params =
+            rans_reader.params();
+        if (unlikely(
+                (rans_params.sample_ct != read_sample_ct) ||
+                (rans_params.variant_ct != read_variant_ct) ||
+                (rans_params.max_allele_ct !=
+                 filesets_iter->read_max_allele_ct))) {
+          logputs("\n");
+          logerrprintfww(
+              "Error: Conditional-rANS header counts in %s do not match "
+              "its .pvar/.psam metadata.\n",
+              read_pgen_fname);
+          goto PmergeConcat_ret_INCONSISTENT_INPUT;
+        }
+        const pgen_rans::ContainerMetadata& rans_metadata =
+            rans_reader.metadata();
+        if (!rans_metadata.nonref_flags.empty()) {
+          if (unlikely(bigstack_calloc_w(
+                  BitCtToWordCt(read_variant_ct),
+                  &pgfi.nonref_flags))) {
+            goto PmergeConcat_ret_NOMEM;
+          }
+          for (uint32_t variant_idx = 0;
+               variant_idx != read_variant_ct; ++variant_idx) {
+            if ((rans_metadata.nonref_flags[variant_idx / 8] >>
+                 (variant_idx % 8)) &
+                1U) {
+              SetBit(variant_idx, pgfi.nonref_flags);
+            }
+          }
+        }
+      } else {
+        PgenHeaderCtrl header_ctrl;
+        uintptr_t cur_alloc_cacheline_ct;
+        reterr = PgfiInitPhase1(read_pgen_fname, nullptr, read_variant_ct, read_sample_ct, &header_ctrl, &pgfi, &cur_alloc_cacheline_ct, g_logbuf);
+        if (unlikely(reterr)) {
+          if (reterr == kPglRetInconsistentInput) {
+            // .pgen was not checked for consistency with .pvar on the first
+            // pass.
+            logputs("\n");
+            WordWrapB(0);
+            logerrputsb();
+            goto PmergeConcat_ret_1;
+          }
+          goto PmergeConcat_ret_PGEN_REWIND_FAIL_N;
+        }
+        unsigned char* pgfi_alloc;
+        if (unlikely(bigstack_alloc_uc(cur_alloc_cacheline_ct * kCacheline, &pgfi_alloc))) {
+          goto PmergeConcat_ret_NOMEM;
+        }
+        if ((header_ctrl & 192) == 192) {
+          if (unlikely(bigstack_alloc_w(BitCtToWordCt(read_variant_ct), &pgfi.nonref_flags))) {
+            goto PmergeConcat_ret_NOMEM;
+          }
+        }
+        if (filesets_iter->read_max_allele_ct > 2) {
+          if (bigstack_alloc_w(read_variant_ct + 1,
+                               &pgfi.allele_idx_offsets)) {
+            goto PmergeConcat_ret_NOMEM;
+          }
+          pgfi.allele_idx_offsets[0] = 0;
+          pgfi.max_allele_ct = filesets_iter->read_max_allele_ct;
+        }
+        uint32_t max_vrec_width;
+        reterr = PgfiInitPhase2(header_ctrl, 0, 0, 0, 0, read_variant_ct, &max_vrec_width, &pgfi, pgfi_alloc, &cur_alloc_cacheline_ct, g_logbuf);
+        if (unlikely(reterr)) {
           logputs("\n");
           WordWrapB(0);
           logerrputsb();
           goto PmergeConcat_ret_1;
         }
-        goto PmergeConcat_ret_PGEN_REWIND_FAIL_N;
-      }
-      unsigned char* pgfi_alloc;
-      if (unlikely(bigstack_alloc_uc(cur_alloc_cacheline_ct * kCacheline, &pgfi_alloc))) {
-        goto PmergeConcat_ret_NOMEM;
-      }
-      if ((header_ctrl & 192) == 192) {
-        if (unlikely(bigstack_alloc_w(BitCtToWordCt(read_variant_ct), &pgfi.nonref_flags))) {
+        unsigned char* pgr_alloc;
+        if (unlikely(bigstack_alloc_uc(cur_alloc_cacheline_ct * kCacheline, &pgr_alloc))) {
           goto PmergeConcat_ret_NOMEM;
         }
-      }
-      read_pvar_fname = filesets_iter->pvar_fname;
-      if (filesets_iter->read_max_allele_ct > 2) {
-        if (bigstack_alloc_w(read_variant_ct + 1, &pgfi.allele_idx_offsets)) {
+        reterr = PgrInit(read_pgen_fname, max_vrec_width, &pgfi, &mr.pgr, pgr_alloc);
+        if (unlikely(reterr)) {
+          goto PmergeConcat_ret_PGEN_REWIND_FAIL_N;
+        }
+        PgrSetSampleSubsetIndex(read_cumulative_popcounts, &mr.pgr, &mr.pssi);
+        // Must check write_max_allele_ct instead of just whether the input file
+        // has multiallelic variants, since we may need to rotate a biallelic
+        // variant into a "multiallelic variant" in these buffers.
+        if (unlikely(BigstackAllocPgv(read_sample_ct, write_max_allele_ct > 2, write_gflags, &mw.pgv_readbuf))) {
           goto PmergeConcat_ret_NOMEM;
         }
-        pgfi.allele_idx_offsets[0] = 0;
-        pgfi.max_allele_ct = filesets_iter->read_max_allele_ct;
-      }
-      uint32_t max_vrec_width;
-      reterr = PgfiInitPhase2(header_ctrl, 0, 0, 0, 0, read_variant_ct, &max_vrec_width, &pgfi, pgfi_alloc, &cur_alloc_cacheline_ct, g_logbuf);
-      if (unlikely(reterr)) {
-        logputs("\n");
-        WordWrapB(0);
-        logerrputsb();
-        goto PmergeConcat_ret_1;
-      }
-      unsigned char* pgr_alloc;
-      if (unlikely(bigstack_alloc_uc(cur_alloc_cacheline_ct * kCacheline, &pgr_alloc))) {
-        goto PmergeConcat_ret_NOMEM;
-      }
-      reterr = PgrInit(read_pgen_fname, max_vrec_width, &pgfi, &mr.pgr, pgr_alloc);
-      if (unlikely(reterr)) {
-        goto PmergeConcat_ret_PGEN_REWIND_FAIL_N;
-      }
-      PgrSetSampleSubsetIndex(read_cumulative_popcounts, &mr.pgr, &mr.pssi);
-      // Must check write_max_allele_ct instead of just whether the input file
-      // has multiallelic variants, since we may need to rotate a biallelic
-      // variant into a "multiallelic variant" in these buffers.
-      if (unlikely(BigstackAllocPgv(read_sample_ct, write_max_allele_ct > 2, write_gflags, &mw.pgv_readbuf))) {
-        goto PmergeConcat_ret_NOMEM;
       }
       reterr = InitTextStream(read_pvar_fname, MAXV(filesets_iter->max_pvar_line_blen, kDecompressMinBlen), 1, &pvar_txs);
       if (unlikely(reterr)) {
@@ -6755,6 +6974,9 @@ PglErr PmergeConcat(const PmergeInfo* pmip, const SampleIdInfo* siip, const ChrI
       uint32_t cur_single_pos_ct = 0;
       uint32_t prev_chr_idx = UINT32_MAX;
       int32_t prev_bp = 0;
+      uint32_t rans_expected_variant_idx = 0;
+      uint32_t* rans_expected_variant_idxp =
+          rans_concat ? &rans_expected_variant_idx : nullptr;
       if (g_debug_on && (fileset_idx == 2)) {
         logprintf("Starting chr3.\n");
       }
@@ -6780,7 +7002,7 @@ PglErr PmergeConcat(const PmergeInfo* pmip, const SampleIdInfo* siip, const ChrI
           continue;
         }
         if (chr_idx != prev_chr_idx) {
-          reterr = ConcatPvariantPos(prev_bp, cur_single_pos_ct, &ppmc, same_pos_records, &mr, &mw);
+          reterr = ConcatPvariantPos(prev_bp, cur_single_pos_ct, &ppmc, same_pos_records, &mr, &mw, rans_expected_variant_idxp);
           if (unlikely(reterr)) {
             goto PmergeConcat_ret_N;
           }
@@ -6824,7 +7046,7 @@ PglErr PmergeConcat(const PmergeInfo* pmip, const SampleIdInfo* siip, const ChrI
           continue;
         }
         if (cur_bp > prev_bp) {
-          reterr = ConcatPvariantPos(prev_bp, cur_single_pos_ct, &ppmc, same_pos_records, &mr, &mw);
+          reterr = ConcatPvariantPos(prev_bp, cur_single_pos_ct, &ppmc, same_pos_records, &mr, &mw, rans_expected_variant_idxp);
           if (unlikely(reterr)) {
             goto PmergeConcat_ret_N;
           }
@@ -6888,6 +7110,16 @@ PglErr PmergeConcat(const PmergeInfo* pmip, const SampleIdInfo* siip, const ChrI
         if (pgfi.nonref_flags) {
           pgen_pr_status |= IsSet(pgfi.nonref_flags, read_variant_idx);
         }
+        if (rans_concat && read_info_pr &&
+            (PrInInfo(token_slens[6], token_ptrs[6]) !=
+             (pgen_pr_status & 1))) {
+          logputs("\n");
+          logerrprintfww(
+              "Error: Provisional-REF status for variant '%s' disagrees "
+              "between %s and\n%s.\n",
+              cur_variant_id_start, read_pgen_fname, read_pvar_fname);
+          goto PmergeConcat_ret_INCONSISTENT_INPUT;
+        }
         cur_record->pgen_pr_status = pgen_pr_status;
 
         if (read_qual) {
@@ -6915,9 +7147,17 @@ PglErr PmergeConcat(const PmergeInfo* pmip, const SampleIdInfo* siip, const ChrI
         same_pos_records[cur_single_pos_ct] = cur_record;
         ++cur_single_pos_ct;
       }
-      reterr = ConcatPvariantPos(prev_bp, cur_single_pos_ct, &ppmc, same_pos_records, &mr, &mw);
+      reterr = ConcatPvariantPos(prev_bp, cur_single_pos_ct, &ppmc, same_pos_records, &mr, &mw, rans_expected_variant_idxp);
       if (unlikely(reterr)) {
         goto PmergeConcat_ret_N;
+      }
+      if (rans_concat &&
+          (rans_expected_variant_idx != read_variant_ct)) {
+        logputs("\n");
+        logerrputs(
+            "Error: Direct conditional-rANS concatenation cannot omit or "
+            "reorder input\nvariants.\n");
+        goto PmergeConcat_ret_INCONSISTENT_INPUT;
       }
       // bugfix (14 Apr 2021): forgot to close .pgen
       if (unlikely(CleanupTextStream2(read_pvar_fname, &pvar_txs, &reterr) ||
@@ -6926,12 +7166,34 @@ PglErr PmergeConcat(const PmergeInfo* pmip, const SampleIdInfo* siip, const ChrI
         goto PmergeConcat_ret_N;
       }
     }
-    reterr = SpgwFinish(&mw.spgw);
-    if (unlikely(reterr)) {
-      goto PmergeConcat_ret_1;
+    if (!rans_concat) {
+      reterr = SpgwFinish(&mw.spgw);
+      if (unlikely(reterr)) {
+        goto PmergeConcat_ret_1;
+      }
     }
     if (unlikely(CswriteCloseNull(&ppmc.pmc.css, ppmc.pmc.cswritep))) {
       goto PmergeConcat_ret_WRITE_FAIL_N;
+    }
+    if (rans_concat) {
+      snprintf(outname_end, kMaxOutfnameExtBlen, ".pgen");
+      pgen_rans::ContainerConcatStats concat_stats;
+      std::string rans_error;
+      if (unlikely(!pgen_rans::ConcatenateContainers(
+              rans_input_paths, outname, &concat_stats, &rans_error))) {
+        logputs("\n");
+        logerrprintfww(
+            "Error: Direct conditional-rANS concatenation failed: %s\n",
+            rans_error.c_str());
+        goto PmergeConcat_ret_INCONSISTENT_INPUT;
+      }
+      logprintf(
+          "\nDirect conditional-rANS block copy complete: %u input%s, "
+          "%u block%s, %" PRIu64 " compressed payload bytes copied.\n",
+          concat_stats.input_file_ct,
+          (concat_stats.input_file_ct == 1) ? "" : "s",
+          concat_stats.block_ct, (concat_stats.block_ct == 1) ? "" : "s",
+          concat_stats.copied_block_byte_ct);
     }
     fputs("\rConcatenating... ", stdout);
     logprintf("%" PRIuPTR "/%" PRIuPTR " variant%s complete.\n", write_variant_ct, write_variant_ct, (write_variant_ct == 1)? "" : "s");
@@ -7016,15 +7278,18 @@ PglErr PmergePass(__attribute__((unused)) const PmergeInfo* pmip, __attribute__(
   return reterr;
 }
 
-PglErr Pmerge(const PmergeInfo* pmip, const char* sample_sort_fname, const char* missing_catname, const char* varid_template_str, const char* varid_multi_template_str, const char* varid_multi_nonsnp_template_str, const char* missing_varid_match, MiscFlags misc_flags, LoadFilterLogFlags load_filter_log_merge_flags, SortMode sample_sort_mode, FamCol fam_cols, int32_t missing_pheno, uint32_t new_variant_id_max_allele_slen, char input_missing_geno_char, uint32_t max_thread_ct, SortMode sort_vars_mode, char* pgenname, char* psamname, char* pvarname, char* outname, char* outname_end, ChrInfo* cip) {
+PglErr Pmerge(const PmergeInfo* pmip, const char* sample_sort_fname, const char* missing_catname, const char* varid_template_str, const char* varid_multi_template_str, const char* varid_multi_nonsnp_template_str, const char* missing_varid_match, MiscFlags misc_flags, LoadFilterLogFlags load_filter_log_merge_flags, SortMode sample_sort_mode, FamCol fam_cols, int32_t missing_pheno, uint32_t new_variant_id_max_allele_slen, char input_missing_geno_char, uint32_t max_thread_ct, SortMode sort_vars_mode, uint32_t prefer_rans_concat, uint32_t rans_concat_final_output, uint32_t write_intermediate, char* pgenname, char* psamname, char* pvarname, char* outname, char* outname_end, ChrInfo* cip, uint32_t* rans_concat_successp) {
   unsigned char* bigstack_mark = g_bigstack_base;
   unsigned char* bigstack_end_mark = g_bigstack_end;
+  *rans_concat_successp = 0;
 
   // nodes and filenames are heap-allocated, not just first_varid/last_varid
   PmergeInputFilesetLl* input_filesets = nullptr;
   PmergeInputFilesetLl* next_filesets = nullptr;
 
   PglErr reterr = kPglRetSuccess;
+  uint32_t rans_concat = 0;
+  uint32_t rans_output_files_started = 0;
   {
     // 1. Construct/load fileset list.
     // 2. Merge .psam files.
@@ -7079,6 +7344,57 @@ PglErr Pmerge(const PmergeInfo* pmip, const char* sample_sort_fname, const char*
       }
     }
 
+    if (prefer_rans_concat) {
+      uint32_t any_rans;
+      reterr = ProbeAllRansContainers(input_filesets, &rans_concat,
+                                      &any_rans);
+      if (unlikely(reterr)) {
+        goto Pmerge_ret_1;
+      }
+      if (unlikely(any_rans && (!rans_concat))) {
+        logerrputs(
+            "Error: Direct conditional-rANS concatenation requires every "
+            "input .pgen to\nuse conditional-rANS storage; mixed ordinary "
+            "and conditional-rANS inputs are not\nsupported.\n");
+        reterr = kPglRetInconsistentInput;
+        goto Pmerge_ret_1;
+      }
+    }
+    const uint32_t output_pvar_zst =
+        !!(pmip->flags & kfPmergeOutputVzs);
+    *outname_end = '\0';
+    if (rans_concat && rans_concat_final_output) {
+      if (RansOutputFilesetExists(outname, output_pvar_zst)) {
+        logputs(
+            "Note: A final output fileset already exists; retaining the "
+            "direct rANS merge\nas an intermediate before the normal "
+            "--make-pgen output step.\n");
+        rans_concat_final_output = 0;
+      }
+    }
+    if (write_intermediate &&
+        ((!rans_concat) || (!rans_concat_final_output))) {
+      outname_end = strcpya_k(outname_end, "-merge");
+    }
+    if (rans_concat) {
+      reterr = RejectRansOutputAliases(
+          input_filesets, outname, output_pvar_zst);
+      if (unlikely(reterr)) {
+        goto Pmerge_ret_1;
+      }
+      if (unlikely(
+              RansOutputFilesetExists(outname, output_pvar_zst))) {
+        logerrprintfww(
+            "Error: Direct conditional-rANS temporary output files with "
+            "prefix %s already\nexist.  Remove or rename them before "
+            "retrying the merge.\n",
+            outname);
+        reterr = kPglRetInconsistentInput;
+        goto Pmerge_ret_1;
+      }
+    }
+
+    rans_output_files_started = rans_concat;
     SampleIdInfo sii;
     uint32_t sample_ct = 0;
     uint32_t psam_linebuf_capacity = 0;
@@ -7118,8 +7434,16 @@ PglErr Pmerge(const PmergeInfo* pmip, const char* sample_sort_fname, const char*
         goto Pmerge_ret_1;
       }
     }
+    if (unlikely(rans_concat && (!is_concat_job))) {
+      logerrputs(
+          "Error: Direct conditional-rANS concatenation requires inputs "
+          "whose variant\nranges can be concatenated without an overlapping "
+          "merge.\n");
+      reterr = kPglRetInconsistentInput;
+      goto Pmerge_ret_1;
+    }
     if (is_concat_job) {
-      reterr = PmergeConcat(pmip, &sii, cip, input_filesets, missing_varid_match, info_keys, info_keys_htable, sample_ct, fam_cols, fileset_ct, psam_linebuf_capacity, missing_varid_match_slen, info_key_ct, info_keys_htable_size, info_conflict_present, input_missing_geno_char, max_thread_ct, sort_vars_mode, varid_templatep, varid_multi_templatep, varid_multi_nonsnp_templatep, outname, outname_end);
+      reterr = PmergeConcat(pmip, &sii, cip, input_filesets, missing_varid_match, info_keys, info_keys_htable, sample_ct, fam_cols, fileset_ct, psam_linebuf_capacity, missing_varid_match_slen, info_key_ct, info_keys_htable_size, info_conflict_present, input_missing_geno_char, max_thread_ct, sort_vars_mode, varid_templatep, varid_multi_templatep, varid_multi_nonsnp_templatep, rans_concat, outname, outname_end);
     } else {
       for (uint32_t pass_idx = 1; ; ++pass_idx) {
         uint32_t next_fileset_ct;
@@ -7153,6 +7477,7 @@ PglErr Pmerge(const PmergeInfo* pmip, const char* sample_sort_fname, const char*
       // excluded from the merged dataset.
       ForgetExtraChrNames(1, cip);
     }
+    *rans_concat_successp = rans_concat && rans_concat_final_output;
   }
   while (0) {
   Pmerge_ret_NOMEM:
@@ -7160,6 +7485,25 @@ PglErr Pmerge(const PmergeInfo* pmip, const char* sample_sort_fname, const char*
     break;
   }
  Pmerge_ret_1:
+  if (reterr && rans_output_files_started) {
+    snprintf(outname_end, kMaxOutfnameExtBlen, ".pgen");
+    if (unlink(outname) && (errno != ENOENT)) {
+      logerrprintfww("Warning: Failed to remove partial output %s: %s.\n",
+                     outname, strerror(errno));
+    }
+    snprintf(outname_end, kMaxOutfnameExtBlen,
+             (pmip->flags & kfPmergeOutputVzs) ? ".pvar.zst" : ".pvar");
+    if (unlink(outname) && (errno != ENOENT)) {
+      logerrprintfww("Warning: Failed to remove partial output %s: %s.\n",
+                     outname, strerror(errno));
+    }
+    snprintf(outname_end, kMaxOutfnameExtBlen, ".psam");
+    if (unlink(outname) && (errno != ENOENT)) {
+      logerrprintfww("Warning: Failed to remove partial output %s: %s.\n",
+                     outname, strerror(errno));
+    }
+    *outname_end = '\0';
+  }
   CleanupFilesetLl(input_filesets, &reterr);
   CleanupFilesetLl(next_filesets, &reterr);
   BigstackDoubleReset(bigstack_mark, bigstack_end_mark);
