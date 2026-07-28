@@ -785,6 +785,80 @@ void TestAvx2HighStateRejection() {
   SetDecodeKernelForTesting(DecodeKernel::kAuto);
 }
 
+void TestAvx512RefillBoundaries() {
+  if (!DecodeKernelSupported(DecodeKernel::kAvx512)) {
+    return;
+  }
+  constexpr uint32_t kSampleCt = 1U << 12;
+  constexpr uint32_t kStateCt = 32;
+  constexpr uint32_t kRansLowerBound = 1U << 23;
+  constexpr size_t kInitialStateOffset = 4;
+  constexpr size_t kPayloadOffset =
+      kInitialStateOffset + 4 * kStateCt;
+  constexpr size_t kUncheckedPayloadByteCt = 64;
+  std::vector<uint64_t> packed_target(
+      PackedWordCt(kSampleCt), 0x5555555555555555ULL);
+  SetPackedGenotype(packed_target.data(), 0, 0);
+  uint32_t counts[4] = {1, kSampleCt - 1, 0, 0};
+  const CodecParams params(kStateCt, 12);
+  std::vector<uint8_t> record;
+  std::string error;
+  Expect(EncodeRecordFromCounts(
+             packed_target.data(), nullptr, nullptr, kSampleCt,
+             RecordMode::kMarginal, 0, 0, counts, params, &record,
+             &error),
+         "AVX-512 refill-boundary encode failed: " + error);
+  Expect(record.size() >= kPayloadOffset,
+         "AVX-512 refill-boundary record is unexpectedly short");
+
+  // A marginal [1, 4095] model maps slot zero to a frequency-one
+  // symbol.  Starting every lane at 2^23 therefore transforms every
+  // state to 2^11, forcing two refill bytes in all 32 lanes.  The
+  // 64-byte record exercises unchecked loads at payload offsets
+  // 0, 16, 32, and 48; the 63-byte record must take the checked path.
+  for (uint32_t lane = 0; lane != kStateCt; ++lane) {
+    const size_t offset = kInitialStateOffset + 4 * lane;
+    record[offset] = static_cast<uint8_t>(kRansLowerBound);
+    record[offset + 1] =
+        static_cast<uint8_t>(kRansLowerBound >> 8);
+    record[offset + 2] =
+        static_cast<uint8_t>(kRansLowerBound >> 16);
+    record[offset + 3] =
+        static_cast<uint8_t>(kRansLowerBound >> 24);
+  }
+  record.resize(kPayloadOffset + kUncheckedPayloadByteCt);
+  for (size_t offset = kPayloadOffset; offset != record.size();
+       ++offset) {
+    record[offset] = 0;
+  }
+
+  const uint64_t* no_anchors[1] = {};
+  std::vector<uint64_t> decoded(PackedWordCt(kSampleCt));
+  for (const size_t payload_byte_ct :
+       {kUncheckedPayloadByteCt, kUncheckedPayloadByteCt - 1}) {
+    const size_t record_size = kPayloadOffset + payload_byte_ct;
+    SetDecodeKernelForTesting(DecodeKernel::kScalar);
+    const bool scalar_ok = DecodeRecordToBuffer(
+        record.data(), record_size, no_anchors, 0, kSampleCt,
+        params, decoded.data(), decoded.size(), nullptr, &error);
+    const std::string scalar_error = error;
+    Expect(!scalar_ok,
+           "scalar decoder accepted a malformed refill-boundary payload");
+
+    SetDecodeKernelForTesting(DecodeKernel::kAvx512);
+    const bool avx512_ok = DecodeRecordToBuffer(
+        record.data(), record_size, no_anchors, 0, kSampleCt,
+        params, decoded.data(), decoded.size(), nullptr, &error);
+    Expect(avx512_ok == scalar_ok,
+           "AVX-512 refill-boundary acceptance differs from scalar");
+    Expect(LastDecodeKernelForTesting() == DecodeKernel::kAvx512,
+           "refill-boundary test did not reach the AVX-512 decoder");
+    Expect(error == scalar_error,
+           "AVX-512 refill-boundary error differs from scalar");
+  }
+  SetDecodeKernelForTesting(DecodeKernel::kAuto);
+}
+
 void TestRuntimeDivisionFrequencies() {
   constexpr uint32_t kSampleCt = 1U << 12;
   std::vector<uint64_t> packed(
@@ -1026,6 +1100,7 @@ int main() {
   TestAvx2EncodeTailsAndFallbacks();
   TestForcedDefaultDecodeKernels();
   TestAvx2HighStateRejection();
+  TestAvx512RefillBoundaries();
   TestRuntimeDivisionFrequencies();
   TestInvalidArguments();
   TestMultiallelicPatches();

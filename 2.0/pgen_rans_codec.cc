@@ -2368,6 +2368,54 @@ bool DecodeEntropyRecordInterleavedAvx2(
   return false;
 }
 
+template <bool kInputHas16Bytes>
+PGEN_RANS_TARGET_AVX512 PGEN_RANS_ALWAYS_INLINE
+bool RefillGroup16Avx512(
+    __mmask16 renormalization_mask, __m512i* state,
+    const uint8_t** interleaved_iter,
+    const uint8_t* interleaved_end, std::string* error) {
+  const uint32_t refill_byte_ct =
+      static_cast<uint32_t>(__builtin_popcount(
+          static_cast<uint32_t>(renormalization_mask)));
+  if constexpr (!kInputHas16Bytes) {
+    if (static_cast<size_t>(
+            interleaved_end - *interleaved_iter) <
+        refill_byte_ct) {
+      SetError("Truncated interleaved rANS payload.", error);
+      return false;
+    }
+  }
+  __m128i packed_bytes;
+  if constexpr (kInputHas16Bytes) {
+    packed_bytes = _mm_loadu_si128(
+        reinterpret_cast<const __m128i*>(*interleaved_iter));
+  } else {
+    const size_t remaining_byte_ct =
+        static_cast<size_t>(
+            interleaved_end - *interleaved_iter);
+    packed_bytes =
+        (remaining_byte_ct >= 16)
+            ? _mm_loadu_si128(
+                  reinterpret_cast<const __m128i*>(
+                      *interleaved_iter))
+            : _mm_maskz_loadu_epi8(
+                  static_cast<__mmask16>(
+                      (1U << remaining_byte_ct) - 1),
+                  *interleaved_iter);
+  }
+  const __m512i refill_values =
+      _mm512_cvtepu8_epi32(packed_bytes);
+  const __m512i expanded_values =
+      _mm512_maskz_expand_epi32(
+          renormalization_mask, refill_values);
+  const __m512i renormalized_states = _mm512_or_si512(
+      _mm512_slli_epi32(*state, 8), expanded_values);
+  *state = _mm512_mask_mov_epi32(
+      *state, renormalization_mask, renormalized_states);
+  *interleaved_iter += refill_byte_ct;
+  return true;
+}
+
 template <RecordMode kMode, uint32_t kGroup, bool kAllEntropy>
 PGEN_RANS_TARGET_AVX512 PGEN_RANS_ALWAYS_INLINE
 bool RansDecodeGroup16Avx512(
@@ -2376,6 +2424,7 @@ bool RansDecodeGroup16Avx512(
     uint64_t reference2_word,
     __m512i* state, const uint8_t** interleaved_iter,
     const uint8_t* interleaved_end,
+    bool groups_have_64_input_bytes,
     uint32_t* packed_symbols, uint32_t* absent_context_mask,
     std::string* error) {
   const __m512i shifts = _mm512_setr_epi32(
@@ -2479,43 +2528,46 @@ bool RansDecodeGroup16Avx512(
       _mm512_cmp_epu32_mask(
           *state, _mm512_set1_epi32(kRansLowerBound),
           _MM_CMPINT_LT);
-  while (renormalization_mask) {
-    const uint32_t refill_byte_ct =
-        static_cast<uint32_t>(__builtin_popcount(
-            static_cast<uint32_t>(renormalization_mask)));
-    if (static_cast<size_t>(
-            interleaved_end - *interleaved_iter) <
-        refill_byte_ct) {
-      SetError("Truncated interleaved rANS payload.", error);
-      return false;
+  // Before the transform every entropy state is at least 2^23.
+  // Since every decoded frequency is at least one, the transformed
+  // state is at least 2^(23 - 12) = 2^11.  It therefore needs at
+  // most two refill bytes.
+  if (renormalization_mask) {
+    if (groups_have_64_input_bytes) {
+      if (!RefillGroup16Avx512<true>(
+              renormalization_mask, state, interleaved_iter,
+              interleaved_end, error)) {
+        return false;
+      }
+      renormalization_mask =
+          entropy_mask &
+          _mm512_cmp_epu32_mask(
+              *state, _mm512_set1_epi32(kRansLowerBound),
+              _MM_CMPINT_LT);
+      if (renormalization_mask &&
+          !RefillGroup16Avx512<true>(
+              renormalization_mask, state, interleaved_iter,
+              interleaved_end, error)) {
+        return false;
+      }
+    } else {
+      if (!RefillGroup16Avx512<false>(
+              renormalization_mask, state, interleaved_iter,
+              interleaved_end, error)) {
+        return false;
+      }
+      renormalization_mask =
+          entropy_mask &
+          _mm512_cmp_epu32_mask(
+              *state, _mm512_set1_epi32(kRansLowerBound),
+              _MM_CMPINT_LT);
+      if (renormalization_mask &&
+          !RefillGroup16Avx512<false>(
+              renormalization_mask, state, interleaved_iter,
+              interleaved_end, error)) {
+        return false;
+      }
     }
-    const size_t remaining_byte_ct =
-        static_cast<size_t>(interleaved_end - *interleaved_iter);
-    const __m128i packed_bytes =
-        (remaining_byte_ct >= 16)
-            ? _mm_loadu_si128(
-                  reinterpret_cast<const __m128i*>(
-                      *interleaved_iter))
-            : _mm_maskz_loadu_epi8(
-                  static_cast<__mmask16>(
-                      (1U << remaining_byte_ct) - 1),
-                  *interleaved_iter);
-    const __m512i refill_values =
-        _mm512_cvtepu8_epi32(packed_bytes);
-    const __m512i expanded_values =
-        _mm512_maskz_expand_epi32(
-            renormalization_mask, refill_values);
-    const __m512i renormalized_states = _mm512_or_si512(
-        _mm512_slli_epi32(*state, 8), expanded_values);
-    *state = _mm512_mask_mov_epi32(
-        *state, renormalization_mask,
-        renormalized_states);
-    *interleaved_iter += refill_byte_ct;
-    renormalization_mask =
-        entropy_mask &
-        _mm512_cmp_epu32_mask(
-            *state, _mm512_set1_epi32(kRansLowerBound),
-            _MM_CMPINT_LT);
   }
 
   // With monotonic threshold masks, symbol = above0 + above1 +
@@ -2559,15 +2611,23 @@ bool DecodeEntropyWords32InterleavedAvx512(
             : 0;
     uint32_t packed0;
     uint32_t packed1;
+    // A 16-lane group consumes at most two bytes per lane.  When at
+    // least 64 bytes remain, both groups can use ordinary 16-byte
+    // loads without repeating payload bounds checks in the refill
+    // hot path.
+    const bool groups_have_64_input_bytes =
+        static_cast<size_t>(payload_end - payload_iter) >= 64;
     if (!RansDecodeGroup16Avx512<
             kMode, 0, kAllEntropy>(
             decode_model, reference1_word, reference2_word,
-            &state0, &payload_iter, payload_end, &packed0,
+            &state0, &payload_iter, payload_end,
+            groups_have_64_input_bytes, &packed0,
             &absent_context_mask, error) ||
         !RansDecodeGroup16Avx512<
             kMode, 1, kAllEntropy>(
             decode_model, reference1_word, reference2_word,
-            &state1, &payload_iter, payload_end, &packed1,
+            &state1, &payload_iter, payload_end,
+            groups_have_64_input_bytes, &packed1,
             &absent_context_mask, error)) {
       return false;
     }
