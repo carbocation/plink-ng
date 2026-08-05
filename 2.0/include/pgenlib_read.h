@@ -79,6 +79,20 @@ typedef struct PgrHardcallBackendStruct {
   PglErr (*get_raw)(
       void* context, uint32_t vidx, PgenGlobalFlags read_gflags,
       uintptr_t** loadbuf_iter_ptr, unsigned char* loaded_vrtype_ptr);
+  // Optional PgrGetDifflistOrGenovec() fast path.  Appended to preserve the
+  // layout of the original hardcall-backend callbacks.  On sparse return,
+  // *difflist_common_geno_ptr is 0..3 and main_raregeno/sample IDs contain at
+  // most max_difflist_len entries.  On dense return it must be UINT32_MAX and
+  // genovec contains sample_ct packed hardcalls.  Implementations must set
+  // *difflist_len_ptr to zero on dense return.  main_raregeno may alias
+  // genovec; sparse and dense outputs are mutually exclusive.
+  PglErr (*get_difflist_or_genovec)(
+      void* context, const uintptr_t* sample_include,
+      const uint32_t* sample_include_cumulative_popcounts,
+      uint32_t sample_ct, uint32_t vidx, uint32_t max_difflist_len,
+      uintptr_t* genovec, uint32_t* difflist_common_geno_ptr,
+      uintptr_t* main_raregeno, uint32_t* difflist_sample_ids,
+      uint32_t* difflist_len_ptr);
 } PgrHardcallBackend;
 
 // PgenFileInfo and PgenReader are the main exported "classes".

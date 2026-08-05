@@ -3,6 +3,7 @@
 #include "pgen_rans_codec.h"
 #include "pgen_rans_container.h"
 #include "pgen_rans_cpu.h"
+#include "pgen_rans_hybrid.h"
 #include "pgen_rans_reader.h"
 
 #include <algorithm>
@@ -29,9 +30,12 @@ using pgen_rans::PackedReadStats;
 using pgen_rans::PackedVariantReader;
 using pgen_rans::DecodeRecord;
 using pgen_rans::EncodeRecord;
+using pgen_rans::EncodeRawRecord;
+using pgen_rans::EncodeSparsePredictorRecord;
 using pgen_rans::EncodedBlock;
 using pgen_rans::GetPackedGenotype;
 using pgen_rans::kPgenRansFormatVersion;
+using pgen_rans::kSparsePredictorBitmapFlag;
 using pgen_rans::kPgenRansStorageMode;
 using pgen_rans::MultiallelicPatches;
 using pgen_rans::PackedWordCt;
@@ -39,6 +43,7 @@ using pgen_rans::RecordMetadata;
 using pgen_rans::RecordMode;
 using pgen_rans::ScheduledAnchorOffsets;
 using pgen_rans::SetPackedGenotype;
+using pgen_rans::SparseHardcallResult;
 
 [[noreturn]] void Fail(const std::string& message) {
   fprintf(stderr, "FAIL: %s\n", message.c_str());
@@ -203,9 +208,216 @@ void WriteSourceContainer(
   Expect(writer.Close(&error), "shard writer close failed: " + error);
 }
 
+std::vector<uint64_t> MakeSparseVariant(
+    uint32_t sample_ct, uint8_t common,
+    const std::vector<std::pair<uint32_t, uint8_t>>& exceptions) {
+  std::vector<uint64_t> result(PackedWordCt(sample_ct), 0);
+  for (uint32_t sample_idx = 0; sample_idx != sample_ct; ++sample_idx) {
+    SetPackedGenotype(result.data(), sample_idx, common);
+  }
+  for (const auto& exception : exceptions) {
+    SetPackedGenotype(result.data(), exception.first, exception.second);
+  }
+  return result;
+}
+
+void ExpectSparseMatches(const SparseHardcallResult& sparse,
+                         const std::vector<uint64_t>& expected,
+                         uint32_t sample_ct, const std::string& label) {
+  Expect(sparse.common_genotype <= 3,
+         label + " did not return a sparse common genotype");
+  Expect(sparse.sample_ids.size() == sparse.genotypes.size(),
+         label + " sparse vector lengths disagree");
+  std::vector<uint64_t> observed(PackedWordCt(sample_ct), 0);
+  for (uint32_t sample_idx = 0; sample_idx != sample_ct; ++sample_idx) {
+    SetPackedGenotype(
+        observed.data(), sample_idx,
+        static_cast<uint8_t>(sparse.common_genotype));
+  }
+  for (size_t idx = 0; idx != sparse.sample_ids.size(); ++idx) {
+    if ((sparse.sample_ids[idx] >= sample_ct) ||
+        (idx && (sparse.sample_ids[idx - 1] >= sparse.sample_ids[idx]))) {
+      Fail(label + " sparse sample IDs are not sorted and in range");
+    }
+    SetPackedGenotype(
+        observed.data(), sparse.sample_ids[idx], sparse.genotypes[idx]);
+  }
+  ExpectEqual(observed, expected, sample_ct);
+}
+
+void TestSparsePackedReader() {
+  constexpr uint32_t kSampleCt = 257;
+  constexpr uint32_t kVariantCt = 7;
+  constexpr uint32_t kAnchorCt = 3;
+  const CodecParams codec_params;
+  const std::vector<uint32_t> anchor_offsets =
+      ScheduledAnchorOffsets(kVariantCt, kAnchorCt);
+  Expect(anchor_offsets == std::vector<uint32_t>({1, 3, 5}),
+         "unexpected sparse-reader anchor schedule");
+
+  std::vector<std::vector<uint64_t>> source(kVariantCt);
+  std::vector<std::pair<uint32_t, uint8_t>> bitmap_exceptions;
+  for (uint32_t sample_idx = 0; sample_idx != 80; ++sample_idx) {
+    bitmap_exceptions.emplace_back(sample_idx, 1 + (sample_idx % 2));
+  }
+  source[0] = MakeSparseVariant(kSampleCt, 0, bitmap_exceptions);
+  source[1] = MakeSparseVariant(
+      kSampleCt, 0, {{3, 1}, {50, 2}, {200, 3}});
+  source[3] = MakeSparseVariant(
+      kSampleCt, 1, {{7, 0}, {50, 2}, {201, 3}});
+
+  const uint8_t one_reference_map[4] = {0, 2, 1, 3};
+  source[2].assign(PackedWordCt(kSampleCt), 0);
+  for (uint32_t sample_idx = 0; sample_idx != kSampleCt; ++sample_idx) {
+    const uint8_t anchor = GetPackedGenotype(source[1].data(), sample_idx);
+    SetPackedGenotype(
+        source[2].data(), sample_idx, one_reference_map[anchor]);
+  }
+  SetPackedGenotype(source[2].data(), 19, 2);
+  SetPackedGenotype(source[2].data(), 200, 0);
+
+  source[4].assign(PackedWordCt(kSampleCt), 0);
+  for (uint32_t sample_idx = 0; sample_idx != kSampleCt; ++sample_idx) {
+    const uint8_t anchor1 =
+        GetPackedGenotype(source[1].data(), sample_idx);
+    const uint8_t anchor2 =
+        GetPackedGenotype(source[3].data(), sample_idx);
+    const uint8_t genotype =
+        static_cast<uint8_t>((anchor1 + 2 * anchor2) & 3);
+    SetPackedGenotype(source[4].data(), sample_idx, genotype);
+  }
+  SetPackedGenotype(source[4].data(), 33, 3);
+  SetPackedGenotype(source[4].data(), 201, 0);
+  source[5] = MakeVariant(5, kSampleCt);
+  const uint8_t raw_anchor_map[4] = {1, 0, 3, 2};
+  source[6].assign(PackedWordCt(kSampleCt), 0);
+  for (uint32_t sample_idx = 0; sample_idx != kSampleCt; ++sample_idx) {
+    const uint8_t anchor = GetPackedGenotype(source[5].data(), sample_idx);
+    SetPackedGenotype(
+        source[6].data(), sample_idx, raw_anchor_map[anchor]);
+  }
+  SetPackedGenotype(
+      source[6].data(), 42,
+      static_cast<uint8_t>(
+          GetPackedGenotype(source[6].data(), 42) ^ 1U));
+
+  EncodedBlock block;
+  block.first_variant = 0;
+  block.records.resize(kVariantCt);
+  std::string error;
+  Expect(EncodeSparsePredictorRecord(
+             source[0].data(), nullptr, nullptr, kSampleCt,
+             RecordMode::kMarginal, 0, 0, &block.records[0], &error),
+         "bitmap marginal sparse encode failed: " + error);
+  Expect(EncodeSparsePredictorRecord(
+             source[1].data(), nullptr, nullptr, kSampleCt,
+             RecordMode::kMarginal, 0, 0, &block.records[1], &error),
+         "first sparse anchor encode failed: " + error);
+  Expect(EncodeSparsePredictorRecord(
+             source[2].data(), source[1].data(), nullptr, kSampleCt,
+             RecordMode::kOneReference, 0, 0, &block.records[2], &error),
+         "one-reference sparse encode failed: " + error);
+  Expect(EncodeSparsePredictorRecord(
+             source[3].data(), nullptr, nullptr, kSampleCt,
+             RecordMode::kMarginal, 0, 0, &block.records[3], &error),
+         "second sparse anchor encode failed: " + error);
+  Expect(EncodeSparsePredictorRecord(
+             source[4].data(), source[1].data(), source[3].data(),
+             kSampleCt, RecordMode::kTwoReference, 0, 1,
+             &block.records[4], &error),
+         "two-reference sparse encode failed: " + error);
+  Expect((block.records[0][0] & kSparsePredictorBitmapFlag) &&
+             !(block.records[1][0] & kSparsePredictorBitmapFlag),
+         "sparse-reader fixture does not cover bitmap and delta IDs");
+  Expect(EncodeRawRecord(
+             source[5].data(), kSampleCt, &block.records[5], &error),
+         "raw fallback encode failed: " + error);
+  Expect(EncodeSparsePredictorRecord(
+             source[6].data(), source[5].data(), nullptr, kSampleCt,
+             RecordMode::kOneReference, 2, 0, &block.records[6], &error),
+         "raw-anchor conditional encode failed: " + error);
+
+  const std::string path = TemporaryPath();
+  const ContainerParams params = {
+      kSampleCt, kVariantCt, kVariantCt, kAnchorCt,
+      codec_params.state_ct, codec_params.scale_bits, 3, 1, 2};
+  ContainerWriter writer;
+  Expect(writer.Open(path, params, {}, &error),
+         "sparse-reader writer open failed: " + error);
+  Expect(writer.WriteBlock(block, &error),
+         "sparse-reader block write failed: " + error);
+  Expect(writer.Close(&error),
+         "sparse-reader writer close failed: " + error);
+
+  PackedVariantReader reader;
+  Expect(reader.Open(path, 2, &error),
+         "sparse packed reader open failed: " + error);
+  const size_t packed_byte_ct = (kSampleCt + 3) / 4;
+  std::vector<uint8_t> dense_output(packed_byte_ct, 0xa5);
+  SparseHardcallResult sparse;
+  PackedReadStats stats;
+  for (const uint32_t variant : {0U, 1U, 2U, 3U, 4U}) {
+    Expect(reader.ReadVariantMaybeSparse(
+               variant, kSampleCt, dense_output.data(), dense_output.size(),
+               &sparse, &stats, &error),
+           "sparse packed read failed: " + error);
+    ExpectSparseMatches(
+        sparse, source[variant], kSampleCt,
+        "variant " + std::to_string(variant));
+  }
+  Expect((stats.returned_sparse_variant_ct == 5) &&
+             (!stats.decoded_variant_ct),
+         "direct sparse reads materialized packed hardcalls");
+
+  Expect(reader.ReadVariantMaybeSparse(
+             0, 10, dense_output.data(), dense_output.size(), &sparse,
+             &stats, &error),
+         "sparse threshold fallback failed: " + error);
+  Expect(sparse.common_genotype == UINT32_MAX,
+         "oversized difference list did not fall back to dense");
+  Expect(!memcmp(dense_output.data(), source[0].data(), packed_byte_ct),
+         "sparse threshold dense fallback mismatch");
+  Expect(reader.ReadVariantMaybeSparse(
+             5, kSampleCt, dense_output.data(), dense_output.size(), &sparse,
+             &stats, &error),
+         "raw packed fallback read failed: " + error);
+  Expect((sparse.common_genotype == UINT32_MAX) &&
+             (!memcmp(dense_output.data(), source[5].data(), packed_byte_ct)),
+         "raw record did not use exact dense fallback");
+  Expect(reader.ReadVariantMaybeSparse(
+             6, kSampleCt, dense_output.data(), dense_output.size(), &sparse,
+             &stats, &error),
+         "raw-anchor conditional fallback read failed: " + error);
+  Expect((sparse.common_genotype == UINT32_MAX) &&
+             (!memcmp(dense_output.data(), source[6].data(), packed_byte_ct)),
+         "conditional record with a raw anchor did not fall back exactly");
+
+  const uint32_t subset[] = {0, 3, 19, 33, 50, 80, 200, 201, 256};
+  constexpr uint32_t kSubsetCt = sizeof(subset) / sizeof(subset[0]);
+  Expect(reader.SetSampleSubset(subset, kSubsetCt, &error),
+         "sparse reader subset setup failed: " + error);
+  std::vector<uint64_t> subset_expected(PackedWordCt(kSubsetCt), 0);
+  for (uint32_t subset_idx = 0; subset_idx != kSubsetCt; ++subset_idx) {
+    SetPackedGenotype(
+        subset_expected.data(), subset_idx,
+        GetPackedGenotype(source[4].data(), subset[subset_idx]));
+  }
+  dense_output.assign((kSubsetCt + 3) / 4, 0xa5);
+  Expect(reader.ReadVariantMaybeSparse(
+             4, kSubsetCt, dense_output.data(), dense_output.size(), &sparse,
+             &stats, &error),
+         "subset sparse read failed: " + error);
+  ExpectSparseMatches(sparse, subset_expected, kSubsetCt,
+                      "subset two-reference variant");
+  reader.Close();
+  Expect(unlink(path.c_str()) == 0,
+         "sparse packed reader cleanup failed");
+}
+
 }  // namespace
 
 int main() {
+  TestSparsePackedReader();
   constexpr uint32_t kSampleCt = 1003;
   constexpr uint32_t kVariantCt = 19;
   constexpr uint32_t kBlockVariantCt = 10;

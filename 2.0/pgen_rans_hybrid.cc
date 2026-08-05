@@ -6,6 +6,7 @@
 #include <array>
 #include <cstring>
 #include <limits>
+#include <utility>
 
 namespace pgen_rans {
 namespace {
@@ -163,6 +164,137 @@ bool ParseSelectors(const uint8_t* record, size_t record_size,
       return false;
     }
   }
+  return true;
+}
+
+bool ParseSparsePredictorRecordImpl(
+    const uint8_t* record, size_t record_size, uint32_t sample_ct,
+    ParsedSparsePredictor* parsed, std::string* error) {
+  const uint8_t flags = record[0];
+  if (!(flags & kSparsePredictorRecordFlag) ||
+      (flags & (kRawPackedRecordFlag | kEntropyPayloadFlag))) {
+    SetError("Record is not a sparse predictor.", error);
+    return false;
+  }
+  RecordMode mode;
+  if (!ParseMode(flags, &mode, error)) {
+    return false;
+  }
+  RecordMetadata metadata;
+  size_t offset = 1;
+  if (!ParseSelectors(record, record_size, mode, &offset, &metadata, error)) {
+    return false;
+  }
+
+  const uint32_t row_ct = RowCt(mode);
+  const size_t mapping_byte_ct = (row_ct + 3) / 4;
+  if ((offset > record_size) ||
+      (mapping_byte_ct > record_size - offset)) {
+    SetError("Truncated sparse predictor mapping.", error);
+    return false;
+  }
+  const uint8_t* const mapping = record + offset;
+  offset += mapping_byte_ct;
+  if ((row_ct % 4) &&
+      (mapping[mapping_byte_ct - 1] >> (2 * (row_ct % 4)))) {
+    SetError("Sparse predictor mapping has nonzero padding.", error);
+    return false;
+  }
+
+  ParsedSparsePredictor candidate;
+  candidate.mode = mode;
+  candidate.reference1 = metadata.reference1;
+  candidate.reference2 = metadata.reference2;
+  for (uint32_t context = 0; context != row_ct; ++context) {
+    candidate.predictions[context] = static_cast<uint8_t>(
+        (mapping[context / 4] >> (2 * (context % 4))) & 3U);
+  }
+
+  uint32_t exception_ct;
+  if ((!ReadVarint(record, record_size, &offset, &exception_ct)) ||
+      (exception_ct > sample_ct)) {
+    SetError("Invalid sparse exception count.", error);
+    return false;
+  }
+  candidate.exception_sample_ids.resize(exception_ct);
+  if (flags & kSparsePredictorBitmapFlag) {
+    const size_t bitmap_byte_ct =
+        (static_cast<size_t>(sample_ct) + 7) / 8;
+    if ((offset > record_size) ||
+        (bitmap_byte_ct > record_size - offset)) {
+      SetError("Truncated sparse exception bitmap.", error);
+      return false;
+    }
+    const uint8_t* const bitmap = record + offset;
+    if ((sample_ct % 8) &&
+        (bitmap[bitmap_byte_ct - 1] >> (sample_ct % 8))) {
+      SetError("Sparse exception bitmap has nonzero padding.", error);
+      return false;
+    }
+    uint32_t observed_ct = 0;
+    for (size_t byte_idx = 0; byte_idx != bitmap_byte_ct; ++byte_idx) {
+      uint8_t set_bits = bitmap[byte_idx];
+      while (set_bits) {
+        if (observed_ct == exception_ct) {
+          SetError("Sparse exception bitmap count mismatch.", error);
+          return false;
+        }
+        uint32_t bit_idx = 0;
+        uint8_t shifted = set_bits;
+        while (!(shifted & 1U)) {
+          shifted >>= 1;
+          ++bit_idx;
+        }
+        candidate.exception_sample_ids[observed_ct++] =
+            static_cast<uint32_t>(8 * byte_idx + bit_idx);
+        set_bits &= static_cast<uint8_t>(set_bits - 1);
+      }
+    }
+    if (observed_ct != exception_ct) {
+      SetError("Sparse exception bitmap count mismatch.", error);
+      return false;
+    }
+    offset += bitmap_byte_ct;
+  } else {
+    uint32_t previous = 0;
+    for (uint32_t idx = 0; idx != exception_ct; ++idx) {
+      uint32_t delta;
+      if ((!ReadVarint(record, record_size, &offset, &delta)) ||
+          (idx && !delta) ||
+          (delta > std::numeric_limits<uint32_t>::max() - previous) ||
+          (previous + delta >= sample_ct)) {
+        SetError("Invalid sparse exception sample index.", error);
+        return false;
+      }
+      previous += delta;
+      candidate.exception_sample_ids[idx] = previous;
+    }
+  }
+
+  const size_t value_byte_ct =
+      (static_cast<size_t>(exception_ct) + 3) / 4;
+  if ((offset > record_size) ||
+      (record_size - offset != value_byte_ct)) {
+    SetError("Sparse exception values have an invalid length.", error);
+    return false;
+  }
+  if ((exception_ct % 4) && value_byte_ct &&
+      (record[record_size - 1] >> (2 * (exception_ct % 4)))) {
+    SetError("Sparse exception values have nonzero padding.", error);
+    return false;
+  }
+  candidate.exception_genotypes.resize(exception_ct);
+  for (uint32_t idx = 0; idx != exception_ct; ++idx) {
+    const uint8_t value = static_cast<uint8_t>(
+        (record[offset + idx / 4] >> (2 * (idx % 4))) & 3U);
+    if ((mode == RecordMode::kMarginal) &&
+        (value == candidate.predictions[0])) {
+      SetError("Sparse exception repeats its predictor.", error);
+      return false;
+    }
+    candidate.exception_genotypes[idx] = value;
+  }
+  *parsed = std::move(candidate);
   return true;
 }
 
@@ -342,6 +474,33 @@ bool EncodeSparsePredictorRecordFromCounts(
   return EncodeSparsePredictorRecordImpl(
       target, reference1, reference2, sample_ct, mode, reference1_idx,
       reference2_idx, context_symbol_counts, record, error);
+}
+
+bool ParseSparsePredictorRecord(
+    const uint8_t* record, size_t record_size, uint32_t sample_ct,
+    ParsedSparsePredictor* parsed, bool* is_sparse_predictor,
+    std::string* error) {
+  if ((!record) || (!record_size) || (!sample_ct) || (!parsed) ||
+      (!is_sparse_predictor)) {
+    SetError("Invalid sparse predictor parser arguments.", error);
+    return false;
+  }
+  *parsed = ParsedSparsePredictor();
+  *is_sparse_predictor = false;
+  size_t base_record_size;
+  if (!GetBaseRecordByteCt(
+          record, record_size, &base_record_size, error)) {
+    return false;
+  }
+  if (!(record[0] & kSparsePredictorRecordFlag)) {
+    return true;
+  }
+  if (!ParseSparsePredictorRecordImpl(
+          record, base_record_size, sample_ct, parsed, error)) {
+    return false;
+  }
+  *is_sparse_predictor = true;
+  return true;
 }
 
 bool DecodeAlternateRecordToBuffer(

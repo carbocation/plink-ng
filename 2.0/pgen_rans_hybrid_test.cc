@@ -16,6 +16,8 @@ using pgen_rans::EncodeSparsePredictorRecord;
 using pgen_rans::EncodeSparsePredictorRecordFromCounts;
 using pgen_rans::GetPackedGenotype;
 using pgen_rans::PackedWordCt;
+using pgen_rans::ParsedSparsePredictor;
+using pgen_rans::ParseSparsePredictorRecord;
 using pgen_rans::RecordMetadata;
 using pgen_rans::RecordMode;
 using pgen_rans::SetPackedGenotype;
@@ -94,6 +96,16 @@ void RoundTrip(const std::vector<uint8_t>& target,
          "count-reusing sparse encode failed: " + error);
   Expect(record == count_reused_record,
          "count-reusing sparse encode changed the record");
+  ParsedSparsePredictor parsed;
+  bool is_sparse_predictor = false;
+  Expect(ParseSparsePredictorRecord(
+             record.data(), record.size(), target.size(), &parsed,
+             &is_sparse_predictor, &error),
+         "sparse predictor parse failed: " + error);
+  Expect(is_sparse_predictor && (parsed.mode == mode) &&
+             (parsed.exception_sample_ids.size() ==
+              parsed.exception_genotypes.size()),
+         "sparse predictor parse metadata mismatch");
   const uint64_t* anchors[6] = {};
   anchors[2] = packed_reference1.data();
   anchors[5] = packed_reference2.data();
@@ -164,6 +176,12 @@ void TestRawRoundTrips() {
     Expect(EncodeRawRecord(
                packed.data(), sample_ct, &record, &error),
            "raw encode failed: " + error);
+    ParsedSparsePredictor parsed;
+    bool is_sparse_predictor = true;
+    Expect(ParseSparsePredictorRecord(
+               record.data(), record.size(), sample_ct, &parsed,
+               &is_sparse_predictor, &error) && !is_sparse_predictor,
+           "raw record was reported as a sparse predictor");
     std::vector<uint64_t> decoded(PackedWordCt(sample_ct) + 1,
                                   0xc001d00dULL);
     Expect(DecodeAlternateRecordToBuffer(

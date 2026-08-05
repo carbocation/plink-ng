@@ -309,6 +309,7 @@ PlinkRansAdapter::PlinkRansAdapter() : backend_{} {
   backend_.get = &Get;
   backend_.get_allele = &GetAllele;
   backend_.get_counts = &GetCounts;
+  backend_.get_difflist_or_genovec = &GetDifflistOrGenovec;
   backend_.get_packed = &GetPacked;
   backend_.get_packed_batch = &GetPackedBatch;
   backend_.get_m = &GetM;
@@ -441,6 +442,85 @@ PglErr PlinkRansAdapter::ReadBase(
     return kPglRetReadFail;
   }
   CopySubset(sample_include, sample_ct, genovec);
+  return kPglRetSuccess;
+}
+
+PglErr PlinkRansAdapter::ReadDifflistOrGenovec(
+    const uintptr_t* sample_include,
+    const uint32_t* sample_include_cumulative_popcounts,
+    uint32_t sample_ct, uint32_t vidx, uint32_t max_difflist_len,
+    uintptr_t* genovec, uint32_t* difflist_common_geno_ptr,
+    uintptr_t* main_raregeno, uint32_t* difflist_sample_ids,
+    uint32_t* difflist_len_ptr) {
+  *difflist_common_geno_ptr = UINT32_MAX;
+  *difflist_len_ptr = 0;
+  const uint32_t raw_sample_ct = reader_.raw_sample_ct();
+  if ((!sample_ct) || (sample_ct > raw_sample_ct) ||
+      (max_difflist_len > sample_ct) || (!genovec) || (!main_raregeno) ||
+      (!difflist_sample_ids) ||
+      ((sample_ct != raw_sample_ct) &&
+       ((!sample_include) ||
+        (!sample_include_cumulative_popcounts)))) {
+    return kPglRetImproperFunctionCall;
+  }
+
+  std::string error;
+  if (!reader_.ReadVariantMaybeSparse(
+          vidx, raw_sample_ct, reinterpret_cast<uint8_t*>(raw_genovec_),
+          reader_.packed_variant_byte_ct(), &sparse_result_, nullptr,
+          &error)) {
+    return ReadFailure(error, &last_error_);
+  }
+  if (sparse_result_.common_genotype == UINT32_MAX) {
+    ZeroTrailingNyps(raw_sample_ct, raw_genovec_);
+    CopySubset(sample_include, sample_ct, genovec);
+    return kPglRetSuccess;
+  }
+
+  uint32_t output_len = 0;
+  for (size_t raw_idx = 0; raw_idx != sparse_result_.sample_ids.size();
+       ++raw_idx) {
+    const uint32_t raw_sample_idx = sparse_result_.sample_ids[raw_idx];
+    if (raw_sample_idx >= raw_sample_ct) {
+      last_error_ =
+          "Conditional-rANS sparse sample index is out of range.";
+      return kPglRetMalformedInput;
+    }
+    if (sample_ct != raw_sample_ct) {
+      if (!IsSet(sample_include, raw_sample_idx)) {
+        continue;
+      }
+    }
+    if (output_len == max_difflist_len) {
+      // The raw record still gives us an exact, inexpensive way to materialize
+      // dense hardcalls.  Avoid invoking the entropy decoder on threshold
+      // fallback.
+      const uintptr_t common_word =
+          sparse_result_.common_genotype * kMask5555;
+      std::fill(raw_genovec_, raw_genovec_ + raw_word_ct_, common_word);
+      for (size_t sparse_idx = 0;
+           sparse_idx != sparse_result_.sample_ids.size(); ++sparse_idx) {
+        AssignNyparrEntry(
+            sparse_result_.sample_ids[sparse_idx],
+            sparse_result_.genotypes[sparse_idx], raw_genovec_);
+      }
+      ZeroTrailingNyps(raw_sample_ct, raw_genovec_);
+      CopySubset(sample_include, sample_ct, genovec);
+      return kPglRetSuccess;
+    }
+    const uint32_t output_sample_idx =
+        (sample_ct == raw_sample_ct)
+            ? raw_sample_idx
+            : RawToSubsettedPos(
+                  sample_include, sample_include_cumulative_popcounts,
+                  raw_sample_idx);
+    difflist_sample_ids[output_len] = output_sample_idx;
+    AssignNyparrEntry(
+        output_len, sparse_result_.genotypes[raw_idx], main_raregeno);
+    ++output_len;
+  }
+  *difflist_common_geno_ptr = sparse_result_.common_genotype;
+  *difflist_len_ptr = output_len;
   return kPglRetSuccess;
 }
 
@@ -733,6 +813,19 @@ PglErr PlinkRansAdapter::GetCounts(
   memcpy(genocounts, count_buffer.data(),
          count_buffer.size() * sizeof(uint32_t));
   return kPglRetSuccess;
+}
+
+PglErr PlinkRansAdapter::GetDifflistOrGenovec(
+    void* context, const uintptr_t* sample_include,
+    const uint32_t* sample_include_cumulative_popcounts,
+    uint32_t sample_ct, uint32_t vidx, uint32_t max_difflist_len,
+    uintptr_t* genovec, uint32_t* difflist_common_geno_ptr,
+    uintptr_t* main_raregeno, uint32_t* difflist_sample_ids,
+    uint32_t* difflist_len_ptr) {
+  return static_cast<PlinkRansAdapter*>(context)->ReadDifflistOrGenovec(
+      sample_include, sample_include_cumulative_popcounts, sample_ct, vidx,
+      max_difflist_len, genovec, difflist_common_geno_ptr, main_raregeno,
+      difflist_sample_ids, difflist_len_ptr);
 }
 
 PglErr PlinkRansAdapter::GetPacked(

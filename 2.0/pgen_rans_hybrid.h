@@ -3,6 +3,7 @@
 #ifndef PGEN_RANS_HYBRID_H_
 #define PGEN_RANS_HYBRID_H_
 
+#include <array>
 #include <cstddef>
 #include <cstdint>
 #include <string>
@@ -46,6 +47,30 @@ bool EncodeSparsePredictorRecordFromCounts(
     const uint64_t* reference2, uint32_t sample_ct, RecordMode mode,
     uint8_t reference1_idx, uint8_t reference2_idx,
     const uint32_t* context_symbol_counts, std::vector<uint8_t>* record,
+    std::string* error);
+
+// Parsed sparse-predictor payload.  The exception genotypes replace the
+// context-specific predictions at the corresponding raw sample IDs.  This
+// representation is intentionally independent of decoded anchor buffers so a
+// caller can compose conditional records from sparse marginal anchors without
+// materializing a full sample-length hardcall vector.
+struct ParsedSparsePredictor {
+  RecordMode mode = RecordMode::kMarginal;
+  uint8_t reference1 = 0;
+  uint8_t reference2 = 0;
+  std::array<uint8_t, 16> predictions = {};
+  std::vector<uint32_t> exception_sample_ids;
+  std::vector<uint8_t> exception_genotypes;
+};
+
+// Parses and canonically validates the structural portion of a sparse
+// predictor record.  is_sparse_predictor is false for ordinary entropy and
+// raw-packed records.  Conditional exception-vs-prediction validation requires
+// anchor values and is performed by consumers when they compose or
+// materialize the record.
+bool ParseSparsePredictorRecord(
+    const uint8_t* record, size_t record_size, uint32_t sample_ct,
+    ParsedSparsePredictor* parsed, bool* is_sparse_predictor,
     std::string* error);
 
 // Decodes and canonically validates a raw or sparse record.  record_size is

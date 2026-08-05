@@ -78,6 +78,13 @@ class PlinkRansAdapter {
       void* context, const uintptr_t* sample_include,
       const uint32_t* sample_include_cumulative_popcounts,
       uint32_t sample_ct, uint32_t vidx, uint32_t* genocounts);
+  static plink2::PglErr GetDifflistOrGenovec(
+      void* context, const uintptr_t* sample_include,
+      const uint32_t* sample_include_cumulative_popcounts,
+      uint32_t sample_ct, uint32_t vidx, uint32_t max_difflist_len,
+      uintptr_t* genovec, uint32_t* difflist_common_geno_ptr,
+      uintptr_t* main_raregeno, uint32_t* difflist_sample_ids,
+      uint32_t* difflist_len_ptr);
   static plink2::PglErr GetPacked(
       void* context, uint32_t vidx, unsigned char* packed_genotypes,
       uint32_t packed_byte_ct);
@@ -106,6 +113,13 @@ class PlinkRansAdapter {
       const uintptr_t* sample_include,
       const uint32_t* sample_include_cumulative_popcounts,
       uint32_t sample_ct, uint32_t vidx, plink2::PgenVariant* pgv);
+  plink2::PglErr ReadDifflistOrGenovec(
+      const uintptr_t* sample_include,
+      const uint32_t* sample_include_cumulative_popcounts,
+      uint32_t sample_ct, uint32_t vidx, uint32_t max_difflist_len,
+      uintptr_t* genovec, uint32_t* difflist_common_geno_ptr,
+      uintptr_t* main_raregeno, uint32_t* difflist_sample_ids,
+      uint32_t* difflist_len_ptr);
   bool ReadRaw(uint32_t vidx);
   plink2::PglErr ReadRawRecord(
       uint32_t vidx, plink2::PgenGlobalFlags read_gflags,
@@ -118,6 +132,7 @@ class PlinkRansAdapter {
   plink2::PgrHardcallBackend backend_;
   uintptr_t* raw_genovec_ = nullptr;
   uintptr_t* count_genovec_ = nullptr;
+  SparseHardcallResult sparse_result_;
   uint32_t raw_word_ct_ = 0;
   std::string last_error_;
 };

@@ -253,6 +253,16 @@ recent block bytes, decoded anchors, and decoded targets for adjacent or
 repeated requests. Patch-only reads still fetch and checksum the complete
 block but skip hardcall entropy decoding.
 
+`PackedVariantReader::ReadVariantMaybeSparse()` additionally exposes the
+PGEN-compatible common-genotype plus difference-list representation used by
+`PgrGetDMaybeSparse()`. Marginal sparse-predictor records are returned without
+materializing a sample-length vector. One- and two-reference sparse predictors
+are likewise composed from sparse scheduled anchors by merging their exception
+IDs; if an anchor is entropy/raw encoded or the final list exceeds the caller's
+limit, the reader returns the ordinary packed fallback. The alternate pgenlib
+hardcall backend advertises this as an optional capability, so older and dense-
+only backends retain their previous behavior.
+
 An optional sorted sample index projects each decoded requested record into a
 smaller packed output. Since rANS states cannot jump over arbitrary samples,
 this projection reduces downstream work and buffer size but not the

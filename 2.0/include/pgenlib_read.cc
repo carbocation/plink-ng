@@ -3369,6 +3369,13 @@ PglErr PgrGetDifflistOrGenovec(const uintptr_t* __restrict sample_include, PgrSa
   if (pgrp->hardcall_backend) {
     *difflist_common_geno_ptr = UINT32_MAX;
     *difflist_len_ptr = 0;
+    if (pgrp->hardcall_backend->get_difflist_or_genovec) {
+      return pgrp->hardcall_backend->get_difflist_or_genovec(
+          pgrp->hardcall_backend->context, sample_include, GetSicp(pssi),
+          sample_ct, vidx, max_difflist_len, genovec,
+          difflist_common_geno_ptr, main_raregeno, difflist_sample_ids,
+          difflist_len_ptr);
+    }
     return pgrp->hardcall_backend->get(
         pgrp->hardcall_backend->context, sample_include, GetSicp(pssi),
         sample_ct, vidx, genovec);
@@ -7639,7 +7646,42 @@ const uint16_t kHcToDosage16[1024] = QUAD_TABLE256(0, 16384, 32768, 65535);
 PglErr IMPLPgrGetDMaybeSparse(const uintptr_t* __restrict sample_include, const uint32_t* __restrict sample_include_cumulative_popcounts, uint32_t sample_ct, uint32_t vidx, uint32_t max_sparse_dosage_ct, PgenReaderMain* pgrp, uintptr_t* __restrict genovec, uintptr_t* __restrict dosage_present, uint16_t* dosage_main, uint32_t* dosage_ct_ptr, uint16_t* difflist_common_dosage_ptr, uint32_t* difflist_sample_ids) {
   assert(vidx < pgrp->fi.raw_variant_ct);
   *difflist_common_dosage_ptr = 1;
+  *dosage_ct_ptr = 0;
   if (!sample_ct) {
+    return kPglRetSuccess;
+  }
+  if (pgrp->hardcall_backend) {
+    const PgrHardcallBackend* backend = pgrp->hardcall_backend;
+    if (!backend->get_difflist_or_genovec) {
+      return backend->get(
+          backend->context, sample_include,
+          sample_include_cumulative_popcounts, sample_ct, vidx, genovec);
+    }
+    uint32_t common_genotype = UINT32_MAX;
+    uint32_t difflist_len = 0;
+    // genovec is large enough to hold a packed rare-genotype vector with up to
+    // sample_ct entries, and dense and sparse returns are mutually exclusive.
+    // Reusing it here avoids adding an alternate-backend-only workspace to
+    // PgenReaderMain.
+    const PglErr reterr = backend->get_difflist_or_genovec(
+        backend->context, sample_include,
+        sample_include_cumulative_popcounts, sample_ct, vidx,
+        max_sparse_dosage_ct, genovec, &common_genotype, genovec,
+        difflist_sample_ids, &difflist_len);
+    if (unlikely(reterr)) {
+      return reterr;
+    }
+    if (common_genotype == UINT32_MAX) {
+      return difflist_len ? kPglRetMalformedInput : kPglRetSuccess;
+    }
+    if ((common_genotype > 3) ||
+        (difflist_len > max_sparse_dosage_ct)) {
+      return kPglRetMalformedInput;
+    }
+    *difflist_common_dosage_ptr = kGenoToDosage16[common_genotype];
+    *dosage_ct_ptr = difflist_len;
+    GenoarrLookup256x2bx4(
+        genovec, kHcToDosage16, difflist_len, dosage_main);
     return kPglRetSuccess;
   }
   const uint32_t vrtype = GetPgfiVrtype(&(pgrp->fi), vidx);
@@ -7659,7 +7701,6 @@ PglErr IMPLPgrGetDMaybeSparse(const uintptr_t* __restrict sample_include, const 
     // support multiallelic variants.
     return IMPLPgrGetD(sample_include, sample_include_cumulative_popcounts, sample_ct, vidx, pgrp, genovec, dosage_present, dosage_main, dosage_ct_ptr);
   }
-  *dosage_ct_ptr = 0;
   uintptr_t* subsetted_raregeno = pgrp->workspace_raregeno_vec;
   // If a dosage-list is present, we may need to merge a (sample ID, genotype)
   // list returned by ReadDifflistOrGenovecSubsetUnsafe() with the (sample ID,

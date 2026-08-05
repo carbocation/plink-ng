@@ -22,6 +22,8 @@ PGENRANSCONTAINERTESTOBJ = $(PGENRANSCODECOBJ) \
 	$(PGENRANSCONTAINEROBJ) \
 	$(addprefix $(PGENRANS_OBJ_DIR)/,\
 	pgen_rans_reader.o pgen_rans_container_test.o)
+PGENLIBSPARSEBACKENDTESTOBJ = $(addprefix $(PGENRANS_OBJ_DIR)/,\
+	$(PGENLIB_CCSRC:.cc=.o) pgenlib_sparse_backend_test.o)
 PGENRANSTOOLSRC = $(PGENLIB_CCSRC) pgen_rans_codec.cc pgen_rans_hybrid.cc \
 	pgen_rans_container.cc pgen_rans_cpu.cc pgen_rans_encode.cc \
 	pgen_rans_tool.cc
@@ -39,7 +41,7 @@ $(PGENRANS_OBJ_DIR)/%.o: %.cc
 	$(CXX) -c $(CXXFLAGS) $(ARCH32) -o $@ $<
 
 .PHONY: libpgen_rans pgen_rans pgen_rans_codec_test pgen_rans_hybrid_test \
-	pgen_rans_container_test test
+	pgen_rans_container_test pgenlib_sparse_backend_test test
 
 libpgen_rans: $(PGENRANSLIBOBJ)
 	$(MKDIR) -p $(PGENRANS_LIB_DIR)
@@ -65,16 +67,25 @@ pgen_rans_container_test: $(PGENRANSCONTAINERTESTOBJ)
 	$(CXX) $(PGENRANSCONTAINERTESTOBJ) \
 		-o $(PGENRANS_BIN_DIR)/pgen_rans_container_test $(LDFLAGS)
 
-test: pgen_rans_codec_test pgen_rans_hybrid_test pgen_rans_container_test
+pgenlib_sparse_backend_test: $(PGENLIBSPARSEBACKENDTESTOBJ)
+	$(MKDIR) -p $(PGENRANS_BIN_DIR)
+	$(CXX) $(PGENLIBSPARSEBACKENDTESTOBJ) \
+		-o $(PGENRANS_BIN_DIR)/pgenlib_sparse_backend_test $(LDFLAGS)
+
+test: pgen_rans_codec_test pgen_rans_hybrid_test pgen_rans_container_test \
+	pgenlib_sparse_backend_test
 	$(PGENRANS_BIN_DIR)/pgen_rans_codec_test
 	$(PGENRANS_BIN_DIR)/pgen_rans_hybrid_test
 	$(PGENRANS_BIN_DIR)/pgen_rans_container_test
+	$(PGENRANS_BIN_DIR)/pgenlib_sparse_backend_test
 
 CLEAN += $(PGENRANSLIBOBJ) $(PGENRANSTOOLOBJ) $(PGENRANSTESTOBJ) \
 	$(PGENRANSHYBRIDTESTOBJ) \
 	$(PGENRANSCONTAINERTESTOBJ) \
+	$(PGENLIBSPARSEBACKENDTESTOBJ) \
 	$(PGENRANS_LIB_DIR)/libpgen_rans.a \
 	$(PGENRANS_BIN_DIR)/pgen_rans \
 	$(PGENRANS_BIN_DIR)/pgen_rans_codec_test \
 	$(PGENRANS_BIN_DIR)/pgen_rans_hybrid_test \
-	$(PGENRANS_BIN_DIR)/pgen_rans_container_test
+	$(PGENRANS_BIN_DIR)/pgen_rans_container_test \
+	$(PGENRANS_BIN_DIR)/pgenlib_sparse_backend_test
