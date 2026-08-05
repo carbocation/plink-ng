@@ -85,6 +85,7 @@ CCSRC = $(PLINK2LIB_CCSRC) \
         pgen_rans_container.cc \
         pgen_rans_cpu.cc \
         pgen_rans_encode.cc \
+        pgen_rans_pgenlib.cc \
         pgen_rans_plink.cc \
         pgen_rans_reader.cc \
         plink2.cc \

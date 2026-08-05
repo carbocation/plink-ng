@@ -2834,6 +2834,13 @@ uint32_t LdLoadNecessary(uint32_t cur_vidx, PgenReaderMain* pgrp) {
 }
 
 BoolErr InitReadPtrs(uint32_t vidx, PgenReaderMain* pgrp, const unsigned char** fread_pp, const unsigned char** fread_endp) {
+  // Alternate hardcall backends do not expose physical PGEN records.  Public
+  // entry points supporting them must dispatch before reaching this helper;
+  // fail safely if an unsupported entry point does not.
+  if (unlikely(pgrp->hardcall_backend)) {
+    errno = EINVAL;
+    return 1;
+  }
   const unsigned char* block_base = pgrp->fi.block_base;
   if (block_base != nullptr) {
     // possible todo: special handling of end of vblock
@@ -4763,6 +4770,26 @@ PglErr PgrGetInv1Counts(const uintptr_t* __restrict sample_include, const uintpt
   PgenReaderMain* pgrp = GetPgrp(pgr_ptr);
   const uint32_t* sample_include_cumulative_popcounts = GetSicp(pssi);
   const uintptr_t* allele_idx_offsets = pgrp->fi.allele_idx_offsets;
+  if (pgrp->hardcall_backend) {
+    const uint32_t allele_ct = allele_idx_offsets
+                                   ? allele_idx_offsets[vidx + 1] -
+                                         allele_idx_offsets[vidx]
+                                   : 2;
+    if ((allele_ct != 2) || (allele_idx > 1)) {
+      return kPglRetNotYetSupported;
+    }
+    const PgrHardcallBackend* backend = pgrp->hardcall_backend;
+    const PglErr reterr = backend->get_counts(
+        backend->context, sample_include,
+        sample_include_cumulative_popcounts, sample_ct, vidx,
+        genocounts.data());
+    if ((!reterr) && allele_idx) {
+      const uint32_t homref_ct = genocounts[0];
+      genocounts[0] = genocounts[2];
+      genocounts[2] = homref_ct;
+    }
+    return reterr;
+  }
   PglErr reterr;
   if ((!allele_idx) || (!allele_idx_offsets)) {
   PgrGetInv1Counts_biallelic:
@@ -6139,6 +6166,24 @@ PglErr IMPLPgrGet2(const uintptr_t* __restrict sample_include, const uint32_t* _
   if (!sample_ct) {
     return kPglRetSuccess;
   }
+  if (pgrp->hardcall_backend) {
+    const uintptr_t* allele_idx_offsets = pgrp->fi.allele_idx_offsets;
+    const uint32_t allele_ct = allele_idx_offsets
+                                   ? allele_idx_offsets[vidx + 1] -
+                                         allele_idx_offsets[vidx]
+                                   : 2;
+    if ((allele_ct != 2) || (allele_idx0 > 1) || (allele_idx1 > 1)) {
+      return kPglRetNotYetSupported;
+    }
+    const PgrHardcallBackend* backend = pgrp->hardcall_backend;
+    const PglErr reterr = backend->get(
+        backend->context, sample_include,
+        sample_include_cumulative_popcounts, sample_ct, vidx, genovec);
+    if ((!reterr) && allele_idx0) {
+      GenovecInvertUnsafe(sample_ct, genovec);
+    }
+    return reterr;
+  }
   const uint32_t raw_sample_ct = pgrp->fi.raw_sample_ct;
   const uint32_t subsetting_required = (sample_ct != raw_sample_ct);
   const uint32_t vrtype = GetPgfiVrtype(&(pgrp->fi), vidx);
@@ -7085,6 +7130,13 @@ PglErr PgrGetP(const uintptr_t* __restrict sample_include, PgrSampleSubsetIndex 
   }
   PgenReaderMain* pgrp = GetPgrp(pgr_ptr);
   assert(vidx < pgrp->fi.raw_variant_ct);
+  if (pgrp->hardcall_backend) {
+    *phasepresent_ct_ptr = 0;
+    const PgrHardcallBackend* backend = pgrp->hardcall_backend;
+    return backend->get(
+        backend->context, sample_include, GetSicp(pssi), sample_ct, vidx,
+        genovec);
+  }
   return ReadGenovecHphaseSubsetUnsafe(sample_include, GetSicp(pssi), sample_ct, vidx, pgrp, nullptr, nullptr, genovec, phasepresent, phaseinfo, phasepresent_ct_ptr);
 }
 
@@ -7129,6 +7181,14 @@ PglErr PgrGet1P(const uintptr_t* __restrict sample_include, PgrSampleSubsetIndex
   }
   PgenReaderMain* pgrp = GetPgrp(pgr_ptr);
   const uint32_t* sample_include_cumulative_popcounts = GetSicp(pssi);
+  if (pgrp->hardcall_backend) {
+    *phasepresent_ct_ptr = 0;
+    const PgrHardcallBackend* backend = pgrp->hardcall_backend;
+    return backend->get_allele(
+        backend->context, sample_include,
+        sample_include_cumulative_popcounts, sample_ct, vidx, allele_idx,
+        allele_countvec);
+  }
   const uint32_t vrtype = GetPgfiVrtype(&(pgrp->fi), vidx);
   const uint32_t multiallelic_hc_present = VrtypeMultiallelicHc(vrtype);
   if ((!allele_idx) || ((allele_idx == 1) && (!multiallelic_hc_present))) {
@@ -7148,6 +7208,18 @@ PglErr IMPLPgrGetInv1P(const uintptr_t* __restrict sample_include, const uint32_
   if (!sample_ct) {
     *phasepresent_ct_ptr = 0;
     return kPglRetSuccess;
+  }
+  if (pgrp->hardcall_backend) {
+    *phasepresent_ct_ptr = 0;
+    const PgrHardcallBackend* backend = pgrp->hardcall_backend;
+    const PglErr reterr = backend->get_allele(
+        backend->context, sample_include,
+        sample_include_cumulative_popcounts, sample_ct, vidx, allele_idx,
+        allele_invcountvec);
+    if (!reterr) {
+      GenovecInvertUnsafe(sample_ct, allele_invcountvec);
+    }
+    return reterr;
   }
   const uint32_t vrtype = GetPgfiVrtype(&(pgrp->fi), vidx);
   const uint32_t multiallelic_hc_present = VrtypeMultiallelicHc(vrtype);
@@ -7180,6 +7252,12 @@ void SuppressHets11(const uintptr_t* genovec, uintptr_t* subsetted_all_hets, uin
 PglErr PgrGet2P(const uintptr_t* __restrict sample_include, PgrSampleSubsetIndex pssi, uint32_t sample_ct, uint32_t vidx, uint32_t allele_idx0, uint32_t allele_idx1, PgenReader* pgr_ptr, uintptr_t* __restrict genovec, uintptr_t* __restrict phasepresent, uintptr_t* __restrict phaseinfo, uint32_t* __restrict phasepresent_ct_ptr) {
   PgenReaderMain* pgrp = GetPgrp(pgr_ptr);
   const uint32_t* sample_include_cumulative_popcounts = GetSicp(pssi);
+  if (pgrp->hardcall_backend) {
+    *phasepresent_ct_ptr = 0;
+    return IMPLPgrGet2(
+        sample_include, sample_include_cumulative_popcounts, sample_ct, vidx,
+        allele_idx0, allele_idx1, pgrp, genovec);
+  }
   const uint32_t vrtype = GetPgfiVrtype(&(pgrp->fi), vidx);
   if (!VrtypeHphase(vrtype)) {
     *phasepresent_ct_ptr = 0;
@@ -7314,6 +7392,16 @@ PglErr PgrGetMP(const uintptr_t* __restrict sample_include, PgrSampleSubsetIndex
   }
   PgenReaderMain* pgrp = GetPgrp(pgr_ptr);
   const uint32_t* sample_include_cumulative_popcounts = GetSicp(pssi);
+  if (pgrp->hardcall_backend) {
+    pgvp->phasepresent_ct = 0;
+    const PgrHardcallBackend* backend = pgrp->hardcall_backend;
+    if (!backend->get_m) {
+      return kPglRetNotYetSupported;
+    }
+    return backend->get_m(
+        backend->context, sample_include,
+        sample_include_cumulative_popcounts, sample_ct, vidx, pgvp);
+  }
   const uint32_t vrtype = GetPgfiVrtype(&(pgrp->fi), vidx);
   const uint32_t multiallelic_hc_present = VrtypeMultiallelicHc(vrtype);
   if (!multiallelic_hc_present) {
@@ -8668,6 +8756,33 @@ PglErr PgrGetDCounts(const uintptr_t* __restrict sample_include, const uintptr_t
   }
   PgenReaderMain* pgrp = GetPgrp(pgr_ptr);
   assert(vidx < pgrp->fi.raw_variant_ct);
+  if (pgrp->hardcall_backend) {
+    const PgrHardcallBackend* backend = pgrp->hardcall_backend;
+    const PglErr reterr = backend->get_counts(
+        backend->context, sample_include, GetSicp(pssi), sample_ct, vidx,
+        genocounts.data());
+    if (reterr) {
+      return reterr;
+    }
+    all_dosages[0] =
+        (genocounts[0] * 2ULL + genocounts[1]) * 16384LLU;
+    all_dosages[1] =
+        (genocounts[2] * 2ULL + genocounts[1]) * 16384LLU;
+    if (imp_r2_ptr) {
+      const uint32_t nm_sample_ct = sample_ct - genocounts[3];
+      const uint64_t alt1_dosage =
+          genocounts[2] * 0x8000LLU + genocounts[1] * 0x4000LLU;
+      const uint64_t hap_alt1_ssq_x2 =
+          genocounts[2] * 0x40000000LLU +
+          genocounts[1] * 0x10000000LLU;
+      *imp_r2_ptr = BiallelicDiploidMinimac3R2(
+          alt1_dosage, hap_alt1_ssq_x2, nm_sample_ct);
+      if (!is_minimac3_r2) {
+        *imp_r2_ptr *= 2;
+      }
+    }
+    return kPglRetSuccess;
+  }
   return GetBasicGenotypeCountsAndDosage16s(sample_include, sample_include_interleaved_vec, GetSicp(pssi), sample_ct, vidx, is_minimac3_r2, pgrp, imp_r2_ptr, genocounts, all_dosages);
 }
 
@@ -9297,6 +9412,20 @@ PglErr PgrGetMDCounts(const uintptr_t* __restrict sample_include, const uintptr_
     }
     return kPglRetSuccess;
   }
+  if (pgrp->hardcall_backend) {
+    if (allele_ct != 2) {
+      return kPglRetNotYetSupported;
+    }
+    const PglErr reterr = PgrGetDCounts(
+        sample_include, sample_include_interleaved_vec, pssi, sample_ct,
+        vidx, is_minimac3_r2, pgr_ptr, imp_r2_ptr, genocounts,
+        all_dosages);
+    if (reterr) {
+      return reterr;
+    }
+    *het_ctp = genocounts[1];
+    return kPglRetSuccess;
+  }
   const uint32_t* sample_include_cumulative_popcounts = GetSicp(pssi);
   const uint32_t vrtype = GetPgfiVrtype(&(pgrp->fi), vidx);
   if ((allele_ct == 2) || (!(vrtype & 0x68))) {
@@ -9318,6 +9447,15 @@ PglErr PgrGetMD(const uintptr_t* __restrict sample_include, PgrSampleSubsetIndex
   }
   PgenReaderMain* pgrp = GetPgrp(pgr_ptr);
   const uint32_t* sample_include_cumulative_popcounts = GetSicp(pssi);
+  if (pgrp->hardcall_backend) {
+    const PgrHardcallBackend* backend = pgrp->hardcall_backend;
+    if (!backend->get_m) {
+      return kPglRetNotYetSupported;
+    }
+    return backend->get_m(
+        backend->context, sample_include,
+        sample_include_cumulative_popcounts, sample_ct, vidx, pgvp);
+  }
   const uintptr_t* allele_idx_offsets = pgrp->fi.allele_idx_offsets;
   const uint32_t allele_ct = allele_idx_offsets? (allele_idx_offsets[vidx + 1] - allele_idx_offsets[vidx]) : 2;
   const uint32_t vrtype = GetPgfiVrtype(&(pgrp->fi), vidx);
@@ -9349,6 +9487,16 @@ PglErr IMPLPgrGetDp(const uintptr_t* __restrict sample_include, const uint32_t* 
     pgvp->dphase_ct = 0;
     return kPglRetSuccess;
   }
+  if (pgrp->hardcall_backend) {
+    pgvp->phasepresent_ct = 0;
+    pgvp->dosage_ct = 0;
+    pgvp->dphase_ct = 0;
+    const PgrHardcallBackend* backend = pgrp->hardcall_backend;
+    return backend->get(
+        backend->context, sample_include,
+        sample_include_cumulative_popcounts, sample_ct, vidx,
+        pgvp->genovec);
+  }
   const unsigned char* fread_ptr = nullptr;
   const unsigned char* fread_end = nullptr;
   const uint32_t vrtype = GetPgfiVrtype(&(pgrp->fi), vidx);
@@ -9367,6 +9515,23 @@ PglErr IMPLPgrGetDp(const uintptr_t* __restrict sample_include, const uint32_t* 
 PglErr PgrGetInv1Dp(const uintptr_t* __restrict sample_include, PgrSampleSubsetIndex pssi, uint32_t sample_ct, uint32_t vidx, AlleleCode allele_idx, PgenReader* pgr_ptr, PgenVariant* pgvp) {
   PgenReaderMain* pgrp = GetPgrp(pgr_ptr);
   const uint32_t* sample_include_cumulative_popcounts = GetSicp(pssi);
+  if (pgrp->hardcall_backend) {
+    pgvp->phasepresent_ct = 0;
+    pgvp->dosage_ct = 0;
+    pgvp->dphase_ct = 0;
+    if (!sample_ct) {
+      return kPglRetSuccess;
+    }
+    const PgrHardcallBackend* backend = pgrp->hardcall_backend;
+    const PglErr reterr = backend->get_allele(
+        backend->context, sample_include,
+        sample_include_cumulative_popcounts, sample_ct, vidx, allele_idx,
+        pgvp->genovec);
+    if (!reterr) {
+      GenovecInvertUnsafe(sample_ct, pgvp->genovec);
+    }
+    return reterr;
+  }
   const uintptr_t* allele_idx_offsets = pgrp->fi.allele_idx_offsets;
   const uint32_t allele_ct = allele_idx_offsets? (allele_idx_offsets[vidx + 1] - allele_idx_offsets[vidx]) : 2;
   if ((allele_ct == 2) || (!allele_idx)) {
@@ -9409,6 +9574,15 @@ PglErr PgrGetMDp(const uintptr_t* __restrict sample_include, PgrSampleSubsetInde
   pgvp->multidphase_sample_ct = 0;
   if (!sample_ct) {
     return kPglRetSuccess;
+  }
+  if (pgrp->hardcall_backend) {
+    const PgrHardcallBackend* backend = pgrp->hardcall_backend;
+    if (!backend->get_m) {
+      return kPglRetNotYetSupported;
+    }
+    return backend->get_m(
+        backend->context, sample_include,
+        sample_include_cumulative_popcounts, sample_ct, vidx, pgvp);
   }
   const uintptr_t* allele_idx_offsets = pgrp->fi.allele_idx_offsets;
   const uint32_t allele_ct = allele_idx_offsets? (allele_idx_offsets[vidx + 1] - allele_idx_offsets[vidx]) : 2;

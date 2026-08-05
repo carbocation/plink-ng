@@ -293,6 +293,16 @@ struct PackedVariantReader::Impl {
               &entry.record, &is_sparse, error))) {
         return false;
       }
+      if (is_sparse && (entry.record.mode == RecordMode::kMarginal)) {
+        const uint8_t common_genotype = entry.record.predictions[0];
+        for (const uint8_t genotype : entry.record.exception_genotypes) {
+          if (genotype == common_genotype) {
+            SetError("Sparse marginal exception repeats its predictor.",
+                     error);
+            return false;
+          }
+        }
+      }
       entry.is_sparse_predictor = is_sparse;
       entry.parsed = true;
     }

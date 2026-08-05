@@ -263,6 +263,42 @@ limit, the reader returns the ordinary packed fallback. The alternate pgenlib
 hardcall backend advertises this as an optional capability, so older and dense-
 only backends retain their previous behavior.
 
+### Downstream pgenlib integration
+
+The reusable pgenlib bridge is exported by the `pgen_rans::pgenlib` CMake
+target. `UnifiedPgenReader` owns file-index and reader allocations, recognizes
+ordinary and conditional-rANS storage during `Open()`, and keeps an installed
+rANS backend alive for the lifetime of its `PgenReader`. Downstream consumers
+therefore do not need to inspect developer storage-mode sentinels or reproduce
+the `PgfiInitPhase1()` / `PgfiInitPhase2()` / `PgrInit()` split.
+
+```cmake
+find_package(pgen_rans CONFIG REQUIRED)
+target_link_libraries(my_consumer PRIVATE pgen_rans::pgenlib)
+```
+
+```cpp
+#include <pgen_rans_pgenlib.h>
+
+pgen_rans::UnifiedPgenReader reader;
+std::string error;
+if (!reader.Open(pgen_path, &error)) {
+  // Report error.
+}
+plink2::PgenReader* pgr = reader.pgen_reader();
+```
+
+`PgenStorageMode` reports which implementation was selected. Once open,
+supported hardcall pgenlib entry points such as `PgrGet()` and
+`PgrGetDMaybeSparse()` are used identically for both modes. A marginal sparse
+rANS record remains a difference list on this path; the unified opener does
+not introduce a dense scan before sparse scoring.
+
+For a multiallelic conditional-rANS file, pass the companion PVAR-derived
+`allele_idx_offsets` array in `UnifiedPgenOpenOptions`; the opener validates
+and owns a copy. The package supplies its pgenlib implementation, so consumers
+must replace, rather than additionally link, another pgenlib copy.
+
 An optional sorted sample index projects each decoded requested record into a
 smaller packed output. Since rANS states cannot jump over arbitrary samples,
 this projection reduces downstream work and buffer size but not the
