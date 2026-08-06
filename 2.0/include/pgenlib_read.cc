@@ -7799,17 +7799,24 @@ PglErr IMPLPgrGetDMaybeSparse(const uintptr_t* __restrict sample_include, const 
   const unsigned char* fread_ptr = nullptr;
   const unsigned char* fread_end = nullptr;
   uint32_t difflist_common_geno;
-  uint32_t subsetted_raregeno_ct;
+  uint32_t subsetted_raregeno_ct = 0;
   PglErr reterr = ReadDifflistOrGenovecSubsetUnsafe(sample_include, sample_include_cumulative_popcounts, sample_ct, max_sparse_dosage_ct, vidx, pgrp, &fread_ptr, &fread_end, genovec, &difflist_common_geno, subsetted_raregeno, subsetted_raregeno_sample_ids, &subsetted_raregeno_ct);
   if (unlikely(reterr)) {
     return reterr;
   }
+  // A dense genovec return has no corresponding sparse-list length.
+  if (difflist_common_geno == UINT32_MAX) {
+    if (!dosage_matters) {
+      return kPglRetSuccess;
+    }
+    return IMPLPgrGetD(sample_include, sample_include_cumulative_popcounts,
+                       sample_ct, vidx, pgrp, genovec, dosage_present,
+                       dosage_main, dosage_ct_ptr);
+  }
   if (!dosage_matters) {
     *dosage_ct_ptr = subsetted_raregeno_ct;
-    if (difflist_common_geno != UINT32_MAX) {
-      *difflist_common_dosage_ptr = kGenoToDosage16[difflist_common_geno];
-      GenoarrLookup256x2bx4(subsetted_raregeno, kHcToDosage16, subsetted_raregeno_ct, dosage_main);
-    }
+    *difflist_common_dosage_ptr = kGenoToDosage16[difflist_common_geno];
+    GenoarrLookup256x2bx4(subsetted_raregeno, kHcToDosage16, subsetted_raregeno_ct, dosage_main);
     return kPglRetSuccess;
   }
   const uintptr_t* allele_idx_offsets = pgrp->fi.allele_idx_offsets;
@@ -7833,9 +7840,7 @@ PglErr IMPLPgrGetDMaybeSparse(const uintptr_t* __restrict sample_include, const 
   // stored.
   const uint32_t peek_raw_dosage_ct = PeekVint31(fread_ptr, fread_end);
   if (peek_raw_dosage_ct + subsetted_raregeno_ct > max_sparse_dosage_ct) {
-    if (difflist_common_geno != UINT32_MAX) {
-      PgrDifflistToGenovecUnsafe(subsetted_raregeno, subsetted_raregeno_sample_ids, difflist_common_geno, sample_ct, subsetted_raregeno_ct, genovec);
-    }
+    PgrDifflistToGenovecUnsafe(subsetted_raregeno, subsetted_raregeno_sample_ids, difflist_common_geno, sample_ct, subsetted_raregeno_ct, genovec);
     return ParseDosage16(fread_ptr, fread_end, sample_include, sample_ct, vidx, allele_ct, pgrp, dosage_ct_ptr, nullptr, nullptr, nullptr, dosage_present, dosage_main);
   }
   *difflist_common_dosage_ptr = kGenoToDosage16[difflist_common_geno];

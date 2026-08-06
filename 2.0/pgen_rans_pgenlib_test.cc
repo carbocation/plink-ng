@@ -11,6 +11,7 @@
 #include <vector>
 
 #include "include/plink2_bits.h"
+#include "include/pgenlib_write.h"
 #include "pgen_rans_container.h"
 #include "pgen_rans_hybrid.h"
 
@@ -130,6 +131,35 @@ void WriteRansPgen(
          "could not close rANS fixture: " + error);
 }
 
+void WriteDosagePgen(const std::string& path,
+                     const std::vector<uint64_t>& hardcalls) {
+  STPgenWriter writer;
+  PreinitSpgw(&writer);
+  uintptr_t alloc_cacheline_ct = 0;
+  uint32_t max_vrec_len = 0;
+  Expect(SpgwInitPhase1(
+             path.c_str(), nullptr, nullptr, 1, kSampleCt, 0,
+             kPgenWriteBackwardSeek, kfPgenGlobalDosagePresent, 2,
+             &writer, &alloc_cacheline_ct, &max_vrec_len) ==
+             kPglRetSuccess,
+         "standard dosage writer initialization failed");
+  unsigned char* writer_alloc = nullptr;
+  Expect(!cachealigned_malloc(alloc_cacheline_ct * kCacheline,
+                              &writer_alloc),
+         "standard dosage writer allocation failed");
+  SpgwInitPhase2(max_vrec_len, &writer, writer_alloc);
+  alignas(kCacheline) uintptr_t dosage_present[8] = {};
+  SetBit(5, dosage_present);
+  const uint16_t dosage_main[1] = {8192};
+  Expect(SpgwAppendBiallelicGenovecDosage16(
+             hardcalls.data(), dosage_present, dosage_main, 1, &writer) ==
+             kPglRetSuccess,
+         "standard dosage record write failed");
+  Expect(SpgwFinish(&writer) == kPglRetSuccess,
+         "standard dosage writer finish failed");
+  aligned_free(writer_alloc);
+}
+
 void ExpectVariant(
     UnifiedPgenReader* reader, uint32_t variant_idx,
     const std::vector<uint64_t>& expected) {
@@ -180,6 +210,55 @@ void ExpectSparseRans(UnifiedPgenReader* reader) {
         (sample_idx == 3) ? 1 : ((sample_idx == 17) ? 3 : 0);
     Expect(GetNyparrEntry(genovec, sample_idx) == expected,
            "unified rANS threshold fallback genotype mismatch");
+  }
+}
+
+void ExpectDenseStandard(UnifiedPgenReader* reader,
+                         const std::vector<uint64_t>& expected) {
+  PgrSampleSubsetIndex pssi;
+  PgrClearSampleSubsetIndex(reader->pgen_reader(), &pssi);
+  alignas(kCacheline) uintptr_t genovec[8] = {};
+  alignas(kCacheline) uintptr_t dosage_present[8] = {};
+  alignas(kCacheline) uint16_t dosage_main[kSampleCt] = {};
+  alignas(kCacheline) uint32_t sample_ids[kSampleCt] = {};
+  uint32_t dosage_ct = UINT32_MAX;
+  uint16_t common_dosage = 0;
+  Expect(PgrGetDMaybeSparse(
+             nullptr, pssi, kSampleCt, 1, 4, reader->pgen_reader(),
+             genovec, dosage_present, dosage_main, &dosage_ct,
+             &common_dosage, sample_ids) == kPglRetSuccess,
+         "standard dense PgrGetDMaybeSparse failed");
+  Expect((common_dosage == 1) && (!dosage_ct),
+         "standard dense PgrGetDMaybeSparse returned a sparse count");
+  for (uint32_t sample_idx = 0; sample_idx != kSampleCt; ++sample_idx) {
+    Expect(GetNyparrEntry(genovec, sample_idx) ==
+               GetPackedGenotype(expected.data(), sample_idx),
+           "standard dense PgrGetDMaybeSparse genotype mismatch");
+  }
+}
+
+void ExpectDenseStandardWithDosage(UnifiedPgenReader* reader,
+                                   const std::vector<uint64_t>& expected) {
+  PgrSampleSubsetIndex pssi;
+  PgrClearSampleSubsetIndex(reader->pgen_reader(), &pssi);
+  alignas(kCacheline) uintptr_t genovec[8] = {};
+  alignas(kCacheline) uintptr_t dosage_present[8] = {};
+  alignas(kCacheline) uint16_t dosage_main[kSampleCt] = {};
+  alignas(kCacheline) uint32_t sample_ids[kSampleCt] = {};
+  uint32_t dosage_ct = UINT32_MAX;
+  uint16_t common_dosage = 0;
+  Expect(PgrGetDMaybeSparse(
+             nullptr, pssi, kSampleCt, 0, 4, reader->pgen_reader(),
+             genovec, dosage_present, dosage_main, &dosage_ct,
+             &common_dosage, sample_ids) == kPglRetSuccess,
+         "standard dense dosage PgrGetDMaybeSparse failed");
+  Expect((common_dosage == 1) && (dosage_ct == 1) &&
+             IsSet(dosage_present, 5) && (dosage_main[0] == 8192),
+         "standard dense dosage PgrGetDMaybeSparse result mismatch");
+  for (uint32_t sample_idx = 0; sample_idx != kSampleCt; ++sample_idx) {
+    Expect(GetNyparrEntry(genovec, sample_idx) ==
+               GetPackedGenotype(expected.data(), sample_idx),
+           "standard dense dosage PgrGetDMaybeSparse genotype mismatch");
   }
 }
 
@@ -252,8 +331,11 @@ int main() {
   const std::vector<std::vector<uint64_t>> variants = {
       MakeVariant(0), MakeVariant(1)};
   const std::string standard_path = TemporaryPath("standard_pgen");
+  const std::string dosage_path = TemporaryPath("dosage_pgen");
   const std::string rans_path = TemporaryPath("unified_pgen");
   WriteStandardPgen(standard_path, variants);
+  unlink(dosage_path.c_str());
+  WriteDosagePgen(dosage_path, variants[1]);
   unlink(rans_path.c_str());
   WriteRansPgen(rans_path, variants);
   ExpectBackendContract(rans_path);
@@ -268,6 +350,11 @@ int main() {
              (reader.variant_ct() == kVariantCt),
          "unified standard metadata mismatch");
   ExpectVariant(&reader, 1, variants[1]);
+  ExpectDenseStandard(&reader, variants[1]);
+
+  Expect(reader.Open(dosage_path, {}, &error),
+         "unified standard dosage open failed: " + error);
+  ExpectDenseStandardWithDosage(&reader, variants[1]);
 
   Expect(reader.Open(rans_path, UnifiedPgenOpenOptions{2}, &error),
          "unified rANS open failed: " + error);
@@ -294,6 +381,8 @@ int main() {
 
   Expect(unlink(standard_path.c_str()) == 0,
          "standard fixture cleanup failed");
+  Expect(unlink(dosage_path.c_str()) == 0,
+         "standard dosage fixture cleanup failed");
   Expect(unlink(rans_path.c_str()) == 0,
          "rANS fixture cleanup failed");
   puts("pgen_rans_pgenlib_test: PASS");

@@ -95,7 +95,11 @@ if(PGEN_RANS_BUILD_TESTING)
     NAME pgenlib_sparse_backend_test COMMAND pgenlib_sparse_backend_test
   )
 
-  add_executable(pgen_rans_pgenlib_test pgen_rans_pgenlib_test.cc)
+  add_executable(
+    pgen_rans_pgenlib_test
+    pgen_rans_pgenlib_test.cc
+    include/pgenlib_write.cc
+  )
   target_link_libraries(pgen_rans_pgenlib_test PRIVATE pgen_rans_pgenlib)
   add_test(NAME pgen_rans_pgenlib_test COMMAND pgen_rans_pgenlib_test)
 endif()
