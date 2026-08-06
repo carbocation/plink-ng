@@ -36,6 +36,9 @@ using pgen_rans::UnifiedPgenReader;
 constexpr uint32_t kSampleCt = 33;
 constexpr uint32_t kVariantCt = 2;
 
+static_assert(sizeof(uintptr_t) == sizeof(uint64_t),
+              "The experimental codec currently requires 64-bit words.");
+
 [[noreturn]] void Fail(const std::string& message) {
   fprintf(stderr, "FAIL: %s\n", message.c_str());
   exit(1);
@@ -148,11 +151,16 @@ void WriteDosagePgen(const std::string& path,
                               &writer_alloc),
          "standard dosage writer allocation failed");
   SpgwInitPhase2(max_vrec_len, &writer, writer_alloc);
+  alignas(kCacheline) uintptr_t genovec[8] = {};
+  Expect(hardcalls.size() <= (sizeof(genovec) / sizeof(*genovec)),
+         "standard dosage hardcall buffer is too large");
+  memcpy(genovec, hardcalls.data(),
+         hardcalls.size() * sizeof(hardcalls[0]));
   alignas(kCacheline) uintptr_t dosage_present[8] = {};
   SetBit(5, dosage_present);
   const uint16_t dosage_main[1] = {8192};
   Expect(SpgwAppendBiallelicGenovecDosage16(
-             hardcalls.data(), dosage_present, dosage_main, 1, &writer) ==
+             genovec, dosage_present, dosage_main, 1, &writer) ==
              kPglRetSuccess,
          "standard dosage record write failed");
   Expect(SpgwFinish(&writer) == kPglRetSuccess,
