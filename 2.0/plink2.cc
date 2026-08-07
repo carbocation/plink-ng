@@ -594,6 +594,7 @@ uint32_t SingleVariantLoaderIsNeeded(const char* king_cutoff_fprefix, Command1Fl
     (hwe_ln_thresh != -DBL_MAX);
 }
 
+
 uint32_t DecentAlleleFreqsAreNeeded(Command1Flags command_flags1, CheckSexFlags check_sex_flags, HetFlags het_flags, ScoreFlags score_flags) {
   // Keep this in sync with --error-on-freq-calc.
   return (command_flags1 & (kfCommand1Pca | kfCommand1MakeRel)) ||
@@ -1191,39 +1192,29 @@ PglErr Plink2Core(const Plink2Cmdline* pcp, MakePlink2Flags make_plink2_flags, c
       PgenHeaderCtrl header_ctrl;
       uintptr_t cur_alloc_cacheline_ct;
       while (1) {
-        reterr = PgfiInitPhase1(
-            pgenname, pcp->pginame, raw_variant_ct, raw_sample_ct,
-            &header_ctrl, &pgfi, &cur_alloc_cacheline_ct, g_logbuf);
+        reterr = PgfiInitPhase1(pgenname, pcp->pginame, raw_variant_ct, raw_sample_ct, &header_ctrl, &pgfi, &cur_alloc_cacheline_ct, g_logbuf);
         if (!reterr) {
           break;
         }
-        // Detect and autoconvert PLINK 1 sample-major files.
+        // detect and autoconvert plink 1 sample-major files, instead of
+        // failing (don't bother supporting plink 0.99 files any more)
         if (unlikely(reterr != kPglRetSampleMajorBed)) {
           WordWrapB(0);
           logerrputsb();
           goto Plink2Core_ret_1;
         }
-        char* pgenname_end =
-            memcpya(pgenname, outname, outname_end - outname);
+        char* pgenname_end = memcpya(pgenname, outname, outname_end - outname);
         pgenname_end = strcpya_k(pgenname_end, ".pgen");
-        const uint32_t no_vmaj_ext =
-            (pcp->command_flags1 & kfCommand1MakePlink2) &&
-            (!pcp->filter_flags) &&
-            ((make_plink2_flags &
-              (kfMakePgen | kfMakePlink2MJoin |
-               (kfMakePgenFormatBase * 3) | kfMakePgenWriterVer |
-               kfMakePgenRans)) == kfMakePgen);
+        const uint32_t no_vmaj_ext = (pcp->command_flags1 & kfCommand1MakePlink2) && (!pcp->filter_flags) && ((make_plink2_flags & (kfMakePgen | kfMakePlink2MJoin | (kfMakePgenFormatBase * 3) | kfMakePgenWriterVer | kfMakePgenRans)) == kfMakePgen);
         if (no_vmaj_ext) {
           *pgenname_end = '\0';
           make_plink2_flags &= ~kfMakePgen;
+          // no --make-just-pgen command, so we'll never entirely skip the
+          // MakePlink2 operation
         } else {
-          snprintf(
-              pgenname_end, kMaxOutfnameExtBlen - 5, ".vmaj");
+          snprintf(pgenname_end, kMaxOutfnameExtBlen - 5, ".vmaj");
         }
-        reterr = Plink1SampleMajorToPgen(
-            pgenname, nullptr, raw_variant_ct, raw_sample_ct,
-            (pcp->misc_flags / kfMiscRealRefAlleles) & 1,
-            pcp->max_thread_ct, pgfi.shared_ff);
+        reterr = Plink1SampleMajorToPgen(pgenname, nullptr, raw_variant_ct, raw_sample_ct, (pcp->misc_flags / kfMiscRealRefAlleles) & 1, pcp->max_thread_ct, pgfi.shared_ff);
         if (unlikely(reterr)) {
           goto Plink2Core_ret_1;
         }
@@ -8410,38 +8401,25 @@ int main(int argc, char** argv) {
                 goto main_ret_INVALID_CMDLINE_A;
               }
             } else if (StrStartsWith(cur_modif, "format=", cur_modif_slen)) {
-              if (unlikely(
-                      make_plink2_flags &
-                      ((kfMakePgenFormatBase * 3) | kfMakePgenRans))) {
+              if (unlikely(make_plink2_flags & ((kfMakePgenFormatBase * 3) | kfMakePgenRans))) {
                 logerrputs("Error: Multiple --make-pgen format= modifiers.\n");
                 goto main_ret_INVALID_CMDLINE;
               }
-              const char* format_code = &(cur_modif[7]);
-              if (strequal_k(format_code, "rans",
-                             cur_modif_slen - 7)) {
+              if (strequal_k(&(cur_modif[7]), "rans", cur_modif_slen - 7)) {
                 make_plink2_flags |= kfMakePgenRans;
-              } else {
-                const uint32_t fcode_minus_2 = ctou32(format_code[0]) - 50;
-                if (unlikely(
-                        (fcode_minus_2 > 2) || format_code[1])) {
-                  snprintf(
-                      g_logbuf, kLogbufSize,
-                      "Error: Invalid --make-pgen format code '%s'.\n",
-                      format_code);
-                  goto main_ret_INVALID_CMDLINE_WWA;
-                }
-                if (fcode_minus_2) {
-                  logerrputs(
-                      "Error: --make-pgen formats 3 and 4 "
-                      "(unphased/phased dosage) are not implemented\nyet.\n");
-                  reterr = kPglRetNotYetSupported;
-                  goto main_ret_1;
-                }
-                make_plink2_flags = S_CAST(
-                    MakePlink2Flags,
-                    make_plink2_flags |
-                        (kfMakePgenFormatBase * (1 + fcode_minus_2)));
+                continue;
               }
+              const uint32_t fcode_minus_2 = ctou32(cur_modif[7]) - 50;
+              if (unlikely((fcode_minus_2 > 2) || cur_modif[8])) {
+                snprintf(g_logbuf, kLogbufSize, "Error: Invalid --make-pgen format code '%s'.\n", &(cur_modif[7]));
+                goto main_ret_INVALID_CMDLINE_WWA;
+              }
+              if (fcode_minus_2) {
+                logerrputs("Error: --make-pgen formats 3 and 4 (unphased/phased dosage) are not implemented\nyet.\n");
+                reterr = kPglRetNotYetSupported;
+                goto main_ret_1;
+              }
+              make_plink2_flags = S_CAST(MakePlink2Flags, make_plink2_flags | (kfMakePgenFormatBase * (1 + fcode_minus_2)));
             } else if (StrStartsWith(cur_modif, "m=", cur_modif_slen) ||
                        StrStartsWith(cur_modif, "multiallelics=", cur_modif_slen)) {
               if (unlikely(make_plink2_flags & kfMakePlink2MMask)) {

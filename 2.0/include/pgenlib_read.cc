@@ -2155,6 +2155,14 @@ PglErr PgrInit(const char* fname, uint32_t max_vrec_width, PgenFileInfo* pgfip, 
     }
   }
   pgrp->fi = *pgfip;  // struct copy
+  if (pgrp->fi.multiread_backend) {
+    // Alternate-container multiread records contain only the ALT-collapsed
+    // two-bit base stream.  The owning reader patches allele-specific values
+    // after the parallel pass.
+    pgrp->fi.allele_idx_offsets = nullptr;
+    pgrp->fi.max_allele_ct = 2;
+    pgrp->fi.gflags &= ~kfPgenGlobalMultiallelicHardcallFound;
+  }
   if (fname) {
     // Mode 2 per-reader load buffer
     pgrp->fread_buf = pgr_alloc_iter;

@@ -167,6 +167,7 @@ typedef struct PgenFileInfoStruct {
 
   // Null for ordinary PGEN input.  When non-null, PgfiMultiread()
   // materializes raw two-bit records through this backend instead of fread().
+  // PgrInit() derives the corresponding ALT-collapsed reader metadata.
   // Kept at the end to minimize disruption to the upstream structure layout.
   const PgrHardcallBackend* multiread_backend;
 } PgenFileInfo;

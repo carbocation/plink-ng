@@ -77,6 +77,43 @@ PgenReader MakeReader(PgrHardcallBackend* backend) {
   return result;
 }
 
+void TestMultireadReaderMetadata(PgrHardcallBackend* backend) {
+  PgenFileInfo pgfi{};
+  PreinitPgfi(&pgfi);
+  uintptr_t allele_idx_offsets[2] = {0, 3};
+  alignas(kCacheline) unsigned char block_base[kCacheline] = {};
+  pgfi.allele_idx_offsets = allele_idx_offsets;
+  pgfi.block_base = block_base;
+  pgfi.const_vrtype = 0;
+  pgfi.gflags = kfPgenGlobalMultiallelicHardcallFound;
+  pgfi.max_allele_ct = 3;
+  pgfi.multiread_backend = backend;
+  pgfi.raw_sample_ct = 16;
+  pgfi.raw_variant_ct = 1;
+
+  unsigned char* pgr_alloc = nullptr;
+  const uintptr_t alloc_cacheline_ct = CountPgrAllocCachelinesRequired(
+      pgfi.raw_sample_ct, pgfi.gflags, pgfi.max_allele_ct, 0);
+  Expect(!cachealigned_malloc(alloc_cacheline_ct * kCacheline, &pgr_alloc),
+         "could not allocate the multiread PgenReader");
+  PgenReader reader{};
+  PreinitPgr(&reader);
+  Expect(PgrInit(nullptr, 0, &pgfi, &reader, pgr_alloc) ==
+             kPglRetSuccess,
+         "multiread PgrInit failed");
+  const PgenReaderMain& pgr = GET_PRIVATE(reader, m);
+  Expect((pgr.fi.allele_idx_offsets == nullptr) &&
+             (pgr.fi.max_allele_ct == 2) &&
+             (!(pgr.fi.gflags &
+                kfPgenGlobalMultiallelicHardcallFound)),
+         "multiread PgrInit did not derive ALT-collapsed metadata");
+  Expect((pgfi.allele_idx_offsets == allele_idx_offsets) &&
+             (pgfi.max_allele_ct == 3) &&
+             (pgfi.gflags & kfPgenGlobalMultiallelicHardcallFound),
+         "multiread PgrInit modified the owning file metadata");
+  aligned_free(pgr_alloc);
+}
+
 }  // namespace
 
 int main() {
@@ -86,6 +123,7 @@ int main() {
   backend.context = &context;
   backend.get = &GetDense;
   backend.get_difflist_or_genovec = &GetSparse;
+  TestMultireadReaderMetadata(&backend);
   PgenReader reader = MakeReader(&backend);
   PgrSampleSubsetIndex pssi;
   PgrClearSampleSubsetIndex(&reader, &pssi);
