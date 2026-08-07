@@ -116,6 +116,22 @@ jobs:
           test -s "$smoke_prefix.pgen"
           test -s "$smoke_prefix.pvar"
           test -s "$smoke_prefix.psam"
+          printf '%s\n%s\n' "$smoke_prefix" "$smoke_prefix" \
+            >"$smoke_prefix-pmerge-list.txt"
+          if 2.0/build_dynamic/plink2 \
+            --pmerge-list "$smoke_prefix-pmerge-list.txt" pfile \
+            --out "$smoke_prefix-pmerge-missing-format"; then
+            echo "rANS pmerge unexpectedly omitted format=rans." >&2
+            exit 1
+          fi
+          grep -q \
+            "Conditional-rANS merge inputs require '--make-pgen format=rans'" \
+            "$smoke_prefix-pmerge-missing-format.log"
+          if grep -q 'requires its alternate hardcall backend' \
+            "$smoke_prefix-pmerge-missing-format.log"; then
+            echo "Low-level rANS backend error leaked from pmerge." >&2
+            exit 1
+          fi
           2.0/build_dynamic/plink2 \
             --pfile "$smoke_prefix-input" \
             --export A \
@@ -363,6 +379,22 @@ jobs:
           test -s "$smoke_prefix.pgen"
           test -s "$smoke_prefix.pvar"
           test -s "$smoke_prefix.psam"
+          printf '%s\n%s\n' "$smoke_prefix" "$smoke_prefix" \
+            >"$smoke_prefix-pmerge-list.txt"
+          if 2.0/build_dynamic/plink2 \
+            --pmerge-list "$smoke_prefix-pmerge-list.txt" pfile \
+            --out "$smoke_prefix-pmerge-missing-format"; then
+            echo "rANS pmerge unexpectedly omitted format=rans." >&2
+            exit 1
+          fi
+          grep -q \
+            "Conditional-rANS merge inputs require '--make-pgen format=rans'" \
+            "$smoke_prefix-pmerge-missing-format.log"
+          if grep -q 'requires its alternate hardcall backend' \
+            "$smoke_prefix-pmerge-missing-format.log"; then
+            echo "Low-level rANS backend error leaked from pmerge." >&2
+            exit 1
+          fi
           2.0/build_dynamic/plink2 \
             --pfile "$smoke_prefix-input" \
             --export A \

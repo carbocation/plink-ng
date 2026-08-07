@@ -7344,14 +7344,22 @@ PglErr Pmerge(const PmergeInfo* pmip, const char* sample_sort_fname, const char*
       }
     }
 
-    if (prefer_rans_concat) {
-      uint32_t any_rans;
-      reterr = ProbeAllRansContainers(input_filesets, &rans_concat,
-                                      &any_rans);
-      if (unlikely(reterr)) {
+    uint32_t any_rans;
+    reterr = ProbeAllRansContainers(input_filesets, &rans_concat,
+                                    &any_rans);
+    if (unlikely(reterr)) {
+      goto Pmerge_ret_1;
+    }
+    if (any_rans) {
+      if (unlikely(!prefer_rans_concat)) {
+        logerrputs(
+            "Error: Conditional-rANS merge inputs require '--make-pgen "
+            "format=rans'.  Add that\noption and run any other commands "
+            "separately.\n");
+        reterr = kPglRetInvalidCmdline;
         goto Pmerge_ret_1;
       }
-      if (unlikely(any_rans && (!rans_concat))) {
+      if (unlikely(!rans_concat)) {
         logerrputs(
             "Error: Direct conditional-rANS concatenation requires every "
             "input .pgen to\nuse conditional-rANS storage; mixed ordinary "
