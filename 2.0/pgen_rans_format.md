@@ -347,9 +347,10 @@ plink2 --pfile cohort-chr22 \
 ```
 
 The initial production surface includes `--score[-list]`, `--freq`,
-`--export A/Av`, `--indep-pairwise`, `--r-unphased`, `--clump`, `--pca`,
-`--make-pgen`, `--write-snplist`, and `--write-samples`. Sample, position, ID,
-and genotype-frequency filters can be applied with these commands. Standard
+`--hardy`, `--missing`, `--geno-counts`, `--export A/Av`, `--indep-pairwise`,
+`--r-unphased`, `--clump`, `--pca`, `--make-pgen`, `--write-snplist`, and
+`--write-samples`. Sample, position, ID, and genotype-frequency filters can be
+applied with these commands. Standard
 `--make-pgen` without `format=rans` reconstructs an exact hardcall PGEN in the
 upstream general-purpose storage mode; phase and dosage cannot be reconstructed
 because the conditional-rANS mode does not store them. Conditional-rANS files

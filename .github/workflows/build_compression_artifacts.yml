@@ -126,6 +126,24 @@ jobs:
             --out "$smoke_prefix-rans-export"
           cmp "$smoke_prefix-pgen-export.raw" "$smoke_prefix-rans-export.raw"
           2.0/build_dynamic/plink2 \
+            --pfile "$smoke_prefix-input" \
+            --hardy --missing --geno-counts \
+            --threads 2 \
+            --out "$smoke_prefix-pgen-reports"
+          2.0/build_dynamic/plink2 \
+            --pfile "$smoke_prefix" \
+            --hardy --missing --geno-counts \
+            --threads 2 \
+            --out "$smoke_prefix-rans-reports"
+          cmp "$smoke_prefix-pgen-reports.hardy" \
+            "$smoke_prefix-rans-reports.hardy"
+          cmp "$smoke_prefix-pgen-reports.smiss" \
+            "$smoke_prefix-rans-reports.smiss"
+          cmp "$smoke_prefix-pgen-reports.vmiss" \
+            "$smoke_prefix-rans-reports.vmiss"
+          cmp "$smoke_prefix-pgen-reports.gcount" \
+            "$smoke_prefix-rans-reports.gcount"
+          2.0/build_dynamic/plink2 \
             --pfile "$smoke_prefix" \
             --make-pgen format=rans \
             --threads 2 \
@@ -354,6 +372,24 @@ jobs:
             --export A \
             --out "$smoke_prefix-rans-export"
           cmp "$smoke_prefix-pgen-export.raw" "$smoke_prefix-rans-export.raw"
+          2.0/build_dynamic/plink2 \
+            --pfile "$smoke_prefix-input" \
+            --hardy --missing --geno-counts \
+            --threads 2 \
+            --out "$smoke_prefix-pgen-reports"
+          2.0/build_dynamic/plink2 \
+            --pfile "$smoke_prefix" \
+            --hardy --missing --geno-counts \
+            --threads 2 \
+            --out "$smoke_prefix-rans-reports"
+          cmp "$smoke_prefix-pgen-reports.hardy" \
+            "$smoke_prefix-rans-reports.hardy"
+          cmp "$smoke_prefix-pgen-reports.smiss" \
+            "$smoke_prefix-rans-reports.smiss"
+          cmp "$smoke_prefix-pgen-reports.vmiss" \
+            "$smoke_prefix-rans-reports.vmiss"
+          cmp "$smoke_prefix-pgen-reports.gcount" \
+            "$smoke_prefix-rans-reports.gcount"
           2.0/build_dynamic/plink2 \
             --pfile "$smoke_prefix" \
             --make-pgen format=rans \

@@ -1226,6 +1226,8 @@ PglErr Plink2Core(const Plink2Cmdline* pcp, MakePlink2Flags make_plink2_flags, c
             S_CAST(
                 Command1Flags,
                 kfCommand1Exportf | kfCommand1AlleleFreq |
+                    kfCommand1MissingReport | kfCommand1GenoCounts |
+                    kfCommand1Hardy |
                     kfCommand1LdPrune | kfCommand1Score |
                     kfCommand1WriteSnplist | kfCommand1WriteSamples |
                     kfCommand1Clump | kfCommand1Vcor | kfCommand1Pca |
