@@ -1316,4 +1316,58 @@ bool ConcatenateContainers(const std::vector<std::string>& input_paths,
   return true;
 }
 
+bool ConcatenateContainersRaw(const char* const* input_paths,
+                              uint32_t input_path_ct,
+                              const char* output_path,
+                              ContainerConcatStats* stats,
+                              char* error_buf,
+                              size_t error_buf_size) {
+  std::vector<std::string> input_path_vec;
+  input_path_vec.reserve(input_path_ct);
+  for (uint32_t input_idx = 0; input_idx != input_path_ct; ++input_idx) {
+    input_path_vec.emplace_back(input_paths[input_idx]);
+  }
+  std::string error;
+  const bool success = ConcatenateContainers(
+      input_path_vec, output_path, stats, &error);
+  if (error_buf_size) {
+    snprintf(error_buf, error_buf_size, "%s", error.c_str());
+  }
+  return success;
+}
+
+bool ReadContainerSummaryRaw(const char* input_path,
+                             ContainerSummary* summary,
+                             unsigned char* nonref_flags,
+                             size_t nonref_flags_capacity,
+                             char* error_buf,
+                             size_t error_buf_size) {
+  std::string error;
+  ContainerReader reader;
+  bool success = reader.Open(input_path, &error);
+  if (success) {
+    const ContainerParams& params = reader.params();
+    const ContainerMetadata& metadata = reader.metadata();
+    if (metadata.nonref_flags.size() > nonref_flags_capacity) {
+      error = "Conditional-rANS non-REF bitmap exceeds caller capacity.";
+      success = false;
+    } else {
+      summary->sample_ct = params.sample_ct;
+      summary->variant_ct = params.variant_ct;
+      summary->max_allele_ct = params.max_allele_ct;
+      summary->all_nonref = metadata.all_nonref;
+      summary->nonref_flag_byte_ct =
+          static_cast<uint32_t>(metadata.nonref_flags.size());
+      if (!metadata.nonref_flags.empty()) {
+        memcpy(nonref_flags, metadata.nonref_flags.data(),
+               metadata.nonref_flags.size());
+      }
+    }
+  }
+  if (error_buf_size) {
+    snprintf(error_buf, error_buf_size, "%s", error.c_str());
+  }
+  return success;
+}
+
 }  // namespace pgen_rans

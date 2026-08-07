@@ -890,6 +890,7 @@ int main() {
   const std::string shard1_path = TemporaryPath();
   const std::string shard2_path = TemporaryPath();
   const std::string concat_path = TemporaryPath();
+  const std::string raw_concat_path = TemporaryPath();
   ContainerMetadata shard1_metadata;
   shard1_metadata.all_nonref = true;
   const ContainerMetadata shard2_metadata;
@@ -932,6 +933,33 @@ int main() {
              (concat_stats.output_byte_ct >
               concat_stats.copied_block_byte_ct),
          "container concatenation statistics mismatch");
+  const char* raw_input_paths[2];
+  raw_input_paths[0] = shard1_path.c_str();
+  raw_input_paths[1] = shard2_path.c_str();
+  char raw_error[256];
+  ContainerConcatStats raw_concat_stats;
+  Expect(pgen_rans::ConcatenateContainersRaw(
+             raw_input_paths, 2, raw_concat_path.c_str(),
+             &raw_concat_stats, raw_error, sizeof(raw_error)),
+         std::string("raw container concatenation failed: ") + raw_error);
+  Expect((raw_concat_stats.output_byte_ct == concat_stats.output_byte_ct) &&
+             (LoadMemoryReader(raw_concat_path).bytes ==
+              LoadMemoryReader(concat_path).bytes),
+         "raw container concatenation changed output bytes");
+  pgen_rans::ContainerSummary raw_summary;
+  std::vector<uint8_t> raw_nonref_flags((kVariantCt + 7) / 8, 0);
+  Expect(pgen_rans::ReadContainerSummaryRaw(
+             raw_concat_path.c_str(), &raw_summary,
+             raw_nonref_flags.data(), raw_nonref_flags.size(),
+             raw_error, sizeof(raw_error)),
+         std::string("raw container summary failed: ") + raw_error);
+  Expect((raw_summary.sample_ct == kSampleCt) &&
+             (raw_summary.variant_ct == kVariantCt) &&
+             (raw_summary.max_allele_ct == 5) &&
+             (!raw_summary.all_nonref) &&
+             (raw_summary.nonref_flag_byte_ct ==
+              raw_nonref_flags.size()),
+         "raw container summary mismatch");
   ContainerReader concat_reader;
   Expect(concat_reader.Open(concat_path, &error),
          "concatenated reader open failed: " + error);
@@ -949,6 +977,8 @@ int main() {
           expected_concat_nonref_flags) &&
              (!concat_reader.metadata().all_nonref),
          "concatenated nonreference bitmap mismatch");
+  Expect(raw_nonref_flags == expected_concat_nonref_flags,
+         "raw container summary nonreference bitmap mismatch");
   uint32_t concatenated_variant_idx = 0;
   for (uint32_t block_idx = 0;
        block_idx != concat_reader.params().block_ct; ++block_idx) {
@@ -1041,6 +1071,8 @@ int main() {
          "second shard cleanup failed");
   Expect(unlink(concat_path.c_str()) == 0,
          "concatenated file cleanup failed");
+  Expect(unlink(raw_concat_path.c_str()) == 0,
+         "raw-concatenated file cleanup failed");
   Expect(unlink(incompatible_path.c_str()) == 0,
          "incompatible shard cleanup failed");
   Expect(unlink(path.c_str()) == 0, "temporary file cleanup failed");

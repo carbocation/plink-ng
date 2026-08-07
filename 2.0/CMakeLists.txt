@@ -85,6 +85,10 @@ if(PGEN_RANS_BUILD_TESTING)
   target_link_libraries(pgen_rans_container_test PRIVATE pgen_rans_decode)
   add_test(NAME pgen_rans_container_test COMMAND pgen_rans_container_test)
 
+  add_executable(pgen_rans_size_test pgen_rans_size_test.cc)
+  target_link_libraries(pgen_rans_size_test PRIVATE pgen_rans_decode)
+  add_test(NAME pgen_rans_size_test COMMAND pgen_rans_size_test)
+
   add_executable(
     pgenlib_sparse_backend_test pgenlib_sparse_backend_test.cc
   )
@@ -116,6 +120,7 @@ if(PGEN_RANS_INSTALL)
   )
   install(FILES
       pgen_rans_codec.h
+      pgen_rans_concat.h
       pgen_rans_container.h
       pgen_rans_cpu.h
       pgen_rans_hybrid.h

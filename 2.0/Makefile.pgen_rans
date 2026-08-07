@@ -22,6 +22,9 @@ PGENRANSCONTAINERTESTOBJ = $(PGENRANSCODECOBJ) \
 	$(PGENRANSCONTAINEROBJ) \
 	$(addprefix $(PGENRANS_OBJ_DIR)/,\
 	pgen_rans_reader.o pgen_rans_container_test.o)
+PGENRANSSIZETESTOBJ = $(PGENRANSCODECOBJ) \
+	$(PGENRANS_OBJ_DIR)/pgen_rans_container.o \
+	$(PGENRANS_OBJ_DIR)/pgen_rans_size_test.o
 PGENLIBSPARSEBACKENDTESTOBJ = $(addprefix $(PGENRANS_OBJ_DIR)/,\
 	$(PGENLIB_CCSRC:.cc=.o) pgenlib_sparse_backend_test.o)
 PGENRANSPGENLIBTESTOBJ = $(PGENRANSCODECOBJ) \
@@ -47,7 +50,7 @@ $(PGENRANS_OBJ_DIR)/%.o: %.cc
 
 .PHONY: libpgen_rans pgen_rans pgen_rans_codec_test pgen_rans_hybrid_test \
 	pgen_rans_container_test pgenlib_sparse_backend_test \
-	pgen_rans_pgenlib_test test
+	pgen_rans_pgenlib_test pgen_rans_size_test test
 
 libpgen_rans: $(PGENRANSLIBOBJ)
 	$(MKDIR) -p $(PGENRANS_LIB_DIR)
@@ -83,17 +86,24 @@ pgen_rans_pgenlib_test: $(PGENRANSPGENLIBTESTOBJ)
 	$(CXX) $(PGENRANSPGENLIBTESTOBJ) \
 		-o $(PGENRANS_BIN_DIR)/pgen_rans_pgenlib_test $(LDFLAGS)
 
+pgen_rans_size_test: $(PGENRANSSIZETESTOBJ)
+	$(MKDIR) -p $(PGENRANS_BIN_DIR)
+	$(CXX) $(PGENRANSSIZETESTOBJ) \
+		-o $(PGENRANS_BIN_DIR)/pgen_rans_size_test $(LDFLAGS)
+
 test: pgen_rans_codec_test pgen_rans_hybrid_test pgen_rans_container_test \
-	pgenlib_sparse_backend_test pgen_rans_pgenlib_test
+	pgenlib_sparse_backend_test pgen_rans_pgenlib_test pgen_rans_size_test
 	$(PGENRANS_BIN_DIR)/pgen_rans_codec_test
 	$(PGENRANS_BIN_DIR)/pgen_rans_hybrid_test
 	$(PGENRANS_BIN_DIR)/pgen_rans_container_test
 	$(PGENRANS_BIN_DIR)/pgenlib_sparse_backend_test
 	$(PGENRANS_BIN_DIR)/pgen_rans_pgenlib_test
+	$(PGENRANS_BIN_DIR)/pgen_rans_size_test
 
 CLEAN += $(PGENRANSLIBOBJ) $(PGENRANSTOOLOBJ) $(PGENRANSTESTOBJ) \
 	$(PGENRANSHYBRIDTESTOBJ) \
 	$(PGENRANSCONTAINERTESTOBJ) \
+	$(PGENRANSSIZETESTOBJ) \
 	$(PGENLIBSPARSEBACKENDTESTOBJ) \
 	$(PGENRANSPGENLIBTESTOBJ) \
 	$(PGENRANS_LIB_DIR)/libpgen_rans.a \
@@ -102,4 +112,5 @@ CLEAN += $(PGENRANSLIBOBJ) $(PGENRANSTOOLOBJ) $(PGENRANSTESTOBJ) \
 	$(PGENRANS_BIN_DIR)/pgen_rans_hybrid_test \
 	$(PGENRANS_BIN_DIR)/pgen_rans_container_test \
 	$(PGENRANS_BIN_DIR)/pgenlib_sparse_backend_test \
-	$(PGENRANS_BIN_DIR)/pgen_rans_pgenlib_test
+	$(PGENRANS_BIN_DIR)/pgen_rans_pgenlib_test \
+	$(PGENRANS_BIN_DIR)/pgen_rans_size_test

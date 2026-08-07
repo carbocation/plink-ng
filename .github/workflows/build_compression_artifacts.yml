@@ -248,6 +248,7 @@ jobs:
             "$artifact_dir/lib/libpgen_rans.a"
           install -m 644 \
             2.0/pgen_rans_codec.h \
+            2.0/pgen_rans_concat.h \
             2.0/pgen_rans_hybrid.h \
             2.0/pgen_rans_container.h \
             2.0/pgen_rans_cpu.h \
@@ -507,6 +508,7 @@ jobs:
             "$artifact_dir/lib/libpgen_rans.a"
           install -m 644 \
             2.0/pgen_rans_codec.h \
+            2.0/pgen_rans_concat.h \
             2.0/pgen_rans_hybrid.h \
             2.0/pgen_rans_container.h \
             2.0/pgen_rans_cpu.h \

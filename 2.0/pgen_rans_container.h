@@ -9,9 +9,10 @@
 #include <string>
 #include <vector>
 
+#include "pgen_rans_concat.h"
+
 namespace pgen_rans {
 
-constexpr uint8_t kPgenRansStorageMode = 0x80;
 constexpr uint32_t kPgenRansMinimumFormatVersion = 1;
 constexpr uint32_t kPgenRansFormatVersion = 2;
 
@@ -50,15 +51,6 @@ struct ContainerMetadata {
   // variant order.  A set bit marks a provisional REF allele.
   std::vector<uint8_t> nonref_flags;
   bool all_nonref = false;
-};
-
-struct ContainerConcatStats {
-  uint32_t input_file_ct = 0;
-  uint32_t sample_ct = 0;
-  uint32_t variant_ct = 0;
-  uint32_t block_ct = 0;
-  uint64_t copied_block_byte_ct = 0;
-  uint64_t output_byte_ct = 0;
 };
 
 struct EncodedBlock {
