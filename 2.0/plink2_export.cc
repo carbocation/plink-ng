@@ -9420,6 +9420,7 @@ PglErr Export012Smaj(const char* outname, const uintptr_t* orig_sample_include, 
     uint32_t exported_allele_idx = 0;
     uint32_t cur_allele_ct = 2;
     uint64_t bytes_written = 0;
+    uint32_t multiallelic_export_variant_ct = 0;
     for (uint32_t variant_idx = 0; variant_idx != variant_ct; ++variant_idx) {
       const uintptr_t variant_uidx = BitIter1(variant_include, &variant_uidx_base, &variant_include_bits);
       *write_iter++ = exportf_delim;
@@ -9433,6 +9434,10 @@ PglErr Export012Smaj(const char* outname, const uintptr_t* orig_sample_include, 
       }
       if (export_allele) {
         exported_allele_idx = export_allele[variant_uidx];
+      }
+      if (pgfip->multiread_backend && allele_idx_offsets &&
+          exported_allele_idx && (cur_allele_ct > 2)) {
+        ++multiallelic_export_variant_ct;
       }
       const char* const* cur_alleles = &(allele_storage[allele_idx_offset_base]);
       if (export_allele_missing && export_allele_missing[variant_uidx]) {
@@ -9545,13 +9550,35 @@ PglErr Export012Smaj(const char* outname, const uintptr_t* orig_sample_include, 
     const uint32_t raw_sample_ctl = BitCtToWordCt(raw_sample_ct);
     uintptr_t* sample_include;
     uint32_t* sample_include_cumulative_popcounts;
+    uint64_t* multiallelic_export_variants = nullptr;
     if (unlikely(bigstack_alloc_w(raw_sample_ctl, &sample_include) ||
                  bigstack_alloc_u32(raw_sample_ctl, &sample_include_cumulative_popcounts) ||
                  bigstack_alloc_u32(calc_thread_ct + 1, &ctx.write_vidx_starts) ||
                  bigstack_alloc_wp(calc_thread_ct, &ctx.thread_write_genovecs) ||
                  bigstack_alloc_wp(calc_thread_ct, &ctx.thread_write_dosagepresents) ||
-                 bigstack_alloc_dosagep(calc_thread_ct, &ctx.thread_write_dosagevals))) {
+                 bigstack_alloc_dosagep(calc_thread_ct, &ctx.thread_write_dosagevals) ||
+                 (multiallelic_export_variant_ct &&
+                  bigstack_alloc_u64(multiallelic_export_variant_ct,
+                                     &multiallelic_export_variants)))) {
       goto Export012Smaj_ret_NOMEM;
+    }
+    if (multiallelic_export_variants) {
+      uintptr_t patch_variant_uidx_base = 0;
+      uintptr_t patch_variant_include_bits = variant_include[0];
+      uint32_t patch_variant_idx = 0;
+      for (uint32_t variant_idx = 0; variant_idx != variant_ct;
+           ++variant_idx) {
+        const uint32_t variant_uidx =
+            BitIter1(variant_include, &patch_variant_uidx_base,
+                     &patch_variant_include_bits);
+        if ((allele_idx_offsets[variant_uidx + 1] -
+             allele_idx_offsets[variant_uidx] > 2) &&
+            export_allele[variant_uidx]) {
+          multiallelic_export_variants[patch_variant_idx++] =
+              (S_CAST(uint64_t, variant_uidx) << 32) | variant_idx;
+        }
+      }
+      assert(patch_variant_idx == multiallelic_export_variant_ct);
     }
 
     // Remaining memory byte requirements:
@@ -9604,9 +9631,10 @@ PglErr Export012Smaj(const char* outname, const uintptr_t* orig_sample_include, 
     ctx.stride = stride;
     ctx.smaj_dosagebuf = S_CAST(Dosage*, bigstack_alloc_raw_rd(read_sample_ct * S_CAST(uintptr_t, ctx.stride) * sizeof(Dosage)));
     uintptr_t* multiallelic_genovec = nullptr;
-    if (pgfip->multiread_backend && allele_idx_offsets && export_allele) {
+    if (multiallelic_export_variant_ct) {
       if (unlikely(bigstack_alloc_w(
-              NypCtToWordCt(read_sample_ct), &multiallelic_genovec))) {
+              NypCtToAlignedWordCt(read_sample_ct),
+              &multiallelic_genovec))) {
         goto Export012Smaj_ret_NOMEM;
       }
     }
@@ -9710,18 +9738,13 @@ PglErr Export012Smaj(const char* outname, const uintptr_t* orig_sample_include, 
         PgrSampleSubsetIndex pssi;
         PgrSetSampleSubsetIndex(
             sample_include_cumulative_popcounts, simple_pgrp, &pssi);
-        uintptr_t patch_variant_uidx_base = 0;
-        uintptr_t patch_variant_include_bits = variant_include[0];
-        for (uint32_t variant_idx = 0; variant_idx != variant_ct;
-             ++variant_idx) {
-          const uintptr_t variant_uidx =
-              BitIter1(variant_include, &patch_variant_uidx_base,
-                       &patch_variant_include_bits);
-          if ((allele_idx_offsets[variant_uidx + 1] -
-               allele_idx_offsets[variant_uidx] <= 2) ||
-              (!export_allele[variant_uidx])) {
-            continue;
-          }
+        for (uint32_t patch_variant_idx = 0;
+             patch_variant_idx != multiallelic_export_variant_ct;
+             ++patch_variant_idx) {
+          const uint64_t variant_pair =
+              multiallelic_export_variants[patch_variant_idx];
+          const uint32_t variant_uidx = variant_pair >> 32;
+          const uint32_t variant_idx = S_CAST(uint32_t, variant_pair);
           uint32_t dosage_ct;
           reterr = PgrGet1D(
               sample_include, pssi, read_sample_ct, variant_uidx,

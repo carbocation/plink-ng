@@ -141,6 +141,22 @@ jobs:
             --export A \
             --out "$smoke_prefix-rans-export"
           cmp "$smoke_prefix-pgen-export.raw" "$smoke_prefix-rans-export.raw"
+          awk -F '\t' 'BEGIN { OFS="\t" } !/^#/ && index($5, ",") {
+            split($5, alts, ","); print $3, alts[2]
+          }' "$smoke_prefix.pvar" >"$smoke_prefix-export-alleles.txt"
+          test -s "$smoke_prefix-export-alleles.txt"
+          2.0/build_dynamic/plink2 \
+            --pfile "$smoke_prefix-input" \
+            --export A \
+            --export-allele "$smoke_prefix-export-alleles.txt" \
+            --out "$smoke_prefix-pgen-alt-export"
+          2.0/build_dynamic/plink2 \
+            --pfile "$smoke_prefix" \
+            --export A \
+            --export-allele "$smoke_prefix-export-alleles.txt" \
+            --out "$smoke_prefix-rans-alt-export"
+          cmp "$smoke_prefix-pgen-alt-export.raw" \
+            "$smoke_prefix-rans-alt-export.raw"
           2.0/build_dynamic/plink2 \
             --pfile "$smoke_prefix-input" \
             --hardy --missing --geno-counts \
@@ -405,6 +421,22 @@ jobs:
             --export A \
             --out "$smoke_prefix-rans-export"
           cmp "$smoke_prefix-pgen-export.raw" "$smoke_prefix-rans-export.raw"
+          awk -F '\t' 'BEGIN { OFS="\t" } !/^#/ && index($5, ",") {
+            split($5, alts, ","); print $3, alts[2]
+          }' "$smoke_prefix.pvar" >"$smoke_prefix-export-alleles.txt"
+          test -s "$smoke_prefix-export-alleles.txt"
+          2.0/build_dynamic/plink2 \
+            --pfile "$smoke_prefix-input" \
+            --export A \
+            --export-allele "$smoke_prefix-export-alleles.txt" \
+            --out "$smoke_prefix-pgen-alt-export"
+          2.0/build_dynamic/plink2 \
+            --pfile "$smoke_prefix" \
+            --export A \
+            --export-allele "$smoke_prefix-export-alleles.txt" \
+            --out "$smoke_prefix-rans-alt-export"
+          cmp "$smoke_prefix-pgen-alt-export.raw" \
+            "$smoke_prefix-rans-alt-export.raw"
           2.0/build_dynamic/plink2 \
             --pfile "$smoke_prefix-input" \
             --hardy --missing --geno-counts \
