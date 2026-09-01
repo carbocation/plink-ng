@@ -3853,7 +3853,7 @@ PglErr PgrGetCounts(const uintptr_t* __restrict sample_include, const uintptr_t*
   if (pgrp->hardcall_backend) {
     return pgrp->hardcall_backend->get_counts(
         pgrp->hardcall_backend->context, sample_include, GetSicp(pssi),
-        sample_ct, vidx, genocounts.data());
+        sample_ct, vidx, &(genocounts[0]));
   }
   return GetBasicGenotypeCounts(sample_include, sample_include_interleaved_vec, GetSicp(pssi), sample_ct, vidx, pgrp, nullptr, genocounts);
 }
@@ -4790,7 +4790,7 @@ PglErr PgrGetInv1Counts(const uintptr_t* __restrict sample_include, const uintpt
     const PglErr reterr = backend->get_counts(
         backend->context, sample_include,
         sample_include_cumulative_popcounts, sample_ct, vidx,
-        genocounts.data());
+        &(genocounts[0]));
     if ((!reterr) && allele_idx) {
       const uint32_t homref_ct = genocounts[0];
       genocounts[0] = genocounts[2];
@@ -8773,7 +8773,7 @@ PglErr PgrGetDCounts(const uintptr_t* __restrict sample_include, const uintptr_t
     const PgrHardcallBackend* backend = pgrp->hardcall_backend;
     const PglErr reterr = backend->get_counts(
         backend->context, sample_include, GetSicp(pssi), sample_ct, vidx,
-        genocounts.data());
+        &(genocounts[0]));
     if (reterr) {
       return reterr;
     }
